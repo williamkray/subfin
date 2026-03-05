@@ -154,22 +154,38 @@ export function addLinkedDevice(
   return plainPassword;
 }
 
-/** Resolve Subsonic (username, password) to Jellyfin token. */
+/** Resolve Subsonic (username, password) to Jellyfin token and matched device. */
 export function resolveToJellyfinToken(
   subsonicUsername: string,
   password: string
-): { jellyfinUserId: string; jellyfinAccessToken: string } | null {
+): {
+  jellyfinUserId: string;
+  jellyfinAccessToken: string;
+  deviceId: number;
+  deviceLabel: string | null;
+} | null {
   const database = openDb();
   const rows = database
     .prepare(
-      "SELECT jellyfin_user_id, app_password_hash, jellyfin_access_token_encrypted FROM linked_devices WHERE subsonic_username = ?"
+      "SELECT id, jellyfin_user_id, app_password_hash, jellyfin_access_token_encrypted, device_label FROM linked_devices WHERE subsonic_username = ?"
     )
-    .all(subsonicUsername) as { jellyfin_user_id: string; app_password_hash: string; jellyfin_access_token_encrypted: Buffer }[];
+    .all(subsonicUsername) as {
+      id: number;
+      jellyfin_user_id: string;
+      app_password_hash: string;
+      jellyfin_access_token_encrypted: Buffer;
+      device_label: string | null;
+    }[];
   const cfg = getConfig();
   for (const row of rows) {
     if (bcrypt.compareSync(password, row.app_password_hash)) {
       const token = decrypt(row.jellyfin_access_token_encrypted, cfg);
-      return { jellyfinUserId: row.jellyfin_user_id, jellyfinAccessToken: token };
+      return {
+        jellyfinUserId: row.jellyfin_user_id,
+        jellyfinAccessToken: token,
+        deviceId: row.id,
+        deviceLabel: row.device_label,
+      };
     }
   }
   return null;
@@ -206,6 +222,15 @@ export function getJellyfinCredentialsForUser(
   if (!deviceRow) return null;
   const token = decrypt(deviceRow.jellyfin_access_token_encrypted, cfg);
   return { jellyfinUserId: deviceRow.jellyfin_user_id, jellyfinAccessToken: token };
+}
+
+/** Return the first linked device's Subsonic username, or null if none. Used by debug scripts to resolve credentials from the DB. */
+export function getFirstSubsonicUsername(): string | null {
+  const database = openDb();
+  const row = database
+    .prepare("SELECT subsonic_username FROM linked_devices ORDER BY created_at ASC LIMIT 1")
+    .get() as { subsonic_username: string } | undefined;
+  return row?.subsonic_username ?? null;
 }
 
 /** List linked devices for a Subsonic username. */
@@ -277,6 +302,8 @@ export interface LinkedDeviceForToken {
   app_password_plain?: string;
   jellyfin_user_id: string;
   jellyfin_access_token: string;
+  device_id: number;
+  device_label: string | null;
 }
 
 /** Internal: devices for a user including plain app password (for token auth). */
@@ -284,13 +311,15 @@ export function getDevicesForToken(subsonicUsername: string): LinkedDeviceForTok
   const database = openDb();
   const rows = database
     .prepare(
-      "SELECT subsonic_username, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted FROM linked_devices WHERE subsonic_username = ?"
+      "SELECT id, subsonic_username, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, device_label FROM linked_devices WHERE subsonic_username = ?"
     )
     .all(subsonicUsername) as {
+      id: number;
       subsonic_username: string;
       app_password_encrypted: Buffer;
       jellyfin_user_id: string;
       jellyfin_access_token_encrypted: Buffer;
+      device_label: string | null;
     }[];
   const cfg = getConfig();
   return rows.map((r) => {
@@ -301,6 +330,8 @@ export function getDevicesForToken(subsonicUsername: string): LinkedDeviceForTok
       app_password_plain: plain || undefined,
       jellyfin_user_id: r.jellyfin_user_id,
       jellyfin_access_token: token,
+      device_id: r.id,
+      device_label: r.device_label,
     };
   });
 }

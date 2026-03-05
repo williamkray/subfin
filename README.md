@@ -66,6 +66,8 @@ docker run -d --name subfin -p 4040:4040 -v subfin-data:/data -e JELLYFIN_URL=ht
 
 The container runs as a non-root user and expects writable `/data` for the store.
 
+**Jellyfin activity panel (device & IP):** Each linked device appears in Jellyfin under its label (or “Subfin Device &lt;id&gt;”). Subfin sends the client’s IP on outbound requests via `X-Forwarded-For` (using the first value from the incoming request’s `X-Forwarded-For` or `X-Real-IP`, or the socket address). For that IP to show in Jellyfin’s activity panel, add Subfin’s IP (or your reverse proxy’s IP) to **Jellyfin → Dashboard → Network → Known Proxies**.
+
 - **Subsonic REST:** `http://localhost:4040/rest/` (e.g. `/rest/ping.view`, `/rest/getMusicFolders.view`)
 - **Web UI:** `http://localhost:4040/` (link device, manage devices)
 
@@ -129,10 +131,10 @@ Subfin exposes two lyrics endpoints:
 
 ### Not implemented / TODO
 
-- Real **artist/album metadata** (biographies, similar artists, Last.fm links, etc.).
+- Richer **artist/album metadata** (e.g. Last.fm links; biographies and similar artists already come from Jellyfin).
 - Playlist CRUD is implemented; remaining work is client testing and any Jellyfin permission edge cases.
-- Rich **search / discovery** features:
-  - `search*`, `getTopSongs`, `getRandomSongs`, `getSimilarSongs` (instant mix), album lists by genre / year, etc.
+- **Album list types** for home screens: `getAlbumList` supports `random`, `newest`, **recent** (recently played), **frequent** (most played), **starred** (favorite albums), `alphabeticalByName`/`ByArtist`, `byGenre`, `byYear`. Not yet: **highest** (highest rated).
+- Further **search / discovery** refinements (e.g. full filter semantics for `getRandomSongs`, multi-genre/year for `getSongsByGenre`).
 - **Scrobbling** refinement (e.g. pause/resume precision) and other write APIs (play queue save).
 - More complete **error handling and diagnostics** around Jellyfin failures and network issues.
 - Configuration UI and docs for **transcoding / bitrate** and multi-library setups.
@@ -180,7 +182,7 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 
 | Endpoint | Status | Jellyfin mapping | Notes |
 |---------|--------|------------------|-------|
-| `getAlbumList` | **Partially implemented** | `ItemsApi.getItems(MusicAlbum)` | Supports types: random, newest, alphabeticalByName/ByArtist, byGenre (genre param), byYear (fromYear/toYear); does not yet support every list type. |
+| `getAlbumList` | **Partially implemented** | `ItemsApi.getItems(MusicAlbum)` + Audio for recent/frequent | Supports types: random, newest, **recent** (derived from recently played *tracks* so it matches scrobble history), **frequent** (derived from per-track play counts so it reflects real listening), **starred**, alphabeticalByName/ByArtist, byGenre, byYear. Not yet: highest (highest rated). |
 | `getAlbumList2` | **Partially implemented** | `ItemsApi.getItems(MusicAlbum)` | Reuses the same data as `getAlbumList` but returns it as `<albumList2>`; does not yet support full ID3-based semantics. |
 | `getRandomSongs` | **Partially implemented** | `ItemsApi.getItems(sortBy=Random, includeItemTypes=Audio)` | Returns random audio tracks via Jellyfin’s random sort; currently supports `size`, `offset`, and optional `musicFolderId` but ignores other filters (year, genre, etc.). |
 | `getSongsByGenre` | **Partially implemented** | `ItemsApi.getItems(Audio, genres=...)` | Filters audio items by a single genre with paging; currently uses Jellyfin text genres and doesn’t yet implement multi-genre or year/artist scoping. |
@@ -238,13 +240,13 @@ Most of the remaining items below are **currently unimplemented** (exceptions: `
 - **Bookmarks** *(not planned)*: `createBookmark`, `getBookmarks`, `deleteBookmark` — no implementation intended.
 - **Chat**: `addChatMessage`, `getChatMessages` → no Jellyfin equivalent; would have to be implemented entirely in Subfin.
 - **Playback state**: `savePlayQueue`, `savePlayQueueByIndex`, `getPlayQueue`, `getPlayQueueByIndex`, `scrobble`, `setRating`, `star`, `unstar` → Jellyfin play queue, playback reporting, and rating/favorite APIs.
-  - `scrobble` is wired to Jellyfin’s playstate API (start/progress/stop) using Subsonic scrobbles as coarse-grained signals; we intentionally **do not** infer playback from raw `stream` calls to avoid treating cache/download operations as active playback. Pause/resume still cannot be tracked precisely, so Jellyfin’s notion of elapsed time is approximate.
+  - `scrobble` is wired to Jellyfin’s playstate API (start/progress/stop) using Subsonic scrobbles as coarse-grained signals; we intentionally **do not** infer playback from raw `stream` calls to avoid treating pre-fetched (gapless) streams as “now playing”. For Jellyfin’s “now playing” and dashboard to update **as soon as** a new track starts (e.g. when the queue auto-advances), the client should send **scrobble with `submission=false`** when that track actually starts, not only when it ends (`submission=true`). Otherwise Subfin only reports the track when it receives the end-of-track scrobble, so the dashboard updates late. Pause/resume still cannot be tracked precisely, so Jellyfin’s notion of elapsed time is approximate.
   - `setRating`, `star`, and `unstar` are **fully implemented**: they call Jellyfin’s favorite and user-like APIs (`markFavorite`, `unmarkFavorite`, `setUserLikeForItem`), so favorites and likes stay in sync with Jellyfin.
 - **Library scanning / transcoding**: `startScan`, `getScanStatus`, `getTranscodeDecision` → Jellyfin library scan and transcoding APIs (not yet surfaced by Subfin).
 
 ## Token store
 
-By default Subfin uses a **JSON file** (`subfin.json`) for storing linked devices and app passwords. No SQLite or native modules are required. For production you can switch to an SQLite backend (see plan) by replacing the store implementation.
+Subfin uses an **SQLite database** (path from `SUBFIN_DB_PATH`, default `./subfin.db`) for linked devices and app passwords. Sensitive columns are encrypted at rest using the key derived from `SUBFIN_SALT`. The build requires native tooling for **better-sqlite3** (e.g. Python, make, g++). If a legacy `subfin.json` file exists at the same path (with `.json` instead of `.db`), it is migrated once into SQLite and the old file is renamed to `subfin.json.migrated`.
 
 ## Security audit
 

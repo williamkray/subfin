@@ -6,6 +6,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { config } from "./config.js";
+import { clientIpMiddleware } from "./request-context.js";
 import { subsonicRouter } from "./subsonic/router.js";
 import { webRouter } from "./web/router.js";
 import { getDb } from "./store/index.js";
@@ -18,6 +19,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+// Set request-scoped client IP (X-Forwarded-For / X-Real-IP / remoteAddress) for Jellyfin outbound requests.
+app.use(clientIpMiddleware);
 
 // Subsonic REST: /rest/ping.view, /rest/getMusicFolders.view, /rest/stream, etc.
 app.all(["/rest", "/rest/:method"], (req, res) => {

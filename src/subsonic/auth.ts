@@ -2,6 +2,7 @@
  * Parse Subsonic-style auth (u, p or t+s, or apiKey) and resolve to Jellyfin token via store.
  */
 import { createHash } from "node:crypto";
+import type { JellyfinContext } from "../jellyfin/client.js";
 import { resolveToJellyfinToken, getDevicesForToken } from "../store/index.js";
 import type { SubsonicError } from "./response.js";
 
@@ -17,6 +18,29 @@ export interface AuthResult {
   subsonicUsername: string;
   jellyfinUserId: string;
   jellyfinAccessToken: string;
+  /** Set when auth is resolved from a linked device; used for Jellyfin device/session identity. */
+  jellyfinDeviceId?: string;
+  jellyfinDeviceName?: string;
+}
+
+function deviceDisplay(deviceId: number, deviceLabel: string | null): { id: string; name: string } {
+  return {
+    id: "subfin-" + deviceId,
+    name: deviceLabel?.trim() ? deviceLabel : "Subfin Device " + deviceId,
+  };
+}
+
+/** Build JellyfinContext from AuthResult for use with jf.* calls (per-device identity when available). */
+export function toJellyfinContext(auth: AuthResult): JellyfinContext {
+  if (auth.jellyfinDeviceId && auth.jellyfinDeviceName) {
+    return {
+      accessToken: auth.jellyfinAccessToken,
+      userId: auth.jellyfinUserId,
+      deviceId: auth.jellyfinDeviceId,
+      deviceName: auth.jellyfinDeviceName,
+    };
+  }
+  return auth.jellyfinAccessToken;
 }
 
 /** Validate and resolve auth. Returns AuthResult or Subsonic error object. */
@@ -38,10 +62,13 @@ export function resolveAuth(params: AuthParams): AuthResult | SubsonicError {
       if (!d.app_password_plain) continue;
       const expected = computeToken(d.app_password_plain, params.s);
       if (expected === params.t) {
+        const dev = deviceDisplay(d.device_id, d.device_label);
         return {
           subsonicUsername: username,
           jellyfinUserId: d.jellyfin_user_id,
           jellyfinAccessToken: d.jellyfin_access_token,
+          jellyfinDeviceId: dev.id,
+          jellyfinDeviceName: dev.name,
         };
       }
     }
@@ -66,11 +93,13 @@ export function resolveAuth(params: AuthParams): AuthResult | SubsonicError {
   if (!resolved) {
     return { code: 40, message: "Wrong username or password." };
   }
-
+  const dev = deviceDisplay(resolved.deviceId, resolved.deviceLabel);
   return {
     subsonicUsername: username,
     jellyfinUserId: resolved.jellyfinUserId,
     jellyfinAccessToken: resolved.jellyfinAccessToken,
+    jellyfinDeviceId: dev.id,
+    jellyfinDeviceName: dev.name,
   };
 }
 
@@ -97,10 +126,13 @@ export function resolveAuthFromBasicHeader(
     if (!username) return null;
     const resolved = resolveToJellyfinToken(username, password);
     if (!resolved) return null;
+    const dev = deviceDisplay(resolved.deviceId, resolved.deviceLabel);
     return {
       subsonicUsername: username,
       jellyfinUserId: resolved.jellyfinUserId,
       jellyfinAccessToken: resolved.jellyfinAccessToken,
+      jellyfinDeviceId: dev.id,
+      jellyfinDeviceName: dev.name,
     };
   } catch {
     return null;

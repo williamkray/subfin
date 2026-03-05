@@ -2,8 +2,10 @@
  * Jellyfin API client wrapper. Uses @jellyfin/sdk with an existing access token
  * (obtained via web UI linking). All methods are for a single user context.
  */
+import axios from "axios";
 import { Jellyfin } from "@jellyfin/sdk/lib/jellyfin.js";
 import { getAuthorizationHeader } from "@jellyfin/sdk/lib/utils/authentication.js";
+import { getClientIp } from "../request-context.js";
 import { getLibraryApi } from "@jellyfin/sdk/lib/utils/api/library-api.js";
 import { getUserViewsApi } from "@jellyfin/sdk/lib/utils/api/user-views-api.js";
 import { getItemsApi } from "@jellyfin/sdk/lib/utils/api/items-api.js";
@@ -22,6 +24,27 @@ import { MediaType } from "@jellyfin/sdk/lib/generated-client/models/media-type.
 import { config } from "../config.js";
 
 const { jellyfin: jf } = config;
+
+/**
+ * Context for Jellyfin API calls. Either a plain access token (legacy / no device) or an object
+ * with token and optional per-device identity so Jellyfin shows separate devices in the dashboard.
+ */
+export type JellyfinContext =
+  | string
+  | { accessToken: string; userId?: string; deviceId?: string; deviceName?: string };
+
+function normalizeContext(ctx: JellyfinContext): {
+  accessToken: string;
+  device?: { id: string; name: string };
+} {
+  if (typeof ctx === "string") {
+    return { accessToken: ctx };
+  }
+  const { accessToken, deviceId, deviceName } = ctx;
+  const device =
+    deviceId && deviceName ? { id: deviceId, name: deviceName } : undefined;
+  return { accessToken, device };
+}
 
 /**
  * Lightweight in-memory caches for operations that would otherwise perform
@@ -55,30 +78,38 @@ function makeAllowedMusicFolderCacheKey(accessToken: string, userId: string): Al
   return `${userId}:${accessToken}`;
 }
 
-function makeJellyfinApiCacheKey(accessToken: string): JellyfinApiCacheKey {
-  // For anonymous operations (QuickConnect), we use a shared empty key.
-  return accessToken || "__no_token__";
+function makeJellyfinApiCacheKey(accessToken: string, deviceId?: string): JellyfinApiCacheKey {
+  const base = accessToken || "__no_token__";
+  return deviceId ? `${base}:${deviceId}` : base;
 }
 
-function createJellyfinApi(accessToken: string) {
+function createJellyfinApi(accessToken: string, device?: { id: string; name: string }) {
   const now = Date.now();
-  const key = makeJellyfinApiCacheKey(accessToken);
+  const key = makeJellyfinApiCacheKey(accessToken, device?.id);
   const cached = jellyfinApiCache.get(key);
   if (cached && cached.expiresAt > now) {
     return cached.api;
   }
 
+  const deviceInfo = device
+    ? { id: device.id, name: device.name }
+    : { id: jf.deviceId, name: jf.deviceName };
   const jellyfin = new Jellyfin({
     clientInfo: {
       name: jf.clientName,
       version: "0.1.0",
     },
-    deviceInfo: {
-      name: jf.deviceName,
-      id: jf.deviceId,
-    },
+    deviceInfo,
   });
-  const api = jellyfin.createApi(jf.baseUrl, accessToken);
+  const axiosInstance = axios.create();
+  axiosInstance.interceptors.request.use((config) => {
+    const clientIp = getClientIp();
+    if (clientIp) {
+      (config.headers as Record<string, string>)["X-Forwarded-For"] = clientIp;
+    }
+    return config;
+  });
+  const api = jellyfin.createApi(jf.baseUrl, accessToken, axiosInstance);
   jellyfinApiCache.set(key, {
     api,
     expiresAt: now + JELLYFIN_API_CACHE_TTL_MS,
@@ -86,11 +117,29 @@ function createJellyfinApi(accessToken: string) {
   return api;
 }
 
-/** Build the Jellyfin Authorization header for a given access token. */
-export function buildJellyfinAuthHeader(accessToken: string): string {
+/** Get API instance for the given context (cached per token + device). */
+function getApi(ctx: JellyfinContext): JellyfinApiInstance {
+  const { accessToken, device } = normalizeContext(ctx);
+  return createJellyfinApi(accessToken, device);
+}
+
+/** Device ID to use in URLs (e.g. stream/download); from context when present, else config. */
+function getDeviceIdForUrl(ctx: JellyfinContext): string {
+  const { device } = normalizeContext(ctx);
+  return device ? device.id : jf.deviceId;
+}
+
+/** Build the Jellyfin Authorization header for a given access token and optional device. */
+export function buildJellyfinAuthHeader(
+  accessToken: string,
+  device?: { id: string; name: string }
+): string {
+  const deviceInfo = device
+    ? { id: device.id, name: device.name }
+    : { id: jf.deviceId, name: jf.deviceName };
   return getAuthorizationHeader(
     { name: jf.clientName, version: "0.1.0" },
-    { name: jf.deviceName, id: jf.deviceId },
+    deviceInfo,
     accessToken
   );
 }
@@ -102,10 +151,10 @@ function isJellyfinViewId(value: string): boolean {
 
 /** Get music libraries (folders) for a user. Uses UserViews (works for non-admin users); Library/MediaFolders returns 403 for non-admins. */
 export async function getMusicLibraries(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string
 ): Promise<{ id: string; name: string }[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const viewsApi = getUserViewsApi(api);
   const response = await viewsApi.getUserViews({ userId });
   const data = response.data;
@@ -130,17 +179,18 @@ export async function getMusicLibraries(
 
 /** When MUSIC_LIBRARY_IDS is set, returns allowed music folder IDs for this user (names resolved to IDs). When not set, returns null (no restriction). Used to default list endpoints to those folders when the client does not send musicFolderId. */
 export async function getAllowedMusicFolderIds(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string
 ): Promise<string[] | null> {
   if (config.musicLibraryIds.length === 0) return null;
+  const { accessToken } = normalizeContext(ctx);
   const now = Date.now();
   const key = makeAllowedMusicFolderCacheKey(accessToken, userId);
   const cached = allowedMusicFolderCache.get(key);
   if (cached && cached.expiresAt > now) {
     return cached.ids;
   }
-  const folders = await getMusicLibraries(accessToken, userId);
+  const folders = await getMusicLibraries(ctx, userId);
   const ids = folders.map((f) => f.id);
   allowedMusicFolderCache.set(key, {
     ids,
@@ -152,10 +202,10 @@ export async function getAllowedMusicFolderIds(
 
 /** Get artists (MusicArtist). Optionally filter by parentId (library). */
 export async function getArtists(
-  accessToken: string,
+  ctx: JellyfinContext,
   parentId?: string
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const response = await itemsApi.getItems({
     includeItemTypes: [BaseItemKind.MusicArtist],
@@ -169,10 +219,10 @@ export async function getArtists(
 
 /** Get a single artist by id. */
 export async function getArtist(
-  accessToken: string,
+  ctx: JellyfinContext,
   id: string
 ): Promise<BaseItemDto | null> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   try {
     const response = await itemsApi.getItems({
@@ -188,10 +238,10 @@ export async function getArtist(
 
 /** Get artist with Overview (biography) and ProviderIds (e.g. MusicBrainz) for getArtistInfo. */
 export async function getArtistWithInfo(
-  accessToken: string,
+  ctx: JellyfinContext,
   id: string
 ): Promise<BaseItemDto | null> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   try {
     const response = await itemsApi.getItems({
@@ -207,12 +257,12 @@ export async function getArtistWithInfo(
 
 /** Get similar artists from Jellyfin (Artists/{id}/Similar). Returns MusicArtist items. */
 export async function getSimilarArtists(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   artistId: string,
   limit: number
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const libApi = getLibraryApi(api);
   try {
     const response = await libApi.getSimilarArtists({
@@ -229,10 +279,10 @@ export async function getSimilarArtists(
 
 /** Get albums for an artist (parentId = artist id). */
 export async function getAlbumsByArtist(
-  accessToken: string,
+  ctx: JellyfinContext,
   artistId: string
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const response = await itemsApi.getItems({
     parentId: artistId,
@@ -244,10 +294,117 @@ export async function getAlbumsByArtist(
   return response.data?.Items ?? [];
 }
 
+/** Derive recently played albums from recently played tracks (Jellyfin sets DatePlayed on Audio, not on albums). */
+async function getRecentAlbumsFromTracks(
+  ctx: JellyfinContext,
+  opts: { userId: string; musicFolderId?: string; size?: number; offset?: number }
+): Promise<BaseItemDto[]> {
+  const { userId, musicFolderId, size = 50, offset = 0 } = opts;
+  const tracks = await getRecentlyPlayedTracks(ctx, {
+    userId,
+    musicFolderId,
+    limit: 500,
+  });
+  const seen = new Set<string>();
+  const albumIds: string[] = [];
+  for (const t of tracks) {
+    const albumId = (t as { AlbumId?: string }).AlbumId ?? t.ParentId;
+    if (albumId && !seen.has(albumId)) {
+      seen.add(albumId);
+      albumIds.push(albumId);
+    }
+  }
+  const pageIds = albumIds.slice(offset, offset + size);
+  if (pageIds.length === 0) return [];
+
+  const api = getApi(ctx);
+  const itemsApi = getItemsApi(api);
+  const response = await itemsApi.getItems({
+    ids: pageIds,
+    includeItemTypes: [BaseItemKind.MusicAlbum],
+    enableUserData: true as any,
+  } as any);
+  const items = response.data?.Items ?? [];
+  const byId = new Map<string, BaseItemDto>();
+  for (const a of items) if (a.Id) byId.set(a.Id, a);
+  return pageIds.map((id) => byId.get(id)).filter((a): a is BaseItemDto => a != null);
+}
+
+/** Get most played tracks (Audio) for the user. Used to derive "most played" albums. */
+async function getMostPlayedTracks(
+  ctx: JellyfinContext,
+  opts: { userId: string; musicFolderId?: string; limit?: number }
+): Promise<BaseItemDto[]> {
+  const api = getApi(ctx);
+  const itemsApi = getItemsApi(api);
+  const { userId, musicFolderId, limit = 1000 } = opts;
+  const response = await itemsApi.getItems({
+    userId,
+    includeItemTypes: [BaseItemKind.Audio],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    sortBy: ["PlayCount"],
+    sortOrder: ["Descending"],
+    limit,
+    startIndex: 0,
+    enableUserData: true as any,
+  } as any);
+  return response.data?.Items ?? [];
+}
+
+/** Derive most played albums from most played tracks (aggregate per-album play counts). */
+async function getFrequentAlbumsFromTracks(
+  ctx: JellyfinContext,
+  opts: { userId: string; musicFolderId?: string; size?: number; offset?: number }
+): Promise<BaseItemDto[]> {
+  const { userId, musicFolderId, size = 50, offset = 0 } = opts;
+  const tracks = await getMostPlayedTracks(ctx, {
+    userId,
+    musicFolderId,
+    limit: 1000,
+  });
+
+  const albumTotals = new Map<string, { total: number }>();
+  for (const t of tracks) {
+    const albumId = (t as { AlbumId?: string }).AlbumId ?? t.ParentId;
+    if (!albumId) continue;
+    const playCount =
+      (t as { UserData?: { PlayCount?: number } }).UserData?.PlayCount ??
+      (t as { PlayCount?: number }).PlayCount ??
+      0;
+    const current = albumTotals.get(albumId);
+    if (current) {
+      current.total += playCount;
+    } else {
+      albumTotals.set(albumId, { total: playCount });
+    }
+  }
+
+  const sortedAlbumIds = Array.from(albumTotals.entries())
+    .sort((a, b) => b[1].total - a[1].total)
+    .map(([id]) => id);
+
+  const pageIds = sortedAlbumIds.slice(offset, offset + size);
+  if (pageIds.length === 0) return [];
+
+  const api = getApi(ctx);
+  const itemsApi = getItemsApi(api);
+  const response = await itemsApi.getItems({
+    ids: pageIds,
+    includeItemTypes: [BaseItemKind.MusicAlbum],
+    enableUserData: true as any,
+  } as any);
+  const items = response.data?.Items ?? [];
+  const byId = new Map<string, BaseItemDto>();
+  for (const a of items) if (a.Id) byId.set(a.Id, a);
+  return pageIds.map((id) => byId.get(id)).filter((a): a is BaseItemDto => a != null);
+}
+
 /** Generic album list for a library (used for Subsonic getAlbumList). */
 export async function getAlbumsForLibrary(
-  accessToken: string,
+  ctx: JellyfinContext,
   opts: {
+    userId?: string;
     musicFolderId?: string;
     type?: string;
     size?: number;
@@ -257,18 +414,48 @@ export async function getAlbumsForLibrary(
     toYear?: number;
   }
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
-  const { musicFolderId, type, size, offset, genre, fromYear, toYear } = opts;
+  const { userId, musicFolderId, type, size, offset, genre, fromYear, toYear } = opts;
 
   // Map Subsonic album list types to Jellyfin sort options.
   let sortBy: string[] = [];
   let sortOrder: ("Ascending" | "Descending")[] = [];
+  let enableUserData = false;
 
-  switch ((type ?? "").toLowerCase()) {
+  const typeLower = (type ?? "").toLowerCase();
+
+  // Recently played: Jellyfin updates DatePlayed on tracks (Audio), not on MusicAlbum.
+  // Derive recent albums from recently played tracks so the list matches scrobble history.
+  // userId is required so Jellyfin returns that user's DatePlayed (required for correct sort).
+  if (typeLower === "recent" && opts.userId) {
+    return getRecentAlbumsFromTracks(ctx, {
+      userId: opts.userId,
+      musicFolderId,
+      size: size ?? 50,
+      offset: offset ?? 0,
+    });
+  }
+
+  // Most played: album-level PlayCount can be unreliable; derive most played albums
+  // from per-track play counts. userId required for user-specific PlayCount.
+  if (typeLower === "frequent" && opts.userId) {
+    return getFrequentAlbumsFromTracks(ctx, {
+      userId: opts.userId,
+      musicFolderId,
+      size: size ?? 50,
+      offset: offset ?? 0,
+    });
+  }
+
+  switch (typeLower) {
     case "newest":
       sortBy = ["DateCreated"];
       sortOrder = ["Descending"];
+      break;
+    case "starred":
+      sortBy = ["SortName"];
+      sortOrder = ["Ascending"];
       break;
     case "alphabeticalbyname":
     case "alphabeticalbyartist":
@@ -284,6 +471,11 @@ export async function getAlbumsForLibrary(
       sortBy = ["Random"];
       sortOrder = ["Ascending"];
       break;
+  }
+
+  let isFavorite: boolean | undefined;
+  if ((type ?? "").toLowerCase() === "starred") {
+    isFavorite = true;
   }
 
   const response = await itemsApi.getItems({
@@ -302,16 +494,18 @@ export async function getAlbumsForLibrary(
     sortOrder,
     limit: size ?? 50,
     startIndex: offset ?? 0,
-  });
+    ...(enableUserData ? { enableUserData: true as any } : {}),
+    ...(isFavorite !== undefined ? { isFavorite } : {}),
+  } as any);
   return response.data?.Items ?? [];
 }
 
 /** Get a single album by id. */
 export async function getAlbum(
-  accessToken: string,
+  ctx: JellyfinContext,
   id: string
 ): Promise<BaseItemDto | null> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   try {
     const response = await itemsApi.getItems({
@@ -326,13 +520,13 @@ export async function getAlbum(
 
 /** Get songs (tracks) for an album (parentId = album id). */
 export async function getSongsByAlbum(
-  accessToken: string,
+  ctx: JellyfinContext,
   albumId: string
 ): Promise<BaseItemDto[]> {
   if (!albumId || albumId === "null" || albumId === "undefined") {
     return [];
   }
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   try {
     const response = await itemsApi.getItems({
@@ -350,11 +544,11 @@ export async function getSongsByAlbum(
 
 /** Get top songs for a given artist name using Jellyfin play counts. */
 export async function getTopSongsForArtist(
-  accessToken: string,
+  ctx: JellyfinContext,
   artistName: string,
   count: number
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
 
   // First, resolve the artist to a Jellyfin MusicArtist item.
@@ -390,16 +584,44 @@ export async function getTopSongsForArtist(
   return songsResp.data?.Items ?? [];
 }
 
+/** Get recently played tracks (Audio) for the user. Used to derive "recently played albums"
+ * because Jellyfin updates DatePlayed on tracks, not on album entities.
+ * Requires userId so Jellyfin returns that user's play state (DatePlayed). */
+export async function getRecentlyPlayedTracks(
+  ctx: JellyfinContext,
+  opts: {
+    userId: string;
+    musicFolderId?: string;
+    limit?: number;
+  }
+): Promise<BaseItemDto[]> {
+  const api = getApi(ctx);
+  const itemsApi = getItemsApi(api);
+  const { userId, musicFolderId, limit = 300 } = opts;
+  const response = await itemsApi.getItems({
+    userId,
+    includeItemTypes: [BaseItemKind.Audio],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    sortBy: ["DatePlayed"],
+    sortOrder: ["Descending"],
+    limit,
+    startIndex: 0,
+    enableUserData: true as any,
+  } as any);
+  return response.data?.Items ?? [];
+}
+
 /** Get random songs from the library (optionally scoped to a music folder). */
 export async function getRandomSongs(
-  accessToken: string,
+  ctx: JellyfinContext,
   opts: {
     musicFolderId?: string;
     size?: number;
     offset?: number;
   }
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const { musicFolderId, size, offset } = opts;
   const response = await itemsApi.getItems({
@@ -422,10 +644,10 @@ interface JellyfinGenreSummary {
 
 /** Aggregate genres from audio items in the library. */
 export async function getGenres(
-  accessToken: string,
+  ctx: JellyfinContext,
   opts: { musicFolderId?: string }
 ): Promise<JellyfinGenreSummary[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const genresApi = getGenresApi(api);
   const { musicFolderId } = opts;
   const response = await genresApi.getGenres({
@@ -453,10 +675,10 @@ export interface JellyfinNowPlayingEntry {
 
 /** Get current now-playing audio items for a user from Jellyfin sessions. */
 export async function getNowPlayingForUser(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string
 ): Promise<JellyfinNowPlayingEntry[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const sessionApi = getSessionApi(api);
   const response = await sessionApi.getSessions({
     controllableByUserId: userId,
@@ -488,11 +710,11 @@ export async function getNowPlayingForUser(
 
 /** Report playback start for an audio item so Jellyfin can show it in Now Playing. */
 export async function reportPlaybackStart(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   itemId: string
 ): Promise<void> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const playstateApi = getPlaystateApi(api);
   try {
     await playstateApi.reportPlaybackStart({
@@ -509,12 +731,12 @@ export async function reportPlaybackStart(
 
 /** Report playback progress so Jellyfin knows an item is actively playing. */
 export async function reportPlaybackProgress(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   itemId: string,
   positionMs?: number
 ): Promise<void> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const playstateApi = getPlaystateApi(api);
   try {
     await playstateApi.reportPlaybackProgress({
@@ -533,12 +755,12 @@ export async function reportPlaybackProgress(
 
 /** Report playback stopped so Jellyfin can finalize play state. */
 export async function reportPlaybackStopped(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   itemId: string,
   positionMs?: number
 ): Promise<void> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const playstateApi = getPlaystateApi(api);
   try {
     await playstateApi.reportPlaybackStopped({
@@ -557,11 +779,11 @@ export async function reportPlaybackStopped(
 
 /** Get songs filtered by genre. */
 export async function getSongsByGenre(
-  accessToken: string,
+  ctx: JellyfinContext,
   genre: string,
   opts: { musicFolderId?: string; size?: number; offset?: number }
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const { musicFolderId, size, offset } = opts;
   const response = await itemsApi.getItems({
@@ -579,10 +801,10 @@ export async function getSongsByGenre(
 
 /** Get favorited items (songs only for now) for the current user. */
 export async function getFavoriteSongs(
-  accessToken: string,
+  ctx: JellyfinContext,
   opts: { musicFolderId?: string; size?: number; offset?: number }
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const { musicFolderId, size, offset } = opts;
   const response = await itemsApi.getItems({
@@ -600,10 +822,10 @@ export async function getFavoriteSongs(
 
 /** Get favorited albums for the current user. */
 export async function getFavoriteAlbums(
-  accessToken: string,
+  ctx: JellyfinContext,
   opts: { musicFolderId?: string; size?: number; offset?: number }
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const { musicFolderId, size, offset } = opts;
   const response = await itemsApi.getItems({
@@ -621,13 +843,14 @@ export async function getFavoriteAlbums(
 
 /** Mark an item as favorite for the given user. */
 export async function markFavorite(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   itemId: string
 ): Promise<void> {
-  const api: any = createJellyfinApi(accessToken);
+  const { accessToken, device } = normalizeContext(ctx);
+  const api: any = getApi(ctx);
   const url = api.getUri(`/Users/${userId}/FavoriteItems/${itemId}`);
-  const authHeader = buildJellyfinAuthHeader(accessToken);
+  const authHeader = buildJellyfinAuthHeader(accessToken, device);
   await api.axiosInstance.post(
     url,
     {},
@@ -641,13 +864,14 @@ export async function markFavorite(
 
 /** Remove favorite flag from an item for the given user. */
 export async function unmarkFavorite(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   itemId: string
 ): Promise<void> {
-  const api: any = createJellyfinApi(accessToken);
+  const { accessToken, device } = normalizeContext(ctx);
+  const api: any = getApi(ctx);
   const url = api.getUri(`/Users/${userId}/FavoriteItems/${itemId}`);
-  const authHeader = buildJellyfinAuthHeader(accessToken);
+  const authHeader = buildJellyfinAuthHeader(accessToken, device);
   await api.axiosInstance.delete(url, {
     headers: {
       Authorization: authHeader,
@@ -657,13 +881,14 @@ export async function unmarkFavorite(
 
 /** Update "like" rating for an item (maps Subsonic rating to Jellyfin likes). */
 export async function setUserLikeForItem(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   itemId: string,
   likes: boolean | null
 ): Promise<void> {
-  const api: any = createJellyfinApi(accessToken);
-  const authHeader = buildJellyfinAuthHeader(accessToken);
+  const { accessToken, device } = normalizeContext(ctx);
+  const api: any = getApi(ctx);
+  const authHeader = buildJellyfinAuthHeader(accessToken, device);
   if (likes === null) {
     // Clear rating by deleting it.
     const url = api.getUri(`/Users/${userId}/Items/${itemId}/Rating`);
@@ -690,11 +915,11 @@ export async function setUserLikeForItem(
 
 /** Search artists by name using Jellyfin's searchTerm. */
 export async function searchArtists(
-  accessToken: string,
+  ctx: JellyfinContext,
   query: string,
   opts: { size?: number; offset?: number; musicFolderId?: string }
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const { size, offset, musicFolderId } = opts;
   const response = await itemsApi.getItems({
@@ -712,11 +937,11 @@ export async function searchArtists(
 
 /** Search albums by name using Jellyfin's searchTerm. */
 export async function searchAlbums(
-  accessToken: string,
+  ctx: JellyfinContext,
   query: string,
   opts: { size?: number; offset?: number; musicFolderId?: string }
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const { size, offset, musicFolderId } = opts;
   const response = await itemsApi.getItems({
@@ -734,11 +959,11 @@ export async function searchAlbums(
 
 /** Search songs by title/artist/album using Jellyfin's searchTerm. */
 export async function searchSongs(
-  accessToken: string,
+  ctx: JellyfinContext,
   query: string,
   opts: { size?: number; offset?: number; musicFolderId?: string }
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const { size, offset, musicFolderId } = opts;
   const response = await itemsApi.getItems({
@@ -760,13 +985,13 @@ export async function searchSongs(
  * Used as a fallback in getLyrics when searchSongs(artist + " " + title) returns 0 results.
  */
 export async function resolveSongsByArtistAndTitle(
-  accessToken: string,
+  ctx: JellyfinContext,
   artist: string,
   title: string,
   opts: { limit?: number } = {}
 ): Promise<BaseItemDto[]> {
   if (!artist?.trim() && !title?.trim()) return [];
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const limit = opts.limit ?? 50;
 
@@ -830,10 +1055,10 @@ interface JellyfinPlaylistSummary {
 
 /** List playlists visible to the given user. */
 export async function getPlaylists(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string
 ): Promise<JellyfinPlaylistSummary[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const response = await itemsApi.getItems({
     includeItemTypes: [BaseItemKind.Playlist],
@@ -855,13 +1080,14 @@ export async function getPlaylists(
 
 /** Get items in a Jellyfin playlist as audio tracks. */
 export async function getPlaylistItems(
-  accessToken: string,
+  ctx: JellyfinContext,
   playlistId: string,
   userId: string
 ): Promise<BaseItemDto[]> {
-  const api: any = createJellyfinApi(accessToken);
+  const { accessToken, device } = normalizeContext(ctx);
+  const api: any = getApi(ctx);
   const url = api.getUri(`/Playlists/${playlistId}/Items`, { UserId: userId });
-  const authHeader = buildJellyfinAuthHeader(accessToken);
+  const authHeader = buildJellyfinAuthHeader(accessToken, device);
   const response = await api.axiosInstance.get(url, {
     headers: {
       Authorization: authHeader,
@@ -873,13 +1099,13 @@ export async function getPlaylistItems(
 
 /** Create a new playlist. Returns the new playlist id. */
 export async function createPlaylist(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   name: string,
   itemIds?: string[],
   isPublic?: boolean
 ): Promise<string> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const playlistsApi = getPlaylistsApi(api);
   const raw = itemIds ?? [];
   const ids = raw.filter(
@@ -904,7 +1130,7 @@ export async function createPlaylist(
 
 /** Add items to an existing playlist. */
 export async function addItemsToPlaylist(
-  accessToken: string,
+  ctx: JellyfinContext,
   playlistId: string,
   userId: string,
   itemIds: string[]
@@ -916,7 +1142,7 @@ export async function addItemsToPlaylist(
       id !== "[object Object]"
   );
   if (ids.length === 0) return;
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const playlistsApi = getPlaylistsApi(api);
   await playlistsApi.addItemToPlaylist({
     playlistId,
@@ -927,12 +1153,12 @@ export async function addItemsToPlaylist(
 
 /** Remove items from a playlist by their item ids (as returned in getPlaylistItems). */
 export async function removeItemsFromPlaylist(
-  accessToken: string,
+  ctx: JellyfinContext,
   playlistId: string,
   entryIds: string[]
 ): Promise<void> {
   if (entryIds.length === 0) return;
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const playlistsApi = getPlaylistsApi(api);
   await playlistsApi.removeItemFromPlaylist({
     playlistId,
@@ -942,11 +1168,11 @@ export async function removeItemsFromPlaylist(
 
 /** Update playlist name or visibility. */
 export async function updatePlaylistMetadata(
-  accessToken: string,
+  ctx: JellyfinContext,
   playlistId: string,
   dto: { Name?: string; IsPublic?: boolean }
 ): Promise<void> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const playlistsApi = getPlaylistsApi(api);
   await playlistsApi.updatePlaylist({
     playlistId,
@@ -956,12 +1182,13 @@ export async function updatePlaylistMetadata(
 
 /** Delete a playlist (must be owned by the user). */
 export async function deletePlaylist(
-  accessToken: string,
+  ctx: JellyfinContext,
   playlistId: string
 ): Promise<void> {
-  const api: any = createJellyfinApi(accessToken);
+  const { accessToken, device } = normalizeContext(ctx);
+  const api: any = getApi(ctx);
   const url = api.getUri(`/Items/${playlistId}`);
-  const authHeader = buildJellyfinAuthHeader(accessToken);
+  const authHeader = buildJellyfinAuthHeader(accessToken, device);
   await api.axiosInstance.delete(url, {
     headers: { Authorization: authHeader },
   });
@@ -969,10 +1196,10 @@ export async function deletePlaylist(
 
 /** Get a single song (audio item) by id. */
 export async function getSong(
-  accessToken: string,
+  ctx: JellyfinContext,
   id: string
 ): Promise<BaseItemDto | null> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   try {
     const response = await itemsApi.getItems({
@@ -987,10 +1214,10 @@ export async function getSong(
 
 /** Get any single item by id (artist, album, song, etc.) so we can detect type for instant mix. */
 export async function getItemById(
-  accessToken: string,
+  ctx: JellyfinContext,
   id: string
 ): Promise<BaseItemDto | null> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   try {
     const response = await itemsApi.getItems({
@@ -1005,12 +1232,12 @@ export async function getItemById(
 
 /** Get similar songs using Jellyfin's instant mix (recommendations). Uses Artists/Album/Item endpoints so plugins (e.g. AudioMuse-AI) get the right context. When id has no prefix, resolves type so artist ids still hit /Artists/{id}/InstantMix. */
 export async function getSimilarSongs(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   id: string,
   count: number
 ): Promise<BaseItemDto[]> {
-  const api = createJellyfinApi(accessToken);
+  const api = getApi(ctx);
   const instantMixApi = InstantMixApiFactory(
     api.configuration,
     api.basePath,
@@ -1024,7 +1251,7 @@ export async function getSimilarSongs(
 
   // When client sends raw id (e.g. Tempus artist Radio without ar- prefix), resolve so we call the right endpoint (Artists/Album/Item) for AudioMuse-style plugins
   if (!isArtist && !isAlbum) {
-    const item = await getItemById(accessToken, cleanId);
+    const item = await getItemById(ctx, cleanId);
     const type = (item as { Type?: string } | null)?.Type;
     if (type === "MusicArtist") {
       isArtist = true;
@@ -1126,7 +1353,7 @@ function parseLyricLine(l: Record<string, unknown>): { text: string; startMs: nu
 
 /** Get lyrics for an audio item. Uses direct GET to /Audio/{id}/Lyrics so we control URL and parsing. Returns lines with start in milliseconds for live/synced lyrics. */
 export async function getLyricsForItem(
-  accessToken: string,
+  ctx: JellyfinContext,
   itemId: string
 ): Promise<{ value: string; lines?: JellyfinLyricLine[] } | null> {
   const now = Date.now();
@@ -1135,10 +1362,11 @@ export async function getLyricsForItem(
   if (cached && cached.expiresAt > now) {
     return { value: cached.value, lines: cached.lines };
   }
+  const { accessToken, device } = normalizeContext(ctx);
   const base = jf.baseUrl.replace(/\/$/, "");
   const url = `${base}/Audio/${itemId}/Lyrics`;
-  const authHeader = buildJellyfinAuthHeader(accessToken);
-  const api: any = createJellyfinApi(accessToken);
+  const authHeader = buildJellyfinAuthHeader(accessToken, device);
+  const api: any = getApi(ctx);
   try {
     const response = await api.axiosInstance.get(url, {
       headers: { Authorization: authHeader },
@@ -1247,12 +1475,14 @@ const TRANSCODE_FORMATS = new Set(["opus", "aac", "m4a", "webma", "wav"]);
 
 /** Get stream URL for an audio item (used when proxying to client). Uses universal for MP3; uses stream-by-container for Opus/AAC/etc. so Jellyfin actually transcodes. */
 export function getStreamUrl(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   itemId: string,
   maxBitRateKbps?: number,
   format?: string
 ): string {
+  const { accessToken } = normalizeContext(ctx);
+  const deviceId = getDeviceIdForUrl(ctx);
   const base = jf.baseUrl.replace(/\/$/, "");
   const normalized = (format ?? "").toLowerCase().trim();
   const wantTranscode = normalized && normalized !== "raw" && TRANSCODE_FORMATS.has(normalized);
@@ -1263,7 +1493,7 @@ export function getStreamUrl(
     const container = normalized === "webma" ? "webm" : normalized;
     const url = new URL(`${base}/Audio/${itemId}/stream.${container}`);
     url.searchParams.set("UserId", userId);
-    url.searchParams.set("DeviceId", jf.deviceId);
+    url.searchParams.set("DeviceId", deviceId);
     url.searchParams.set("audioCodec", container === "m4a" ? "aac" : container);
     url.searchParams.set("audioBitRate", String(audioBitRateBps));
     url.searchParams.set("ApiKey", accessToken);
@@ -1273,7 +1503,7 @@ export function getStreamUrl(
   // MP3 or raw/unspecified: use universal endpoint (reliable for MP3).
   const url = new URL(`${base}/Audio/${itemId}/universal`);
   url.searchParams.set("UserId", userId);
-  url.searchParams.set("DeviceId", jf.deviceId);
+  url.searchParams.set("DeviceId", deviceId);
   url.searchParams.set("Container", "mp3");
   url.searchParams.set("AudioCodec", "mp3");
   url.searchParams.set("MaxStreamingBitrate", String(audioBitRateBps));
@@ -1286,14 +1516,16 @@ export function getStreamUrl(
  * Uses Jellyfin's audio stream endpoint and requests the original file (`Static=true`).
  */
 export function getDownloadUrl(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   itemId: string
 ): string {
+  const { accessToken } = normalizeContext(ctx);
+  const deviceId = getDeviceIdForUrl(ctx);
   const base = jf.baseUrl.replace(/\/$/, "");
   const url = new URL(`${base}/Audio/${itemId}/stream`);
   url.searchParams.set("UserId", userId);
-  url.searchParams.set("DeviceId", jf.deviceId);
+  url.searchParams.set("DeviceId", deviceId);
   // Ask Jellyfin to serve the original file when possible instead of a transcoded stream.
   url.searchParams.set("static", "true");
   url.searchParams.set("ApiKey", accessToken);
@@ -1302,11 +1534,12 @@ export function getDownloadUrl(
 
 /** Get cover/image URL for an item (used when proxying to client). */
 export function getImageUrl(
-  accessToken: string,
+  ctx: JellyfinContext,
   itemId: string,
   imageType = "Primary",
   size?: number
 ): string {
+  const { accessToken } = normalizeContext(ctx);
   const base = jf.baseUrl.replace(/\/$/, "");
   const url = new URL(`${base}/Items/${itemId}/Images/${imageType}`);
   if (size && size > 0) {
@@ -1319,10 +1552,11 @@ export function getImageUrl(
 
 /** Get avatar URL for a given Jellyfin user (used when proxying to client). */
 export function getUserAvatarUrl(
-  accessToken: string,
+  ctx: JellyfinContext,
   userId: string,
   size?: number
 ): string {
+  const { accessToken } = normalizeContext(ctx);
   const base = jf.baseUrl.replace(/\/$/, "");
   const url = new URL(`${base}/Users/${userId}/Images/Primary`);
   if (size && size > 0) {
@@ -1335,7 +1569,7 @@ export function getUserAvatarUrl(
 
 /** Check if QuickConnect is enabled (for web UI). */
 export async function getQuickConnectEnabled(): Promise<boolean> {
-  const api = createJellyfinApi(""); // no token needed for this call
+  const api = getApi(""); // no token needed for this call
   const qcApi = getQuickConnectApi(api);
   try {
     const response = await qcApi.getQuickConnectEnabled();
@@ -1350,7 +1584,7 @@ export async function initiateQuickConnect(): Promise<{
   secret: string;
   code: string;
 } | null> {
-  const api = createJellyfinApi("");
+  const api = getApi("");
   const qcApi = getQuickConnectApi(api);
   try {
     const response = await qcApi.initiateQuickConnect();
@@ -1366,7 +1600,7 @@ export async function initiateQuickConnect(): Promise<{
 export async function getQuickConnectState(secret: string): Promise<{
   authenticated: boolean;
 }> {
-  const api = createJellyfinApi("");
+  const api = getApi("");
   const qcApi = getQuickConnectApi(api);
   try {
     const response = await qcApi.getQuickConnectState({ secret });
@@ -1381,7 +1615,7 @@ export async function getQuickConnectState(secret: string): Promise<{
 export async function authenticateWithQuickConnect(
   secret: string
 ): Promise<{ userId: string; accessToken: string } | null> {
-  const api = createJellyfinApi("");
+  const api = getApi("");
   const userApi = getUserApi(api);
   try {
     const response = await userApi.authenticateWithQuickConnect({
@@ -1399,9 +1633,9 @@ export async function authenticateWithQuickConnect(
   }
 }
 
-/** Get current user info (name) given an access token. */
-export async function getCurrentUserName(accessToken: string): Promise<string | null> {
-  const api = createJellyfinApi(accessToken);
+/** Get current user info (name) given an access token or context. */
+export async function getCurrentUserName(ctxOrToken: JellyfinContext | string): Promise<string | null> {
+  const api = getApi(ctxOrToken);
   const userApi = getUserApi(api);
   try {
     const response = await userApi.getCurrentUser();
@@ -1417,7 +1651,7 @@ export async function authenticateByName(
   username: string,
   password: string
 ): Promise<{ userId: string; accessToken: string } | null> {
-  const api = createJellyfinApi("");
+  const api = getApi("");
   const userApi = getUserApi(api);
   try {
     const response = await userApi.authenticateUserByName({

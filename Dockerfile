@@ -29,7 +29,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 # App from builder
 COPY --from=builder /app/dist ./dist
 
-# Data directory: app writes subfin.json here
+# Data directory: SQLite DB and optional config (SUBFIN_DB_PATH defaults to /data/subfin.db)
 RUN mkdir -p /data && chown -R subfin:subfin /data
 
 EXPOSE 4040

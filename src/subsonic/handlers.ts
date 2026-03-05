@@ -11,7 +11,7 @@ import {
   toSubsonicSong,
   ticksToSeconds,
 } from "./mappers.js";
-import type { AuthResult } from "./auth.js";
+import { toJellyfinContext, type AuthResult } from "./auth.js";
 
 /** Resolve effective music folder id(s) for list endpoints: client param wins; else MUSIC_LIBRARY_IDS when set. Returns null = no restriction, [] = no allowed folders, [id...] = use these. */
 async function getEffectiveMusicFolderIds(
@@ -20,7 +20,7 @@ async function getEffectiveMusicFolderIds(
 ): Promise<string[] | null> {
   const trimmed = clientMusicFolderId?.trim();
   if (trimmed) return [trimmed];
-  return jf.getAllowedMusicFolderIds(auth.jellyfinAccessToken, auth.jellyfinUserId);
+  return jf.getAllowedMusicFolderIds(toJellyfinContext(auth), auth.jellyfinUserId);
 }
 
 export async function handlePing(): Promise<Record<string, unknown>> {
@@ -50,7 +50,7 @@ export async function handleGetOpenSubsonicExtensions(): Promise<Record<string, 
 }
 
 export async function handleGetMusicFolders(auth: AuthResult): Promise<Record<string, unknown>> {
-  const folders = await jf.getMusicLibraries(auth.jellyfinAccessToken, auth.jellyfinUserId);
+  const folders = await jf.getMusicLibraries(toJellyfinContext(auth), auth.jellyfinUserId);
   return {
     musicFolders: {
       musicFolder: folders.map((f) => ({ id: f.id, name: f.name })),
@@ -65,14 +65,14 @@ export async function handleGetArtists(
   const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
   let artists: Awaited<ReturnType<typeof jf.getArtists>>;
   if (folderIds === null) {
-    artists = await jf.getArtists(auth.jellyfinAccessToken, undefined);
+    artists = await jf.getArtists(toJellyfinContext(auth), undefined);
   } else if (folderIds.length === 0) {
     artists = [];
   } else if (folderIds.length === 1) {
-    artists = await jf.getArtists(auth.jellyfinAccessToken, folderIds[0]);
+    artists = await jf.getArtists(toJellyfinContext(auth), folderIds[0]);
   } else {
     const results = await Promise.all(
-      folderIds.map((id) => jf.getArtists(auth.jellyfinAccessToken, id))
+      folderIds.map((id) => jf.getArtists(toJellyfinContext(auth), id))
     );
     const byId = new Map<string, Awaited<ReturnType<typeof jf.getArtists>>[number]>();
     for (const list of results) for (const a of list) if (a.Id) byId.set(a.Id, a);
@@ -91,14 +91,14 @@ export async function handleGetIndexes(
   const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
   let artists: Awaited<ReturnType<typeof jf.getArtists>>;
   if (folderIds === null) {
-    artists = await jf.getArtists(auth.jellyfinAccessToken, undefined);
+    artists = await jf.getArtists(toJellyfinContext(auth), undefined);
   } else if (folderIds.length === 0) {
     artists = [];
   } else if (folderIds.length === 1) {
-    artists = await jf.getArtists(auth.jellyfinAccessToken, folderIds[0]);
+    artists = await jf.getArtists(toJellyfinContext(auth), folderIds[0]);
   } else {
     const results = await Promise.all(
-      folderIds.map((id) => jf.getArtists(auth.jellyfinAccessToken, id))
+      folderIds.map((id) => jf.getArtists(toJellyfinContext(auth), id))
     );
     const byId = new Map<string, Awaited<ReturnType<typeof jf.getArtists>>[number]>();
     for (const list of results) for (const a of list) if (a.Id) byId.set(a.Id, a);
@@ -122,8 +122,8 @@ export async function handleGetArtist(
   if (!id) throw new Error("Missing id");
   const cleanId = stripSubsonicIdPrefix(id);
   const [artist, albums] = await Promise.all([
-    jf.getArtist(auth.jellyfinAccessToken, cleanId),
-    jf.getAlbumsByArtist(auth.jellyfinAccessToken, cleanId),
+    jf.getArtist(toJellyfinContext(auth), cleanId),
+    jf.getAlbumsByArtist(toJellyfinContext(auth), cleanId),
   ]);
   if (!artist) throw new Error("NotFound");
   return {
@@ -143,9 +143,9 @@ export async function handleGetMusicDirectory(
   const cleanId = stripSubsonicIdPrefix(id);
 
   // Try album first (al- prefix or raw album id).
-  const album = await jf.getAlbum(auth.jellyfinAccessToken, cleanId);
+  const album = await jf.getAlbum(toJellyfinContext(auth), cleanId);
   if (album) {
-    const songs = await jf.getSongsByAlbum(auth.jellyfinAccessToken, cleanId);
+    const songs = await jf.getSongsByAlbum(toJellyfinContext(auth), cleanId);
     const artistName = album.AlbumArtist ?? album.Artists?.[0] ?? "";
     return {
       musicDirectory: {
@@ -161,8 +161,8 @@ export async function handleGetMusicDirectory(
 
   // Fallback: treat as artist (ar- prefix or raw artist id).
   const [artist, albums] = await Promise.all([
-    jf.getArtist(auth.jellyfinAccessToken, cleanId),
-    jf.getAlbumsByArtist(auth.jellyfinAccessToken, cleanId),
+    jf.getArtist(toJellyfinContext(auth), cleanId),
+    jf.getAlbumsByArtist(toJellyfinContext(auth), cleanId),
   ]);
   if (!artist) {
     throw new Error("NotFound");
@@ -201,8 +201,8 @@ export async function handleGetAlbum(
   }
   const cleanId = stripSubsonicIdPrefix(id);
   const [album, songs] = await Promise.all([
-    jf.getAlbum(auth.jellyfinAccessToken, cleanId),
-    jf.getSongsByAlbum(auth.jellyfinAccessToken, cleanId),
+    jf.getAlbum(toJellyfinContext(auth), cleanId),
+    jf.getSongsByAlbum(toJellyfinContext(auth), cleanId),
   ]);
   if (!album) throw new Error("NotFound");
   return {
@@ -225,7 +225,8 @@ export async function handleGetAlbumList(
   const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
   let albums: Awaited<ReturnType<typeof jf.getAlbumsForLibrary>>;
   if (folderIds === null) {
-    albums = await jf.getAlbumsForLibrary(auth.jellyfinAccessToken, {
+    albums = await jf.getAlbumsForLibrary(toJellyfinContext(auth), {
+      userId: auth.jellyfinUserId,
       type,
       size,
       offset,
@@ -236,7 +237,8 @@ export async function handleGetAlbumList(
   } else if (folderIds.length === 0) {
     albums = [];
   } else if (folderIds.length === 1) {
-    albums = await jf.getAlbumsForLibrary(auth.jellyfinAccessToken, {
+    albums = await jf.getAlbumsForLibrary(toJellyfinContext(auth), {
+      userId: auth.jellyfinUserId,
       musicFolderId: folderIds[0],
       type,
       size,
@@ -249,7 +251,8 @@ export async function handleGetAlbumList(
     const needed = offset + size;
     const results = await Promise.all(
       folderIds.map((musicFolderId) =>
-        jf.getAlbumsForLibrary(auth.jellyfinAccessToken, {
+        jf.getAlbumsForLibrary(toJellyfinContext(auth), {
+          userId: auth.jellyfinUserId,
           musicFolderId,
           type,
           size: needed,
@@ -266,7 +269,21 @@ export async function handleGetAlbumList(
     const typeLower = type.toLowerCase();
     if (typeLower === "newest") {
       merged.sort((a, b) => (b.DateCreated ?? "").localeCompare(a.DateCreated ?? ""));
-    } else if (typeLower === "alphabeticalbyname" || typeLower === "alphabeticalbyartist") {
+    } else if (typeLower === "recent") {
+      const lastPlayed = (x: typeof merged[0]) =>
+        (x as { UserData?: { LastPlayedDate?: string }; DateLastPlayed?: string }).UserData
+          ?.LastPlayedDate ??
+        (x as { DateLastPlayed?: string }).DateLastPlayed ??
+        "";
+      merged.sort((a, b) => lastPlayed(b).localeCompare(lastPlayed(a)));
+    } else if (typeLower === "frequent") {
+      const playCount = (x: typeof merged[0]) => (x as { PlayCount?: number }).PlayCount ?? 0;
+      merged.sort((a, b) => playCount(b) - playCount(a));
+    } else if (
+      typeLower === "starred" ||
+      typeLower === "alphabeticalbyname" ||
+      typeLower === "alphabeticalbyartist"
+    ) {
       merged.sort((a, b) => (a.SortName ?? "").localeCompare(b.SortName ?? ""));
     } else if (typeLower === "byyear") {
       merged.sort(
@@ -351,7 +368,7 @@ export async function handleGetUsers(auth: AuthResult): Promise<Record<string, u
 export async function handleGetPlaylists(
   auth: AuthResult
 ): Promise<Record<string, unknown>> {
-  const pls = await jf.getPlaylists(auth.jellyfinAccessToken, auth.jellyfinUserId);
+  const pls = await jf.getPlaylists(toJellyfinContext(auth), auth.jellyfinUserId);
   return {
     playlists: {
       playlist: pls.map((p) => ({
@@ -383,7 +400,7 @@ export async function handleGetPlaylist(
   }
 
   const items = await jf.getPlaylistItems(
-    auth.jellyfinAccessToken,
+    toJellyfinContext(auth),
     id,
     auth.jellyfinUserId
   );
@@ -424,26 +441,26 @@ export async function handleCreatePlaylist(
   try {
     if (playlistId) {
       // Overwrite existing playlist: set name and replace items.
-      await jf.updatePlaylistMetadata(auth.jellyfinAccessToken, playlistId, {
+      await jf.updatePlaylistMetadata(toJellyfinContext(auth), playlistId, {
         Name: name,
         ...(params.public !== undefined && { IsPublic: isPublic }),
       });
       const current = await jf.getPlaylistItems(
-        auth.jellyfinAccessToken,
+        toJellyfinContext(auth),
         playlistId,
         auth.jellyfinUserId
       );
       const currentIds = current.map((i) => i.Id!).filter(Boolean);
       if (currentIds.length > 0) {
         await jf.removeItemsFromPlaylist(
-          auth.jellyfinAccessToken,
+          toJellyfinContext(auth),
           playlistId,
           currentIds
         );
       }
       if (songIds.length > 0) {
         await jf.addItemsToPlaylist(
-          auth.jellyfinAccessToken,
+          toJellyfinContext(auth),
           playlistId,
           auth.jellyfinUserId,
           songIds
@@ -452,7 +469,7 @@ export async function handleCreatePlaylist(
       return { playlist: { id: playlistId, name } };
     }
     const id = await jf.createPlaylist(
-      auth.jellyfinAccessToken,
+      toJellyfinContext(auth),
       auth.jellyfinUserId,
       name,
       songIds.length > 0 ? songIds : undefined,
@@ -491,18 +508,18 @@ export async function handleUpdatePlaylist(
 
   try {
     if (name !== undefined && name !== "") {
-      await jf.updatePlaylistMetadata(auth.jellyfinAccessToken, playlistId, {
+      await jf.updatePlaylistMetadata(toJellyfinContext(auth), playlistId, {
         Name: name,
       });
     }
     if (comment !== undefined || params.public !== undefined) {
-      await jf.updatePlaylistMetadata(auth.jellyfinAccessToken, playlistId, {
+      await jf.updatePlaylistMetadata(toJellyfinContext(auth), playlistId, {
         IsPublic: params.public !== undefined ? isPublic : undefined,
       });
     }
 
     const items = await jf.getPlaylistItems(
-      auth.jellyfinAccessToken,
+      toJellyfinContext(auth),
       playlistId,
       auth.jellyfinUserId
     );
@@ -515,7 +532,7 @@ export async function handleUpdatePlaylist(
       }
       if (idsToRemove.length > 0) {
         await jf.removeItemsFromPlaylist(
-          auth.jellyfinAccessToken,
+          toJellyfinContext(auth),
           playlistId,
           idsToRemove
         );
@@ -524,7 +541,7 @@ export async function handleUpdatePlaylist(
 
     if (songIdsToAdd.length > 0) {
       await jf.addItemsToPlaylist(
-        auth.jellyfinAccessToken,
+        toJellyfinContext(auth),
         playlistId,
         auth.jellyfinUserId,
         songIdsToAdd
@@ -554,7 +571,7 @@ export async function handleDeletePlaylist(
   if (!id) throw new Error("Missing id");
 
   try {
-    await jf.deletePlaylist(auth.jellyfinAccessToken, id);
+    await jf.deletePlaylist(toJellyfinContext(auth), id);
     return {};
   } catch (err: unknown) {
     const status = (err as { response?: { status?: number } })?.response?.status;
@@ -582,7 +599,7 @@ export async function handleGetArtistInfo(
   // Resolve to artist id if id is album or song
   let resolvedArtistId = /^ar-/i.test(id) ? artistId : null;
   if (!resolvedArtistId) {
-    const item = await jf.getItemById(auth.jellyfinAccessToken, artistId);
+    const item = await jf.getItemById(toJellyfinContext(auth), artistId);
     const type = (item as { Type?: string } | null)?.Type;
     if (type === "MusicArtist") {
       resolvedArtistId = artistId;
@@ -595,8 +612,8 @@ export async function handleGetArtistInfo(
   }
 
   const [artist, similar] = await Promise.all([
-    jf.getArtistWithInfo(auth.jellyfinAccessToken, resolvedArtistId),
-    jf.getSimilarArtists(auth.jellyfinAccessToken, auth.jellyfinUserId, resolvedArtistId, count),
+    jf.getArtistWithInfo(toJellyfinContext(auth), resolvedArtistId),
+    jf.getSimilarArtists(toJellyfinContext(auth), auth.jellyfinUserId, resolvedArtistId, count),
   ]);
 
   const baseUrl = config.subfinPublicUrl;
@@ -645,8 +662,8 @@ export async function handleGetStarred(
   const offset = Number.parseInt(params.offset ?? "0", 10) || 0;
   const musicFolderId = params.musicFolderId?.trim() || undefined;
   const [albums, songs] = await Promise.all([
-    jf.getFavoriteAlbums(auth.jellyfinAccessToken, { musicFolderId, size, offset }),
-    jf.getFavoriteSongs(auth.jellyfinAccessToken, { musicFolderId, size, offset }),
+    jf.getFavoriteAlbums(toJellyfinContext(auth), { musicFolderId, size, offset }),
+    jf.getFavoriteSongs(toJellyfinContext(auth), { musicFolderId, size, offset }),
   ]);
   return {
     starred: {
@@ -690,11 +707,11 @@ export async function handleGetRandomSongs(
   const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
   let songs: Awaited<ReturnType<typeof jf.getRandomSongs>>;
   if (folderIds === null) {
-    songs = await jf.getRandomSongs(auth.jellyfinAccessToken, { size, offset });
+    songs = await jf.getRandomSongs(toJellyfinContext(auth), { size, offset });
   } else if (folderIds.length === 0) {
     songs = [];
   } else if (folderIds.length === 1) {
-    songs = await jf.getRandomSongs(auth.jellyfinAccessToken, {
+    songs = await jf.getRandomSongs(toJellyfinContext(auth), {
       musicFolderId: folderIds[0],
       size,
       offset,
@@ -703,7 +720,7 @@ export async function handleGetRandomSongs(
     const needed = offset + size;
     const results = await Promise.all(
       folderIds.map((musicFolderId) =>
-        jf.getRandomSongs(auth.jellyfinAccessToken, {
+        jf.getRandomSongs(toJellyfinContext(auth), {
           musicFolderId,
           size: needed,
           offset: 0,
@@ -731,17 +748,17 @@ export async function handleGetGenres(
     const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
     let genres: Awaited<ReturnType<typeof jf.getGenres>>;
     if (folderIds === null) {
-      genres = await jf.getGenres(auth.jellyfinAccessToken, {});
+      genres = await jf.getGenres(toJellyfinContext(auth), {});
     } else if (folderIds.length === 0) {
       genres = [];
     } else if (folderIds.length === 1) {
-      genres = await jf.getGenres(auth.jellyfinAccessToken, {
+      genres = await jf.getGenres(toJellyfinContext(auth), {
         musicFolderId: folderIds[0],
       });
     } else {
       const results = await Promise.all(
         folderIds.map((musicFolderId) =>
-          jf.getGenres(auth.jellyfinAccessToken, { musicFolderId })
+          jf.getGenres(toJellyfinContext(auth), { musicFolderId })
         )
       );
       const byName = new Map<string, { name: string; songCount: number; albumCount: number }>();
@@ -796,11 +813,11 @@ export async function handleGetSongsByGenre(
   const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
   let songs: Awaited<ReturnType<typeof jf.getSongsByGenre>>;
   if (folderIds === null) {
-    songs = await jf.getSongsByGenre(auth.jellyfinAccessToken, genre, { size, offset });
+    songs = await jf.getSongsByGenre(toJellyfinContext(auth), genre, { size, offset });
   } else if (folderIds.length === 0) {
     songs = [];
   } else if (folderIds.length === 1) {
-    songs = await jf.getSongsByGenre(auth.jellyfinAccessToken, genre, {
+    songs = await jf.getSongsByGenre(toJellyfinContext(auth), genre, {
       musicFolderId: folderIds[0],
       size,
       offset,
@@ -809,7 +826,7 @@ export async function handleGetSongsByGenre(
     const needed = offset + size;
     const results = await Promise.all(
       folderIds.map((musicFolderId) =>
-        jf.getSongsByGenre(auth.jellyfinAccessToken, genre, {
+        jf.getSongsByGenre(toJellyfinContext(auth), genre, {
           musicFolderId,
           size: needed,
           offset: 0,
@@ -832,7 +849,7 @@ export async function handleGetSongsByGenre(
 export async function handleGetNowPlaying(
   auth: AuthResult
 ): Promise<Record<string, unknown>> {
-  const entries = await jf.getNowPlayingForUser(auth.jellyfinAccessToken, auth.jellyfinUserId);
+  const entries = await jf.getNowPlayingForUser(toJellyfinContext(auth), auth.jellyfinUserId);
   return {
     nowPlaying: {
       entry: entries.map(({ item, username, minutesAgo, playerId, playerName }) => {
@@ -849,33 +866,48 @@ export async function handleGetNowPlaying(
   };
 }
 
-/** scrobble: accept and ignore playback reports (no-op). */
+/** scrobble: accept playback reports and forward to Jellyfin playstate API. */
 export async function handleScrobble(
   auth: AuthResult,
   params: Record<string, string>
 ): Promise<Record<string, unknown>> {
-  const id = params.id?.trim();
-  if (id) {
-    const timeMs = params.time ? Number.parseInt(params.time, 10) || undefined : undefined;
-    const submission = (params.submission ?? params.submitted ?? "").toLowerCase();
-    const isSubmission =
-      submission === "true" || submission === "1" || submission === "yes" || submission === "";
+  const rawId = params.id?.trim();
+  if (!rawId) return {};
 
-    // When submission is false, treat this as a "now playing" update and start a Jellyfin session.
-    if (!isSubmission) {
-      void jf.reportPlaybackStart(auth.jellyfinAccessToken, auth.jellyfinUserId, id);
-    }
+  const id = stripSubsonicIdPrefix(rawId);
+  const timeMs = params.time ? Number.parseInt(params.time, 10) || undefined : undefined;
+  const submission = (params.submission ?? params.submitted ?? "").toLowerCase();
+  const isSubmission =
+    submission === "true" || submission === "1" || submission === "yes" || submission === "";
 
-    // Use scrobble as a lightweight signal that this item is (or was) playing.
-    // Many clients send scrobble repeatedly; reporting progress is cheap and helps Jellyfin show activity.
-    void jf.reportPlaybackProgress(auth.jellyfinAccessToken, auth.jellyfinUserId, id, timeMs);
-
-    // When submission is true (or omitted, which defaults to true), treat this as an end-of-track scrobble
-    // and notify Jellyfin that playback stopped.
-    if (isSubmission) {
-      void jf.reportPlaybackStopped(auth.jellyfinAccessToken, auth.jellyfinUserId, id, timeMs);
-    }
+  if (config.logRest) {
+    console.log(
+      `[SCROBBLE] id=${rawId} cleanId=${id} submission=${params.submission ?? params.submitted ?? ""} isSubmission=${isSubmission} time=${params.time ?? "none"}`
+    );
   }
+
+  const ctx = toJellyfinContext(auth);
+  const userId = auth.jellyfinUserId;
+
+  if (isSubmission) {
+    // End-of-track: client says this track finished. Many clients never send submission=false when
+    // a queued track auto-starts, so Jellyfin never got reportPlaybackStart. Send a full
+    // start → progress → stop sequence so Jellyfin records the item as played and updates
+    // DatePlayed / recently played. Order and awaiting start before stop matters for Jellyfin.
+    // "Now playing" in the dashboard will only update when we get this (e.g. at end of track or
+    // when the client sends progress scrobbles), unless the client sends submission=false when
+    // the queue advances to the next track.
+    await jf.reportPlaybackStart(ctx, userId, id);
+    await jf.reportPlaybackProgress(ctx, userId, id, timeMs);
+    await jf.reportPlaybackStopped(ctx, userId, id, timeMs);
+    if (config.logRest) console.log(`[SCROBBLE] sent start+progress+stop for ${id}`);
+  } else {
+    // Now playing: client says this track started (e.g. user hit next). Start session and report progress.
+    await jf.reportPlaybackStart(ctx, userId, id);
+    void jf.reportPlaybackProgress(ctx, userId, id, timeMs);
+    if (config.logRest) console.log(`[SCROBBLE] sent start+progress (now playing) for ${id}`);
+  }
+
   return {};
 }
 
@@ -895,7 +927,7 @@ export async function handleSetRating(
       else if (rating <= 2) likes = false;
       else likes = null;
     }
-    await jf.setUserLikeForItem(auth.jellyfinAccessToken, auth.jellyfinUserId, id, likes);
+    await jf.setUserLikeForItem(toJellyfinContext(auth), auth.jellyfinUserId, id, likes);
   }
   return {};
 }
@@ -921,7 +953,7 @@ export async function handleStar(
   if (uniqueIds.length > 0) {
     await Promise.all(
       uniqueIds.map((id) =>
-        jf.markFavorite(auth.jellyfinAccessToken, auth.jellyfinUserId, id)
+        jf.markFavorite(toJellyfinContext(auth), auth.jellyfinUserId, id)
       )
     );
   }
@@ -949,7 +981,7 @@ export async function handleUnstar(
   if (uniqueIds.length > 0) {
     await Promise.all(
       uniqueIds.map((id) =>
-        jf.unmarkFavorite(auth.jellyfinAccessToken, auth.jellyfinUserId, id)
+        jf.unmarkFavorite(toJellyfinContext(auth), auth.jellyfinUserId, id)
       )
     );
   }
@@ -966,7 +998,7 @@ export async function handleGetTopSongs(
     throw new Error("Missing artist");
   }
   const count = Number.parseInt(params.count ?? "50", 10) || 50;
-  const songs = await jf.getTopSongsForArtist(auth.jellyfinAccessToken, artistName, count);
+  const songs = await jf.getTopSongsForArtist(toJellyfinContext(auth), artistName, count);
   return {
     topSongs: {
       song: songs.map((s) => toSubsonicSong(s)),
@@ -983,7 +1015,7 @@ export async function handleGetSimilarSongs(
   if (!id) throw new Error("Missing id");
   const count = Number.parseInt(params.count ?? "50", 10) || 50;
   const songs = await jf.getSimilarSongs(
-    auth.jellyfinAccessToken,
+    toJellyfinContext(auth),
     auth.jellyfinUserId,
     id,
     count
@@ -1004,7 +1036,7 @@ export async function handleGetSimilarSongs2(
   if (!id) throw new Error("Missing id");
   const count = Number.parseInt(params.count ?? "50", 10) || 50;
   const songs = await jf.getSimilarSongs(
-    auth.jellyfinAccessToken,
+    toJellyfinContext(auth),
     auth.jellyfinUserId,
     id,
     count
@@ -1036,7 +1068,7 @@ export async function handleGetLyrics(
   let valueFromSearch = "";
 
   if (id) {
-    const song = await jf.getSong(auth.jellyfinAccessToken, id);
+    const song = await jf.getSong(toJellyfinContext(auth), id);
     if (song) {
       itemId = song.Id ?? null;
       artistName = song.AlbumArtist ?? song.Artists?.[0] ?? artistName;
@@ -1044,13 +1076,13 @@ export async function handleGetLyrics(
     }
   } else if (artist || title) {
     const query = [artist, title].filter(Boolean).join(" ");
-    let songs = await jf.searchSongs(auth.jellyfinAccessToken, query, { size: 8 });
+    let songs = await jf.searchSongs(toJellyfinContext(auth), query, { size: 8 });
     // When full-text search returns 0, fall back to resolve by artist then filter by title (same track can be found)
     if (songs.length === 0 && (artist?.trim() || title?.trim())) {
       if (logRest) {
         console.log("[LYRICS] getLyrics search returned 0 results query=\"" + query + "\", trying artist+title fallback");
       }
-      songs = await jf.resolveSongsByArtistAndTitle(auth.jellyfinAccessToken, artist ?? "", title ?? "", { limit: 8 });
+      songs = await jf.resolveSongsByArtistAndTitle(toJellyfinContext(auth), artist ?? "", title ?? "", { limit: 8 });
       if (logRest && songs.length > 0) {
         console.log("[LYRICS] getLyrics fallback resolved " + songs.length + " candidate(s) by artist+title");
       }
@@ -1067,7 +1099,7 @@ export async function handleGetLyrics(
           const sid = song.Id ?? null;
           if (!sid) return Promise.resolve<{ song: typeof song; value: string } | null>(null);
           return jf
-            .getLyricsForItem(auth.jellyfinAccessToken, sid)
+            .getLyricsForItem(toJellyfinContext(auth), sid)
             .then((lr) => (lr?.value ? { song, value: lr.value } : null))
             .catch(() => null);
         })
@@ -1117,7 +1149,7 @@ export async function handleGetLyrics(
 
   const value =
     valueFromSearch ||
-    (await jf.getLyricsForItem(auth.jellyfinAccessToken, itemId))?.value ||
+    (await jf.getLyricsForItem(toJellyfinContext(auth), itemId))?.value ||
     "";
 
   if (logRest) {
@@ -1146,10 +1178,10 @@ export async function handleGetLyricsBySongId(
     return { lyricsList: { structuredLyrics: [] } };
   }
   const itemId = stripSubsonicIdPrefix(id);
-  const song = await jf.getSong(auth.jellyfinAccessToken, itemId);
+  const song = await jf.getSong(toJellyfinContext(auth), itemId);
   const displayArtist = song?.AlbumArtist ?? song?.Artists?.[0] ?? "";
   const displayTitle = song?.Name ?? "";
-  const lyricsResult = await jf.getLyricsForItem(auth.jellyfinAccessToken, itemId);
+  const lyricsResult = await jf.getLyricsForItem(toJellyfinContext(auth), itemId);
   if (!lyricsResult?.value && (!lyricsResult?.lines || lyricsResult.lines.length === 0)) {
     return {
       lyricsList: {
@@ -1203,17 +1235,17 @@ export async function handleSearch3(
   const musicFolderId = params.musicFolderId?.trim() || undefined;
 
   const [artists, albums, songs] = await Promise.all([
-    jf.searchArtists(auth.jellyfinAccessToken, query, {
+    jf.searchArtists(toJellyfinContext(auth), query, {
       size: artistCount,
       offset: artistOffset,
       musicFolderId,
     }),
-    jf.searchAlbums(auth.jellyfinAccessToken, query, {
+    jf.searchAlbums(toJellyfinContext(auth), query, {
       size: albumCount,
       offset: albumOffset,
       musicFolderId,
     }),
-    jf.searchSongs(auth.jellyfinAccessToken, query, {
+    jf.searchSongs(toJellyfinContext(auth), query, {
       size: songCount,
       offset: songOffset,
       musicFolderId,
@@ -1261,7 +1293,7 @@ export async function handleGetSong(
   const id = params.id?.trim();
   if (!id) throw new Error("Missing id");
   const cleanId = stripSubsonicIdPrefix(id);
-  const song = await jf.getSong(auth.jellyfinAccessToken, cleanId);
+  const song = await jf.getSong(toJellyfinContext(auth), cleanId);
   if (!song) throw new Error("NotFound");
   return {
     song: toSubsonicSong(song),
@@ -1275,18 +1307,20 @@ export function getStreamRedirectUrl(
   maxBitRateKbps?: number,
   format?: string
 ): string {
-  return jf.getStreamUrl(auth.jellyfinAccessToken, auth.jellyfinUserId, id, maxBitRateKbps, format);
+  return jf.getStreamUrl(toJellyfinContext(auth), auth.jellyfinUserId, id, maxBitRateKbps, format);
 }
 
 /** Returns Jellyfin download URL used by the router to proxy the original audio file. */
 export function getDownloadRedirectUrl(auth: AuthResult, id: string): string {
   const cleanId = stripSubsonicIdPrefix(id);
-  return jf.getDownloadUrl(auth.jellyfinAccessToken, auth.jellyfinUserId, cleanId);
+  return jf.getDownloadUrl(toJellyfinContext(auth), auth.jellyfinUserId, cleanId);
 }
 
-/** Fire-and-forget hook so router can notify Jellyfin about playback starting. */
+/** Fire-and-forget: notify Jellyfin that playback started. Only used when the client explicitly
+ * signals "now playing" (e.g. scrobble with submission=false). We do not call this on stream
+ * requests because clients like SubTUI pre-fetch the next track for gapless playback. */
 export function notifyPlaybackStart(auth: AuthResult, id: string): void {
-  void jf.reportPlaybackStart(auth.jellyfinAccessToken, auth.jellyfinUserId, id);
+  void jf.reportPlaybackStart(toJellyfinContext(auth), auth.jellyfinUserId, id);
 }
 
 /** Returns Jellyfin image URL for cover art; router proxies the response. */
@@ -1302,7 +1336,7 @@ export function getCoverArtRedirectUrl(auth: AuthResult, id: string, size?: numb
   if (id.startsWith("ar-") || id.startsWith("al-") || id.startsWith("pl-")) {
     jellyfinId = id.slice(3);
   }
-  return jf.getImageUrl(auth.jellyfinAccessToken, jellyfinId, "Primary", size);
+  return jf.getImageUrl(toJellyfinContext(auth), jellyfinId, "Primary", size);
 }
 
 /** Returns Jellyfin avatar URL for the authenticated user; router proxies the response. */
@@ -1314,7 +1348,7 @@ export function getAvatarRedirectUrl(
   if (username != null && username.trim() !== "" && username.trim() !== auth.subsonicUsername) {
     return null;
   }
-  return jf.getUserAvatarUrl(auth.jellyfinAccessToken, auth.jellyfinUserId, size);
+  return jf.getUserAvatarUrl(toJellyfinContext(auth), auth.jellyfinUserId, size);
 }
 
 /** Stub: save play queue (no-op so clients don't error). */

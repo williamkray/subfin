@@ -1,5 +1,26 @@
 # Scripts
 
+## Recently played debug (Jellyfin API)
+
+**When to run:** To verify what Jellyfin returns for “recently played” albums vs tracks (e.g. if the Subfin “Recently Played” list looks wrong).
+
+**Prerequisites:**
+
+- `npm run build` so `dist/` exists.
+- Config in `data/subfin.config.json` (or set `SUBFIN_CONFIG`). Salt and Jellyfin URL come from there.
+- At least one linked device so `data/subfin.db` has credentials (script uses the same DB and salt to decrypt the Jellyfin token). Optional fallback: `.local-testing/subfin-api-credentials.json` with `jellyfin_user_id` and `jellyfin_access_token`.
+
+**Run:**
+
+```bash
+# From repo root; uses data/subfin.config.json and data/subfin.db by default
+node scripts/recently-played-debug.mjs
+```
+
+**What it does:** Calls Jellyfin’s `GetItems` with (1) MusicAlbum + SortBy=DatePlayed and (2) Audio + SortBy=DatePlayed, and prints the results. Subfin derives “Recently Played” albums from (2). If you get 401, re-link a device in the Subfin web UI to refresh the token.
+
+---
+
 ## Playlist API test (Subfin + Jellyfin)
 
 **When to run:** After you deploy Subfin and before validating in real clients (Musly, Tempus, DSub, etc.).

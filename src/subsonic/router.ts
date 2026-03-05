@@ -226,6 +226,10 @@ export function subsonicRouter(req: Request, res: Response): void {
       sendError(res, format, ErrorCode.RequiredParameterMissing, "Missing id");
       return;
     }
+    // Do not report playback start on stream: many clients pre-fetch the next track for gapless
+    // playback, so we would mark the wrong track as "now playing". For "now playing" to update
+    // when the queue auto-advances, the client must send scrobble(id, submission=false) when the
+    // new track actually starts (not just when it's streamed for pre-fetch).
     try {
       const maxBitRateKbps = params.maxBitRate
         ? Number.parseInt(params.maxBitRate, 10) || undefined
@@ -235,7 +239,11 @@ export function subsonicRouter(req: Request, res: Response): void {
       if (config.logRest) {
         console.log(`[STREAM] url=${url}`);
       }
-      proxyBinary(url, auth.jellyfinAccessToken, req, res);
+      const device =
+        auth.jellyfinDeviceId && auth.jellyfinDeviceName
+          ? { id: auth.jellyfinDeviceId, name: auth.jellyfinDeviceName }
+          : undefined;
+      proxyBinary(url, auth.jellyfinAccessToken, req, res, device);
       return;
     } catch (err) {
       console.error("Error resolving stream URL", err);
@@ -255,7 +263,11 @@ export function subsonicRouter(req: Request, res: Response): void {
       if (config.logRest) {
         console.log(`[DOWNLOAD] url=${url}`);
       }
-      proxyBinary(url, auth.jellyfinAccessToken, req, res);
+      const device =
+        auth.jellyfinDeviceId && auth.jellyfinDeviceName
+          ? { id: auth.jellyfinDeviceId, name: auth.jellyfinDeviceName }
+          : undefined;
+      proxyBinary(url, auth.jellyfinAccessToken, req, res, device);
       return;
     } catch (err) {
       console.error("Error resolving download URL", err);
@@ -280,7 +292,11 @@ export function subsonicRouter(req: Request, res: Response): void {
         sendError(res, format, ErrorCode.NotFound, "Cover art not found");
         return;
       }
-      proxyBinary(url, auth.jellyfinAccessToken, req, res);
+      const device =
+        auth.jellyfinDeviceId && auth.jellyfinDeviceName
+          ? { id: auth.jellyfinDeviceId, name: auth.jellyfinDeviceName }
+          : undefined;
+      proxyBinary(url, auth.jellyfinAccessToken, req, res, device);
       return;
     } catch (err) {
       sendError(res, format, ErrorCode.NotFound, "Cover art not found");
@@ -296,7 +312,11 @@ export function subsonicRouter(req: Request, res: Response): void {
       sendError(res, format, ErrorCode.NotFound, "Avatar not found");
       return;
     }
-    proxyBinary(url, auth.jellyfinAccessToken, req, res);
+    const device =
+      auth.jellyfinDeviceId && auth.jellyfinDeviceName
+        ? { id: auth.jellyfinDeviceId, name: auth.jellyfinDeviceName }
+        : undefined;
+    proxyBinary(url, auth.jellyfinAccessToken, req, res, device);
     return;
   }
 
@@ -1149,7 +1169,13 @@ function escapeXmlAttr(s: string): string {
   return escapeXml(s);
 }
 
-function proxyBinary(url: string, accessToken: string, clientReq: Request, clientRes: Response): void {
+function proxyBinary(
+  url: string,
+  accessToken: string,
+  clientReq: Request,
+  clientRes: Response,
+  device?: { id: string; name: string }
+): void {
   try {
     const target = new URL(url);
     const isHttps = target.protocol === "https:";
@@ -1159,7 +1185,7 @@ function proxyBinary(url: string, accessToken: string, clientReq: Request, clien
     if (clientReq.headers.range) {
       headers.range = clientReq.headers.range as string;
     }
-    headers.Authorization = buildJellyfinAuthHeader(accessToken);
+    headers.Authorization = buildJellyfinAuthHeader(accessToken, device);
     if (config.logRest) {
       console.log("[STREAM_PROXY_REQ]", {
         range: headers.range ?? null,
