@@ -1,0 +1,14 @@
+{
+  "port": 4040,
+  "subfinPublicUrl": "",
+  "jellyfin": {
+    "baseUrl": "http://localhost:8096",
+    "clientName": "Subfin",
+    "deviceId": "subfin-device-1",
+    "deviceName": "Subfin Middleware"
+  },
+  "musicLibraryIds": [],
+  "dbPath": "./subfin.db",
+  "logRest": false,
+  "salt": "REPLACE_WITH_32_BYTE_BASE64_OR_HEX_GENERATE_VIA_node_-e_console.log(require('crypto').randomBytes(32).toString('base64'))"
+}

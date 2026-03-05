@@ -1,0 +1,15 @@
+---
+description: When running a full security review or audit, use the security-review skill and write findings to SECURITY-AUDIT.md
+globs: "**/*.ts"
+alwaysApply: false
+---
+
+# Security review
+
+When the user requests a **full security review**, **security audit**, or **vulnerability analysis**:
+
+1. Apply the **security-review** skill (`.cursor/skills/security-review/SKILL.md`).
+2. Perform the review using the skill’s checklist and prioritization (Critical → High → Medium → Low → Info).
+3. **Output:** Create or update **SECURITY-AUDIT.md** at the repository root with the report structure defined in the skill (executive summary, summary table, findings, recommendations).
+
+Do not only list issues in chat; the canonical deliverable is the `SECURITY-AUDIT.md` file in the repo.

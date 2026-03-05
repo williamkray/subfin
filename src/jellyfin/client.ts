@@ -1,0 +1,1436 @@
+/**
+ * Jellyfin API client wrapper. Uses @jellyfin/sdk with an existing access token
+ * (obtained via web UI linking). All methods are for a single user context.
+ */
+import { Jellyfin } from "@jellyfin/sdk/lib/jellyfin.js";
+import { getAuthorizationHeader } from "@jellyfin/sdk/lib/utils/authentication.js";
+import { getLibraryApi } from "@jellyfin/sdk/lib/utils/api/library-api.js";
+import { getUserViewsApi } from "@jellyfin/sdk/lib/utils/api/user-views-api.js";
+import { getItemsApi } from "@jellyfin/sdk/lib/utils/api/items-api.js";
+import { getPlaylistsApi } from "@jellyfin/sdk/lib/utils/api/playlists-api.js";
+import { getGenresApi } from "@jellyfin/sdk/lib/utils/api/genres-api.js";
+import { getQuickConnectApi } from "@jellyfin/sdk/lib/utils/api/quick-connect-api.js";
+import { getUserApi } from "@jellyfin/sdk/lib/utils/api/user-api.js";
+import { getPlaystateApi } from "@jellyfin/sdk/lib/utils/api/playstate-api.js";
+import { getSessionApi } from "@jellyfin/sdk/lib/utils/api/session-api.js";
+import { InstantMixApiFactory } from "@jellyfin/sdk/lib/generated-client/api/instant-mix-api.js";
+import type { BaseItemDto } from "@jellyfin/sdk/lib/generated-client/models/base-item-dto.js";
+import { BaseItemKind } from "@jellyfin/sdk/lib/generated-client/models/base-item-kind.js";
+import { CollectionType } from "@jellyfin/sdk/lib/generated-client/models/collection-type.js";
+import { ItemFields } from "@jellyfin/sdk/lib/generated-client/models/item-fields.js";
+import { MediaType } from "@jellyfin/sdk/lib/generated-client/models/media-type.js";
+import { config } from "../config.js";
+
+const { jellyfin: jf } = config;
+
+/**
+ * Lightweight in-memory caches for operations that would otherwise perform
+ * repeated network or client setup work on hot paths.
+ */
+type AllowedMusicFolderCacheKey = string;
+
+interface AllowedMusicFolderCacheEntry {
+  ids: string[];
+  expiresAt: number;
+}
+
+type JellyfinApiCacheKey = string;
+type JellyfinApiInstance = ReturnType<Jellyfin["createApi"]>;
+
+interface JellyfinApiCacheEntry {
+  api: JellyfinApiInstance;
+  expiresAt: number;
+}
+
+const allowedMusicFolderCache = new Map<AllowedMusicFolderCacheKey, AllowedMusicFolderCacheEntry>();
+const jellyfinApiCache = new Map<JellyfinApiCacheKey, JellyfinApiCacheEntry>();
+
+/** Default TTLs for in-memory caches, in milliseconds. */
+const ALLOWED_MUSIC_FOLDER_TTL_MS = 5 * 60 * 1000;
+const JELLYFIN_API_CACHE_TTL_MS = 5 * 60 * 1000;
+
+function makeAllowedMusicFolderCacheKey(accessToken: string, userId: string): AllowedMusicFolderCacheKey {
+  // accessToken is already scoped to a Jellyfin server and user; include both
+  // to avoid accidental cross-user reuse if tokens are shared.
+  return `${userId}:${accessToken}`;
+}
+
+function makeJellyfinApiCacheKey(accessToken: string): JellyfinApiCacheKey {
+  // For anonymous operations (QuickConnect), we use a shared empty key.
+  return accessToken || "__no_token__";
+}
+
+function createJellyfinApi(accessToken: string) {
+  const now = Date.now();
+  const key = makeJellyfinApiCacheKey(accessToken);
+  const cached = jellyfinApiCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return cached.api;
+  }
+
+  const jellyfin = new Jellyfin({
+    clientInfo: {
+      name: jf.clientName,
+      version: "0.1.0",
+    },
+    deviceInfo: {
+      name: jf.deviceName,
+      id: jf.deviceId,
+    },
+  });
+  const api = jellyfin.createApi(jf.baseUrl, accessToken);
+  jellyfinApiCache.set(key, {
+    api,
+    expiresAt: now + JELLYFIN_API_CACHE_TTL_MS,
+  });
+  return api;
+}
+
+/** Build the Jellyfin Authorization header for a given access token. */
+export function buildJellyfinAuthHeader(accessToken: string): string {
+  return getAuthorizationHeader(
+    { name: jf.clientName, version: "0.1.0" },
+    { name: jf.deviceName, id: jf.deviceId },
+    accessToken
+  );
+}
+
+/** True if value looks like a Jellyfin view ID (32 hex chars, no dashes). */
+function isJellyfinViewId(value: string): boolean {
+  return /^[0-9a-fA-F]{32}$/.test(value.trim());
+}
+
+/** Get music libraries (folders) for a user. Uses UserViews (works for non-admin users); Library/MediaFolders returns 403 for non-admins. */
+export async function getMusicLibraries(
+  accessToken: string,
+  userId: string
+): Promise<{ id: string; name: string }[]> {
+  const api = createJellyfinApi(accessToken);
+  const viewsApi = getUserViewsApi(api);
+  const response = await viewsApi.getUserViews({ userId });
+  const data = response.data;
+  const folders = data?.Items ?? [];
+  const music = folders.filter(
+    (f: BaseItemDto) => f.CollectionType === CollectionType.Music
+  );
+  if (config.musicLibraryIds.length > 0) {
+    return music
+      .filter((m: BaseItemDto) => {
+        if (!m.Id) return false;
+        return config.musicLibraryIds.some((v) => {
+          const t = v.trim();
+          if (isJellyfinViewId(t)) return m.Id === t;
+          return m.Name?.toLowerCase().trim() === t.toLowerCase();
+        });
+      })
+      .map((m: BaseItemDto) => ({ id: m.Id!, name: m.Name ?? "Music" }));
+  }
+  return music.map((m: BaseItemDto) => ({ id: m.Id!, name: m.Name ?? "Music" }));
+}
+
+/** When MUSIC_LIBRARY_IDS is set, returns allowed music folder IDs for this user (names resolved to IDs). When not set, returns null (no restriction). Used to default list endpoints to those folders when the client does not send musicFolderId. */
+export async function getAllowedMusicFolderIds(
+  accessToken: string,
+  userId: string
+): Promise<string[] | null> {
+  if (config.musicLibraryIds.length === 0) return null;
+  const now = Date.now();
+  const key = makeAllowedMusicFolderCacheKey(accessToken, userId);
+  const cached = allowedMusicFolderCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return cached.ids;
+  }
+  const folders = await getMusicLibraries(accessToken, userId);
+  const ids = folders.map((f) => f.id);
+  allowedMusicFolderCache.set(key, {
+    ids,
+    expiresAt: now + ALLOWED_MUSIC_FOLDER_TTL_MS,
+  });
+  return ids;
+}
+
+
+/** Get artists (MusicArtist). Optionally filter by parentId (library). */
+export async function getArtists(
+  accessToken: string,
+  parentId?: string
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.MusicArtist],
+    recursive: true,
+    parentId: parentId || undefined,
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+  });
+  return response.data?.Items ?? [];
+}
+
+/** Get a single artist by id. */
+export async function getArtist(
+  accessToken: string,
+  id: string
+): Promise<BaseItemDto | null> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  try {
+    const response = await itemsApi.getItems({
+      ids: [id],
+      includeItemTypes: [BaseItemKind.MusicArtist],
+    });
+    const item = response.data?.Items?.[0];
+    return item ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Get artist with Overview (biography) and ProviderIds (e.g. MusicBrainz) for getArtistInfo. */
+export async function getArtistWithInfo(
+  accessToken: string,
+  id: string
+): Promise<BaseItemDto | null> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  try {
+    const response = await itemsApi.getItems({
+      ids: [id],
+      includeItemTypes: [BaseItemKind.MusicArtist],
+      fields: [ItemFields.Overview, ItemFields.ProviderIds],
+    });
+    return response.data?.Items?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Get similar artists from Jellyfin (Artists/{id}/Similar). Returns MusicArtist items. */
+export async function getSimilarArtists(
+  accessToken: string,
+  userId: string,
+  artistId: string,
+  limit: number
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const libApi = getLibraryApi(api);
+  try {
+    const response = await libApi.getSimilarArtists({
+      itemId: artistId,
+      userId,
+      limit,
+    });
+    const items = response.data?.Items ?? [];
+    return items.filter((i: BaseItemDto) => i.Type === "MusicArtist") as BaseItemDto[];
+  } catch {
+    return [];
+  }
+}
+
+/** Get albums for an artist (parentId = artist id). */
+export async function getAlbumsByArtist(
+  accessToken: string,
+  artistId: string
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const response = await itemsApi.getItems({
+    parentId: artistId,
+    includeItemTypes: [BaseItemKind.MusicAlbum],
+    recursive: false,
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+  });
+  return response.data?.Items ?? [];
+}
+
+/** Generic album list for a library (used for Subsonic getAlbumList). */
+export async function getAlbumsForLibrary(
+  accessToken: string,
+  opts: {
+    musicFolderId?: string;
+    type?: string;
+    size?: number;
+    offset?: number;
+    genre?: string;
+    fromYear?: number;
+    toYear?: number;
+  }
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const { musicFolderId, type, size, offset, genre, fromYear, toYear } = opts;
+
+  // Map Subsonic album list types to Jellyfin sort options.
+  let sortBy: string[] = [];
+  let sortOrder: ("Ascending" | "Descending")[] = [];
+
+  switch ((type ?? "").toLowerCase()) {
+    case "newest":
+      sortBy = ["DateCreated"];
+      sortOrder = ["Descending"];
+      break;
+    case "alphabeticalbyname":
+    case "alphabeticalbyartist":
+      sortBy = ["SortName"];
+      sortOrder = ["Ascending"];
+      break;
+    case "byyear":
+      sortBy = ["ProductionYear", "SortName"];
+      sortOrder = ["Ascending", "Ascending"];
+      break;
+    case "random":
+    default:
+      sortBy = ["Random"];
+      sortOrder = ["Ascending"];
+      break;
+  }
+
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.MusicAlbum],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    genres: genre ? [genre] : undefined,
+    years:
+      fromYear != null && toYear != null
+        ? Array.from(
+            { length: Math.min(toYear - fromYear + 1, 100) },
+            (_, i) => fromYear + i
+          )
+        : undefined,
+    sortBy,
+    sortOrder,
+    limit: size ?? 50,
+    startIndex: offset ?? 0,
+  });
+  return response.data?.Items ?? [];
+}
+
+/** Get a single album by id. */
+export async function getAlbum(
+  accessToken: string,
+  id: string
+): Promise<BaseItemDto | null> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  try {
+    const response = await itemsApi.getItems({
+      ids: [id],
+      includeItemTypes: [BaseItemKind.MusicAlbum],
+    });
+    return response.data?.Items?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Get songs (tracks) for an album (parentId = album id). */
+export async function getSongsByAlbum(
+  accessToken: string,
+  albumId: string
+): Promise<BaseItemDto[]> {
+  if (!albumId || albumId === "null" || albumId === "undefined") {
+    return [];
+  }
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  try {
+    const response = await itemsApi.getItems({
+      parentId: albumId,
+      includeItemTypes: [BaseItemKind.Audio],
+      recursive: false,
+      sortBy: ["ParentIndexNumber", "IndexNumber"],
+      sortOrder: ["Ascending", "Ascending"],
+    });
+    return response.data?.Items ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/** Get top songs for a given artist name using Jellyfin play counts. */
+export async function getTopSongsForArtist(
+  accessToken: string,
+  artistName: string,
+  count: number
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+
+  // First, resolve the artist to a Jellyfin MusicArtist item.
+  const artistSearch = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.MusicArtist],
+    recursive: true,
+    searchTerm: artistName,
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+    limit: 10,
+  });
+  const artists: BaseItemDto[] = artistSearch.data?.Items ?? [];
+  if (artists.length === 0) return [];
+
+  // Prefer an exact name match (case-insensitive); fall back to the first result.
+  const lower = artistName.toLowerCase();
+  const exact =
+    artists.find((a) => (a.Name ?? "").toLowerCase() === lower) ??
+    artists.find((a) => (a.SortName ?? "").toLowerCase() === lower) ??
+    artists[0];
+  const artistId = exact.Id;
+  if (!artistId) return [];
+
+  const songsResp = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.Audio],
+    recursive: true,
+    artistIds: [artistId],
+    sortBy: ["PlayCount"],
+    sortOrder: ["Descending"],
+    limit: count,
+    enableUserData: true as any,
+  } as any);
+  return songsResp.data?.Items ?? [];
+}
+
+/** Get random songs from the library (optionally scoped to a music folder). */
+export async function getRandomSongs(
+  accessToken: string,
+  opts: {
+    musicFolderId?: string;
+    size?: number;
+    offset?: number;
+  }
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const { musicFolderId, size, offset } = opts;
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.Audio],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    sortBy: ["Random"],
+    sortOrder: ["Ascending"],
+    limit: size ?? 50,
+    startIndex: offset ?? 0,
+  });
+  return response.data?.Items ?? [];
+}
+
+interface JellyfinGenreSummary {
+  name: string;
+  songCount: number;
+  albumCount: number;
+}
+
+/** Aggregate genres from audio items in the library. */
+export async function getGenres(
+  accessToken: string,
+  opts: { musicFolderId?: string }
+): Promise<JellyfinGenreSummary[]> {
+  const api = createJellyfinApi(accessToken);
+  const genresApi = getGenresApi(api);
+  const { musicFolderId } = opts;
+  const response = await genresApi.getGenres({
+    parentId: musicFolderId || undefined,
+    // A reasonable upper bound; Jellyfin will cap as needed.
+    limit: 500,
+  });
+  const items: BaseItemDto[] = response.data?.Items ?? [];
+
+  return (items ?? []).map((g: any) => ({
+    name: g.Name as string,
+    songCount: (g.SongCount as number) ?? 0,
+    albumCount: (g.AlbumCount as number) ?? 0,
+  }));
+}
+
+/** Now playing entry from Jellyfin sessions. */
+export interface JellyfinNowPlayingEntry {
+  item: BaseItemDto;
+  username: string;
+  minutesAgo: number;
+  playerId: string;
+  playerName: string;
+}
+
+/** Get current now-playing audio items for a user from Jellyfin sessions. */
+export async function getNowPlayingForUser(
+  accessToken: string,
+  userId: string
+): Promise<JellyfinNowPlayingEntry[]> {
+  const api = createJellyfinApi(accessToken);
+  const sessionApi = getSessionApi(api);
+  const response = await sessionApi.getSessions({
+    controllableByUserId: userId,
+  } as any);
+  const sessions: any[] = response.data ?? [];
+  const now = Date.now();
+
+  const entries: JellyfinNowPlayingEntry[] = [];
+  for (const s of sessions) {
+    const item = s.NowPlayingItem as BaseItemDto | undefined;
+    if (!item) continue;
+    // Only consider audio now-playing items.
+    if ((item.MediaType as string | undefined) !== "Audio") continue;
+    const userName = (s.UserName as string | undefined) ?? "";
+    const playerId = (s.Id as string | undefined) ?? "";
+    const playerName = (s.Client as string | undefined) ?? "";
+    const lastActivity = Date.parse((s.LastActivityDate as string | undefined) ?? "") || now;
+    const minutesAgo = Math.max(0, Math.round((now - lastActivity) / 60000));
+    entries.push({
+      item,
+      username: userName,
+      minutesAgo,
+      playerId,
+      playerName,
+    });
+  }
+  return entries;
+}
+
+/** Report playback start for an audio item so Jellyfin can show it in Now Playing. */
+export async function reportPlaybackStart(
+  accessToken: string,
+  userId: string,
+  itemId: string
+): Promise<void> {
+  const api = createJellyfinApi(accessToken);
+  const playstateApi = getPlaystateApi(api);
+  try {
+    await playstateApi.reportPlaybackStart({
+      playbackStartInfo: {
+        ItemId: itemId,
+        UserId: userId,
+        CanSeek: true,
+      } as any,
+    } as any);
+  } catch {
+    // Non-fatal: logging is handled by callers if needed.
+  }
+}
+
+/** Report playback progress so Jellyfin knows an item is actively playing. */
+export async function reportPlaybackProgress(
+  accessToken: string,
+  userId: string,
+  itemId: string,
+  positionMs?: number
+): Promise<void> {
+  const api = createJellyfinApi(accessToken);
+  const playstateApi = getPlaystateApi(api);
+  try {
+    await playstateApi.reportPlaybackProgress({
+      playbackProgressInfo: {
+        ItemId: itemId,
+        UserId: userId,
+        PositionTicks:
+          positionMs !== undefined ? Math.max(0, Math.floor(positionMs * 10_000)) : undefined,
+        IsPaused: false,
+      } as any,
+    } as any);
+  } catch {
+    // Non-fatal.
+  }
+}
+
+/** Report playback stopped so Jellyfin can finalize play state. */
+export async function reportPlaybackStopped(
+  accessToken: string,
+  userId: string,
+  itemId: string,
+  positionMs?: number
+): Promise<void> {
+  const api = createJellyfinApi(accessToken);
+  const playstateApi = getPlaystateApi(api);
+  try {
+    await playstateApi.reportPlaybackStopped({
+      playbackStopInfo: {
+        ItemId: itemId,
+        UserId: userId,
+        PositionTicks:
+          positionMs !== undefined ? Math.max(0, Math.floor(positionMs * 10_000)) : undefined,
+        Failed: false,
+      } as any,
+    } as any);
+  } catch {
+    // Non-fatal.
+  }
+}
+
+/** Get songs filtered by genre. */
+export async function getSongsByGenre(
+  accessToken: string,
+  genre: string,
+  opts: { musicFolderId?: string; size?: number; offset?: number }
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const { musicFolderId, size, offset } = opts;
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.Audio],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    genres: [genre],
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+    limit: size ?? 50,
+    startIndex: offset ?? 0,
+  });
+  return response.data?.Items ?? [];
+}
+
+/** Get favorited items (songs only for now) for the current user. */
+export async function getFavoriteSongs(
+  accessToken: string,
+  opts: { musicFolderId?: string; size?: number; offset?: number }
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const { musicFolderId, size, offset } = opts;
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.Audio],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    isFavorite: true as any,
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+    limit: size ?? 200,
+    startIndex: offset ?? 0,
+  } as any);
+  return response.data?.Items ?? [];
+}
+
+/** Get favorited albums for the current user. */
+export async function getFavoriteAlbums(
+  accessToken: string,
+  opts: { musicFolderId?: string; size?: number; offset?: number }
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const { musicFolderId, size, offset } = opts;
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.MusicAlbum],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    isFavorite: true as any,
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+    limit: size ?? 200,
+    startIndex: offset ?? 0,
+  } as any);
+  return response.data?.Items ?? [];
+}
+
+/** Mark an item as favorite for the given user. */
+export async function markFavorite(
+  accessToken: string,
+  userId: string,
+  itemId: string
+): Promise<void> {
+  const api: any = createJellyfinApi(accessToken);
+  const url = api.getUri(`/Users/${userId}/FavoriteItems/${itemId}`);
+  const authHeader = buildJellyfinAuthHeader(accessToken);
+  await api.axiosInstance.post(
+    url,
+    {},
+    {
+      headers: {
+        Authorization: authHeader,
+      },
+    }
+  );
+}
+
+/** Remove favorite flag from an item for the given user. */
+export async function unmarkFavorite(
+  accessToken: string,
+  userId: string,
+  itemId: string
+): Promise<void> {
+  const api: any = createJellyfinApi(accessToken);
+  const url = api.getUri(`/Users/${userId}/FavoriteItems/${itemId}`);
+  const authHeader = buildJellyfinAuthHeader(accessToken);
+  await api.axiosInstance.delete(url, {
+    headers: {
+      Authorization: authHeader,
+    },
+  });
+}
+
+/** Update "like" rating for an item (maps Subsonic rating to Jellyfin likes). */
+export async function setUserLikeForItem(
+  accessToken: string,
+  userId: string,
+  itemId: string,
+  likes: boolean | null
+): Promise<void> {
+  const api: any = createJellyfinApi(accessToken);
+  const authHeader = buildJellyfinAuthHeader(accessToken);
+  if (likes === null) {
+    // Clear rating by deleting it.
+    const url = api.getUri(`/Users/${userId}/Items/${itemId}/Rating`);
+    await api.axiosInstance.delete(url, {
+      headers: {
+        Authorization: authHeader,
+      },
+    });
+  } else {
+    const url = api.getUri(`/Users/${userId}/Items/${itemId}/Rating`, {
+      Likes: likes,
+    });
+    await api.axiosInstance.post(
+      url,
+      {},
+      {
+        headers: {
+          Authorization: authHeader,
+        },
+      }
+    );
+  }
+}
+
+/** Search artists by name using Jellyfin's searchTerm. */
+export async function searchArtists(
+  accessToken: string,
+  query: string,
+  opts: { size?: number; offset?: number; musicFolderId?: string }
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const { size, offset, musicFolderId } = opts;
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.MusicArtist],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+    searchTerm: query,
+    limit: size ?? 20,
+    startIndex: offset ?? 0,
+  });
+  return response.data?.Items ?? [];
+}
+
+/** Search albums by name using Jellyfin's searchTerm. */
+export async function searchAlbums(
+  accessToken: string,
+  query: string,
+  opts: { size?: number; offset?: number; musicFolderId?: string }
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const { size, offset, musicFolderId } = opts;
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.MusicAlbum],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+    searchTerm: query,
+    limit: size ?? 20,
+    startIndex: offset ?? 0,
+  });
+  return response.data?.Items ?? [];
+}
+
+/** Search songs by title/artist/album using Jellyfin's searchTerm. */
+export async function searchSongs(
+  accessToken: string,
+  query: string,
+  opts: { size?: number; offset?: number; musicFolderId?: string }
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const { size, offset, musicFolderId } = opts;
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.Audio],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+    searchTerm: query,
+    limit: size ?? 50,
+    startIndex: offset ?? 0,
+  });
+  return response.data?.Items ?? [];
+}
+
+/**
+ * Resolve songs by artist name and track title when full-text search returns nothing.
+ * Finds artist by name, then lists that artist's tracks and filters by title (exact or contains).
+ * Used as a fallback in getLyrics when searchSongs(artist + " " + title) returns 0 results.
+ */
+export async function resolveSongsByArtistAndTitle(
+  accessToken: string,
+  artist: string,
+  title: string,
+  opts: { limit?: number } = {}
+): Promise<BaseItemDto[]> {
+  if (!artist?.trim() && !title?.trim()) return [];
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const limit = opts.limit ?? 50;
+
+  // 1) Resolve artist name to a MusicArtist item
+  const artistSearch = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.MusicArtist],
+    recursive: true,
+    searchTerm: artist.trim(),
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+    limit: 10,
+  });
+  const artists: BaseItemDto[] = artistSearch.data?.Items ?? [];
+  if (artists.length === 0) return [];
+
+  const artistLower = artist.trim().toLowerCase();
+  const exactArtist =
+    artists.find((a) => (a.Name ?? "").toLowerCase() === artistLower) ??
+    artists.find((a) => (a.SortName ?? "").toLowerCase() === artistLower) ??
+    artists[0];
+  const artistId = exactArtist.Id;
+  if (!artistId) return [];
+
+  // 2) Get audio items for that artist
+  const songsResp = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.Audio],
+    recursive: true,
+    artistIds: [artistId],
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+    limit: Math.max(limit, 100),
+  } as any);
+  const songs: BaseItemDto[] = songsResp.data?.Items ?? [];
+  if (songs.length === 0) return [];
+
+  // 3) Filter by title (case-insensitive; exact match first, then contains)
+  const titleNorm = title.trim().toLowerCase();
+  if (!titleNorm) return songs.slice(0, limit);
+
+  const exact = songs.filter(
+    (s) => (s.Name ?? "").toLowerCase() === titleNorm || (s.SortName ?? "").toLowerCase() === titleNorm
+  );
+  if (exact.length > 0) return exact.slice(0, limit);
+  const contains = songs.filter(
+    (s) =>
+      (s.Name ?? "").toLowerCase().includes(titleNorm) || (s.SortName ?? "").toLowerCase().includes(titleNorm)
+  );
+  return contains.slice(0, limit);
+}
+
+interface JellyfinPlaylistSummary {
+  id: string;
+  name: string;
+  owner: string;
+  comment: string;
+  songCount: number;
+  created: string | null;
+  changed: string | null;
+  duration: number | null;
+}
+
+/** List playlists visible to the given user. */
+export async function getPlaylists(
+  accessToken: string,
+  userId: string
+): Promise<JellyfinPlaylistSummary[]> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.Playlist],
+    recursive: true,
+    parentId: undefined,
+  });
+  const items: BaseItemDto[] = response.data?.Items ?? [];
+  return items.map((p) => ({
+    id: p.Id!,
+    name: p.Name ?? "",
+    owner: (p as any).UserId ?? "",
+    comment: "",
+    songCount: (p as any).ChildCount ?? 0,
+    created: p.DateCreated ?? null,
+    changed: (p as any).DateLastModified ?? null,
+    duration: (p as any).RunTimeTicks ?? null,
+  }));
+}
+
+/** Get items in a Jellyfin playlist as audio tracks. */
+export async function getPlaylistItems(
+  accessToken: string,
+  playlistId: string,
+  userId: string
+): Promise<BaseItemDto[]> {
+  const api: any = createJellyfinApi(accessToken);
+  const url = api.getUri(`/Playlists/${playlistId}/Items`, { UserId: userId });
+  const authHeader = buildJellyfinAuthHeader(accessToken);
+  const response = await api.axiosInstance.get(url, {
+    headers: {
+      Authorization: authHeader,
+    },
+  });
+  const items: BaseItemDto[] = response.data?.Items ?? [];
+  return items;
+}
+
+/** Create a new playlist. Returns the new playlist id. */
+export async function createPlaylist(
+  accessToken: string,
+  userId: string,
+  name: string,
+  itemIds?: string[],
+  isPublic?: boolean
+): Promise<string> {
+  const api = createJellyfinApi(accessToken);
+  const playlistsApi = getPlaylistsApi(api);
+  const raw = itemIds ?? [];
+  const ids = raw.filter(
+    (id): id is string =>
+      typeof id === "string" &&
+      id.trim() !== "" &&
+      id !== "[object Object]"
+  );
+  const result = await playlistsApi.createPlaylist({
+    createPlaylistDto: {
+      Name: name,
+      UserId: userId,
+      MediaType: MediaType.Audio,
+      IsPublic: isPublic ?? false,
+      Ids: ids.length > 0 ? ids : undefined,
+    },
+  });
+  const id = (result.data as { Id?: string })?.Id;
+  if (!id) throw new Error("Create playlist did not return an id");
+  return id;
+}
+
+/** Add items to an existing playlist. */
+export async function addItemsToPlaylist(
+  accessToken: string,
+  playlistId: string,
+  userId: string,
+  itemIds: string[]
+): Promise<void> {
+  const ids = itemIds.filter(
+    (id): id is string =>
+      typeof id === "string" &&
+      id.trim() !== "" &&
+      id !== "[object Object]"
+  );
+  if (ids.length === 0) return;
+  const api = createJellyfinApi(accessToken);
+  const playlistsApi = getPlaylistsApi(api);
+  await playlistsApi.addItemToPlaylist({
+    playlistId,
+    ids,
+    userId,
+  });
+}
+
+/** Remove items from a playlist by their item ids (as returned in getPlaylistItems). */
+export async function removeItemsFromPlaylist(
+  accessToken: string,
+  playlistId: string,
+  entryIds: string[]
+): Promise<void> {
+  if (entryIds.length === 0) return;
+  const api = createJellyfinApi(accessToken);
+  const playlistsApi = getPlaylistsApi(api);
+  await playlistsApi.removeItemFromPlaylist({
+    playlistId,
+    entryIds,
+  });
+}
+
+/** Update playlist name or visibility. */
+export async function updatePlaylistMetadata(
+  accessToken: string,
+  playlistId: string,
+  dto: { Name?: string; IsPublic?: boolean }
+): Promise<void> {
+  const api = createJellyfinApi(accessToken);
+  const playlistsApi = getPlaylistsApi(api);
+  await playlistsApi.updatePlaylist({
+    playlistId,
+    updatePlaylistDto: dto as any,
+  });
+}
+
+/** Delete a playlist (must be owned by the user). */
+export async function deletePlaylist(
+  accessToken: string,
+  playlistId: string
+): Promise<void> {
+  const api: any = createJellyfinApi(accessToken);
+  const url = api.getUri(`/Items/${playlistId}`);
+  const authHeader = buildJellyfinAuthHeader(accessToken);
+  await api.axiosInstance.delete(url, {
+    headers: { Authorization: authHeader },
+  });
+}
+
+/** Get a single song (audio item) by id. */
+export async function getSong(
+  accessToken: string,
+  id: string
+): Promise<BaseItemDto | null> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  try {
+    const response = await itemsApi.getItems({
+      ids: [id],
+      includeItemTypes: [BaseItemKind.Audio],
+    });
+    return response.data?.Items?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Get any single item by id (artist, album, song, etc.) so we can detect type for instant mix. */
+export async function getItemById(
+  accessToken: string,
+  id: string
+): Promise<BaseItemDto | null> {
+  const api = createJellyfinApi(accessToken);
+  const itemsApi = getItemsApi(api);
+  try {
+    const response = await itemsApi.getItems({
+      ids: [id],
+      limit: 1,
+    });
+    return response.data?.Items?.[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Get similar songs using Jellyfin's instant mix (recommendations). Uses Artists/Album/Item endpoints so plugins (e.g. AudioMuse-AI) get the right context. When id has no prefix, resolves type so artist ids still hit /Artists/{id}/InstantMix. */
+export async function getSimilarSongs(
+  accessToken: string,
+  userId: string,
+  id: string,
+  count: number
+): Promise<BaseItemDto[]> {
+  const api = createJellyfinApi(accessToken);
+  const instantMixApi = InstantMixApiFactory(
+    api.configuration,
+    api.basePath,
+    api.axiosInstance
+  );
+  let isArtist = /^ar-/i.test(id);
+  let isAlbum = /^al-/i.test(id);
+  const cleanId = id.replace(/^(ar-|al-|pl-)/i, "");
+  const limit = Math.min(Math.max(1, count), 100);
+  const opts = { userId, limit };
+
+  // When client sends raw id (e.g. Tempus artist Radio without ar- prefix), resolve so we call the right endpoint (Artists/Album/Item) for AudioMuse-style plugins
+  if (!isArtist && !isAlbum) {
+    const item = await getItemById(accessToken, cleanId);
+    const type = (item as { Type?: string } | null)?.Type;
+    if (type === "MusicArtist") {
+      isArtist = true;
+      if (config.logRest) console.log("[INSTANT_MIX] resolved id=" + cleanId + " to artist, using Artists/InstantMix");
+    } else if (type === "MusicAlbum") {
+      isAlbum = true;
+      if (config.logRest) console.log("[INSTANT_MIX] resolved id=" + cleanId + " to album, using Albums/InstantMix");
+    }
+  }
+
+  const parseItems = (response: { data?: Record<string, unknown> }): BaseItemDto[] => {
+    const data = response.data;
+    const raw = (data?.Items ?? data?.items) as BaseItemDto[] | undefined;
+    const items = Array.isArray(raw) ? raw : [];
+    if (items.length === 0 && data && config.logRest) {
+      const arr = data.Items ?? data.items;
+      console.warn("[INSTANT_MIX] response keys:", Object.keys(data), "Items length:", Array.isArray(arr) ? arr.length : arr);
+    }
+    return items.filter((i: BaseItemDto) => i.Type === "Audio") as BaseItemDto[];
+  };
+
+  try {
+    let response: { data?: Record<string, unknown> };
+    if (isArtist) {
+      try {
+        response = await instantMixApi.getInstantMixFromArtists({ itemId: cleanId, ...opts });
+      } catch (artistErr: unknown) {
+        if (config.logRest) {
+          console.warn("[INSTANT_MIX] getInstantMixFromArtists failed:", (artistErr as Error)?.message ?? artistErr);
+        }
+        response = await instantMixApi.getInstantMixFromItem({ itemId: cleanId, ...opts });
+      }
+      let items = parseItems(response);
+      if (items.length === 0) {
+        if (config.logRest) {
+          console.warn("[INSTANT_MIX] artist id=" + cleanId + " returned 0 items, trying getInstantMixFromItem");
+        }
+        response = await instantMixApi.getInstantMixFromItem({ itemId: cleanId, ...opts });
+        items = parseItems(response);
+      }
+      if (config.logRest) {
+        console.log("[INSTANT_MIX] artist id=" + cleanId + " returned " + items.length + " songs");
+      }
+      return items;
+    }
+    if (isAlbum) {
+      response = await instantMixApi.getInstantMixFromAlbum({ itemId: cleanId, ...opts });
+    } else {
+      response = await instantMixApi.getInstantMixFromItem({ itemId: cleanId, ...opts });
+    }
+    const items = parseItems(response);
+    if (config.logRest) {
+      const kind = isAlbum ? "album" : "item";
+      console.log("[INSTANT_MIX] " + kind + " id=" + cleanId + " returned " + items.length + " songs");
+    }
+    return items;
+  } catch (err: unknown) {
+    if (config.logRest) {
+      console.warn("[INSTANT_MIX] failed:", (err as Error)?.message ?? err);
+    }
+    return [];
+  }
+}
+
+/** Raw lyric line from Jellyfin (we parse multiple possible shapes). start is always in milliseconds for OpenSubsonic. */
+export interface JellyfinLyricLine {
+  text?: string;
+  /** Start time in milliseconds (OpenSubsonic convention). Converted from Jellyfin ticks (100-ns) when needed. */
+  start?: number | null;
+}
+
+interface LyricsCacheEntry {
+  value: string;
+  lines?: JellyfinLyricLine[];
+  expiresAt: number;
+}
+
+const lyricsCache = new Map<string, LyricsCacheEntry>();
+const LYRICS_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/** Jellyfin often returns Start in .NET ticks (100-nanosecond units). 1 ms = 10,000 ticks. OpenSubsonic uses milliseconds. */
+function lyricStartToMs(raw: number | null | undefined): number | null {
+  if (raw == null || typeof raw !== "number") return null;
+  // Values > ~10 min in ms (600000) are almost certainly ticks. 1 ms = 10000 ticks.
+  if (raw > 600000) return Math.round(raw / 10000);
+  return raw;
+}
+
+/** Normalise a single lyric line from various Jellyfin shapes into { text, startMs }. */
+function parseLyricLine(l: Record<string, unknown>): { text: string; startMs: number | null } {
+  const t = ((l.Text ?? l.Value ?? l.Line ?? l.text ?? l.value ?? "") as string).trim();
+  const raw =
+    (l.Start as number | undefined) ??
+    (l.StartTicks as number | undefined) ??
+    (l.StartTimeTicks as number | undefined) ??
+    (l.start as number | undefined);
+  return { text: t, startMs: lyricStartToMs(raw ?? null) };
+}
+
+/** Get lyrics for an audio item. Uses direct GET to /Audio/{id}/Lyrics so we control URL and parsing. Returns lines with start in milliseconds for live/synced lyrics. */
+export async function getLyricsForItem(
+  accessToken: string,
+  itemId: string
+): Promise<{ value: string; lines?: JellyfinLyricLine[] } | null> {
+  const now = Date.now();
+  const cacheKey = itemId;
+  const cached = lyricsCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return { value: cached.value, lines: cached.lines };
+  }
+  const base = jf.baseUrl.replace(/\/$/, "");
+  const url = `${base}/Audio/${itemId}/Lyrics`;
+  const authHeader = buildJellyfinAuthHeader(accessToken);
+  const api: any = createJellyfinApi(accessToken);
+  try {
+    const response = await api.axiosInstance.get(url, {
+      headers: { Authorization: authHeader },
+      validateStatus: () => true,
+    });
+    if (response.status !== 200) {
+      if (config.logRest) {
+        console.warn("[LYRICS] GET", url, "status=", response.status, "body=", JSON.stringify(response.data).slice(0, 200));
+      }
+      return null;
+    }
+    const data = response.data as Record<string, unknown>;
+    if (!data) return null;
+    if (config.logRest && (data.Lyrics === undefined || (Array.isArray(data.Lyrics) && data.Lyrics.length === 0))) {
+      console.warn("[LYRICS] GET", url, "keys=", Object.keys(data), "Lyrics=", Array.isArray(data.Lyrics) ? "[]" : data.Lyrics);
+    }
+
+    const lines: JellyfinLyricLine[] = [];
+    let plainText = "";
+
+    // Primary: Jellyfin LyricDto { Lyrics?: LyricLine[] }; LyricLine: { Text?, Start? } (Start may be ticks)
+    const lyricsArray = data.Lyrics as Record<string, unknown>[] | undefined;
+    if (Array.isArray(lyricsArray) && lyricsArray.length > 0) {
+      for (const l of lyricsArray) {
+        const { text: t, startMs } = parseLyricLine(l as Record<string, unknown>);
+        if (t) {
+          lines.push({ text: t, start: startMs });
+          plainText += (plainText ? "\n" : "") + t;
+        }
+      }
+      if (plainText) {
+        lyricsCache.set(cacheKey, {
+          value: plainText,
+          lines,
+          expiresAt: now + LYRICS_CACHE_TTL_MS,
+        });
+        return { value: plainText, lines };
+      }
+    }
+
+    // Cues array (some Jellyfin responses use Lyrics.Cues[] with Start/Text)
+    const cues = (data.Cues as Record<string, unknown>[] | undefined) ?? (data.Lyrics as { Cues?: Record<string, unknown>[] })?.Cues;
+    if (Array.isArray(cues) && cues.length > 0) {
+      for (const c of cues) {
+        const { text: t, startMs } = parseLyricLine(c as Record<string, unknown>);
+        if (t) {
+          lines.push({ text: t, start: startMs });
+          plainText += (plainText ? "\n" : "") + t;
+        }
+      }
+      if (plainText) {
+        lyricsCache.set(cacheKey, {
+          value: plainText,
+          lines,
+          expiresAt: now + LYRICS_CACHE_TTL_MS,
+        });
+        return { value: plainText, lines };
+      }
+    }
+
+    // Alternative: single string (no timestamps)
+    if (typeof data.Lyrics === "string" && data.Lyrics.trim()) {
+      const value = data.Lyrics.trim();
+      lyricsCache.set(cacheKey, {
+        value,
+        lines: [],
+        expiresAt: now + LYRICS_CACHE_TTL_MS,
+      });
+      return { value, lines: [] };
+    }
+
+    // Nested Metadata.Lyrics or Lines (array of { Text } or { value }) — no Start in these shapes
+    const meta = data.Metadata as Record<string, unknown> | undefined;
+    const nested = (meta?.Lyrics ?? data.Lines) as Record<string, unknown>[] | undefined;
+    if (Array.isArray(nested)) {
+      for (const l of nested) {
+        const t = ((l.Text ?? l.value ?? l.Value) as string ?? "").trim();
+        if (t) plainText += (plainText ? "\n" : "") + t;
+      }
+      if (plainText) {
+        lyricsCache.set(cacheKey, {
+          value: plainText,
+          lines: [],
+          expiresAt: now + LYRICS_CACHE_TTL_MS,
+        });
+        return { value: plainText, lines: [] };
+      }
+    }
+
+    if (plainText) {
+      lyricsCache.set(cacheKey, {
+        value: plainText,
+        lines: [],
+        expiresAt: now + LYRICS_CACHE_TTL_MS,
+      });
+      return { value: plainText, lines: [] };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Subsonic format names that need transcoding via /Audio/{id}/stream.{container}. Universal only reliably does MP3. */
+const TRANSCODE_FORMATS = new Set(["opus", "aac", "m4a", "webma", "wav"]);
+
+/** Get stream URL for an audio item (used when proxying to client). Uses universal for MP3; uses stream-by-container for Opus/AAC/etc. so Jellyfin actually transcodes. */
+export function getStreamUrl(
+  accessToken: string,
+  userId: string,
+  itemId: string,
+  maxBitRateKbps?: number,
+  format?: string
+): string {
+  const base = jf.baseUrl.replace(/\/$/, "");
+  const normalized = (format ?? "").toLowerCase().trim();
+  const wantTranscode = normalized && normalized !== "raw" && TRANSCODE_FORMATS.has(normalized);
+  const audioBitRateBps = maxBitRateKbps && maxBitRateKbps > 0 ? maxBitRateKbps * 1000 : 320000;
+
+  if (wantTranscode) {
+    // /Audio/{id}/stream.{container} with audioCodec + audioBitRate so Jellyfin transcodes (universal returns 0 bytes for Opus).
+    const container = normalized === "webma" ? "webm" : normalized;
+    const url = new URL(`${base}/Audio/${itemId}/stream.${container}`);
+    url.searchParams.set("UserId", userId);
+    url.searchParams.set("DeviceId", jf.deviceId);
+    url.searchParams.set("audioCodec", container === "m4a" ? "aac" : container);
+    url.searchParams.set("audioBitRate", String(audioBitRateBps));
+    url.searchParams.set("ApiKey", accessToken);
+    return url.toString();
+  }
+
+  // MP3 or raw/unspecified: use universal endpoint (reliable for MP3).
+  const url = new URL(`${base}/Audio/${itemId}/universal`);
+  url.searchParams.set("UserId", userId);
+  url.searchParams.set("DeviceId", jf.deviceId);
+  url.searchParams.set("Container", "mp3");
+  url.searchParams.set("AudioCodec", "mp3");
+  url.searchParams.set("MaxStreamingBitrate", String(audioBitRateBps));
+  url.searchParams.set("ApiKey", accessToken);
+  return url.toString();
+}
+
+/**
+ * Get download URL for an audio item (used when proxying to client).
+ * Uses Jellyfin's audio stream endpoint and requests the original file (`Static=true`).
+ */
+export function getDownloadUrl(
+  accessToken: string,
+  userId: string,
+  itemId: string
+): string {
+  const base = jf.baseUrl.replace(/\/$/, "");
+  const url = new URL(`${base}/Audio/${itemId}/stream`);
+  url.searchParams.set("UserId", userId);
+  url.searchParams.set("DeviceId", jf.deviceId);
+  // Ask Jellyfin to serve the original file when possible instead of a transcoded stream.
+  url.searchParams.set("static", "true");
+  url.searchParams.set("ApiKey", accessToken);
+  return url.toString();
+}
+
+/** Get cover/image URL for an item (used when proxying to client). */
+export function getImageUrl(
+  accessToken: string,
+  itemId: string,
+  imageType = "Primary",
+  size?: number
+): string {
+  const base = jf.baseUrl.replace(/\/$/, "");
+  const url = new URL(`${base}/Items/${itemId}/Images/${imageType}`);
+  if (size && size > 0) {
+    url.searchParams.set("maxHeight", String(size));
+    url.searchParams.set("maxWidth", String(size));
+  }
+  url.searchParams.set("ApiKey", accessToken);
+  return url.toString();
+}
+
+/** Get avatar URL for a given Jellyfin user (used when proxying to client). */
+export function getUserAvatarUrl(
+  accessToken: string,
+  userId: string,
+  size?: number
+): string {
+  const base = jf.baseUrl.replace(/\/$/, "");
+  const url = new URL(`${base}/Users/${userId}/Images/Primary`);
+  if (size && size > 0) {
+    url.searchParams.set("maxHeight", String(size));
+    url.searchParams.set("maxWidth", String(size));
+  }
+  url.searchParams.set("ApiKey", accessToken);
+  return url.toString();
+}
+
+/** Check if QuickConnect is enabled (for web UI). */
+export async function getQuickConnectEnabled(): Promise<boolean> {
+  const api = createJellyfinApi(""); // no token needed for this call
+  const qcApi = getQuickConnectApi(api);
+  try {
+    const response = await qcApi.getQuickConnectEnabled();
+    return response.data ?? false;
+  } catch {
+    return false;
+  }
+}
+
+/** Start QuickConnect: returns { secret, code } for user to authorize in Jellyfin. */
+export async function initiateQuickConnect(): Promise<{
+  secret: string;
+  code: string;
+} | null> {
+  const api = createJellyfinApi("");
+  const qcApi = getQuickConnectApi(api);
+  try {
+    const response = await qcApi.initiateQuickConnect();
+    const data = response.data;
+    if (data?.Secret && data?.Code) return { secret: data.Secret, code: data.Code };
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Poll QuickConnect state. */
+export async function getQuickConnectState(secret: string): Promise<{
+  authenticated: boolean;
+}> {
+  const api = createJellyfinApi("");
+  const qcApi = getQuickConnectApi(api);
+  try {
+    const response = await qcApi.getQuickConnectState({ secret });
+    const data = response.data;
+    return { authenticated: data?.Authenticated ?? false };
+  } catch {
+    return { authenticated: false };
+  }
+}
+
+/** Exchange QuickConnect secret for token (call after getQuickConnectState returns authenticated). */
+export async function authenticateWithQuickConnect(
+  secret: string
+): Promise<{ userId: string; accessToken: string } | null> {
+  const api = createJellyfinApi("");
+  const userApi = getUserApi(api);
+  try {
+    const response = await userApi.authenticateWithQuickConnect({
+      quickConnectDto: { Secret: secret },
+    });
+    const data = response.data;
+    const userId = data?.User?.Id;
+    const accessToken = data?.AccessToken;
+    if (userId && accessToken) {
+      return { userId, accessToken };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Get current user info (name) given an access token. */
+export async function getCurrentUserName(accessToken: string): Promise<string | null> {
+  const api = createJellyfinApi(accessToken);
+  const userApi = getUserApi(api);
+  try {
+    const response = await userApi.getCurrentUser();
+    const user = response.data;
+    return user?.Name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Authenticate by username and password (for web UI when server supports password). */
+export async function authenticateByName(
+  username: string,
+  password: string
+): Promise<{ userId: string; accessToken: string } | null> {
+  const api = createJellyfinApi("");
+  const userApi = getUserApi(api);
+  try {
+    const response = await userApi.authenticateUserByName({
+      authenticateUserByName: { Username: username, Pw: password },
+    });
+    const data = response.data;
+    const userId = data?.User?.Id;
+    const accessToken = data?.AccessToken;
+    if (userId && accessToken) {
+      return { userId, accessToken };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}

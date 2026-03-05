@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+subfin.json
+subfin.json.migrated
+subfin.db
+subfin.config.json
+.local-testing/
+.*-analysis/
+.cursor/
