@@ -42,3 +42,18 @@ CREATE TABLE IF NOT EXISTS play_queue (
   changed_at TEXT NOT NULL,
   changed_by TEXT NOT NULL DEFAULT ''
 );
+
+-- Shares: public share = one linked device (share device) + metadata and allowlist.
+-- share_uid is UUID for public URLs (unguessable); linked_device_id is FK to the share device.
+CREATE TABLE IF NOT EXISTS shares (
+  share_uid TEXT PRIMARY KEY,
+  linked_device_id INTEGER NOT NULL UNIQUE,
+  entry_ids TEXT NOT NULL,
+  entry_ids_flat TEXT NOT NULL,
+  description TEXT,
+  expires_at TEXT,
+  visit_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (linked_device_id) REFERENCES linked_devices(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_shares_linked_device ON shares(linked_device_id);

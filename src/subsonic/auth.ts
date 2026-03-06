@@ -3,7 +3,8 @@
  */
 import { createHash } from "node:crypto";
 import type { JellyfinContext } from "../jellyfin/client.js";
-import { resolveToJellyfinToken, getDevicesForToken } from "../store/index.js";
+import { resolveToJellyfinToken, getDevicesForToken, resolveShareAuth, getShareAuthByUid } from "../store/index.js";
+import { validateShareToken } from "../web/share-tokens.js";
 import type { SubsonicError } from "./response.js";
 
 export interface AuthParams {
@@ -12,6 +13,8 @@ export interface AuthParams {
   t?: string;
   s?: string;
   apiKey?: string;
+  /** Short-lived share token (e.g. for M3U/zip URLs). */
+  token?: string;
 }
 
 export interface AuthResult {
@@ -21,6 +24,9 @@ export interface AuthResult {
   /** Set when auth is resolved from a linked device; used for Jellyfin device/session identity. */
   jellyfinDeviceId?: string;
   jellyfinDeviceName?: string;
+  /** Set when auth is via share (share_uid + secret). Restrict stream/download/cover to these track ids. */
+  shareId?: string;
+  shareAllowedIds?: Set<string>;
 }
 
 function deviceDisplay(deviceId: number, deviceLabel: string | null): { id: string; name: string } {
@@ -45,12 +51,61 @@ export function toJellyfinContext(auth: AuthResult): JellyfinContext {
 
 /** Validate and resolve auth. Returns AuthResult or Subsonic error object. */
 export function resolveAuth(params: AuthParams): AuthResult | SubsonicError {
+  // Share auth via short-lived token (e.g. M3U/zip URLs)
+  if (params.token?.trim()) {
+    const tokenParam = params.token.trim();
+    const shareUid = validateShareToken(tokenParam);
+    if (shareUid) {
+      const auth = getShareAuthByUid(shareUid);
+      if (auth) {
+        return {
+          subsonicUsername: auth.subsonicUsername,
+          jellyfinUserId: auth.jellyfinUserId,
+          jellyfinAccessToken: auth.jellyfinAccessToken,
+          shareId: shareUid,
+          shareAllowedIds: auth.allowedTrackIds,
+        };
+      }
+    }
+    return { code: 40, message: "Invalid or expired token." };
+  }
+
   const username = params.u?.trim();
   if (!username) {
     return { code: 10, message: "Required parameter 'u' (username) missing." };
   }
 
   let password: string | null = null;
+
+  // Share auth: u=share_<share_uid>, p=secret
+  if (username.startsWith("share_")) {
+    const shareUid = username.slice(6).trim();
+    if (!shareUid) return { code: 10, message: "Invalid share username." };
+    if (params.p) {
+      const p = params.p.startsWith("enc:")
+        ? (() => {
+            try {
+              return Buffer.from(params.p!.slice(4), "hex").toString("utf-8");
+            } catch {
+              return "";
+            }
+          })()
+        : params.p;
+      if (p) {
+        const resolved = resolveShareAuth(shareUid, p);
+        if (resolved) {
+          return {
+            subsonicUsername: resolved.subsonicUsername,
+            jellyfinUserId: resolved.jellyfinUserId,
+            jellyfinAccessToken: resolved.jellyfinAccessToken,
+            shareId: shareUid,
+            shareAllowedIds: resolved.allowedTrackIds,
+          };
+        }
+      }
+    }
+    return { code: 40, message: "Wrong username or password." };
+  }
 
   if (params.apiKey) {
     // apiKey: treat as app-specific password (stored in our store)

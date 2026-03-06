@@ -5,8 +5,10 @@ import { type Request, type Response } from "express";
 import http from "node:http";
 import https from "node:https";
 import { resolveAuth, resolveAuthFromBasicHeader } from "./auth.js";
+import { resolveAuthFromShareCookie } from "../web/share-session.js";
 import { subsonicEnvelope, subsonicError, ErrorCode, VERSION } from "./response.js";
 import * as handlers from "./handlers.js";
+import { stripSubsonicIdPrefix } from "./mappers.js";
 import { config } from "../config.js";
 import { buildJellyfinAuthHeader } from "../jellyfin/client.js";
 
@@ -56,6 +58,10 @@ const HANDLERS: Record<
   unstar: async (auth, params) => handlers.handleUnstar(auth, params),
   saveplayqueue: async (auth, params) => handlers.handleSavePlayQueue(auth, params),
   getplayqueue: async (auth) => handlers.handleGetPlayQueue(auth),
+  createshare: async (auth, params) => handlers.handleCreateShare(auth, params as unknown as { ids: string[]; description?: string; expires?: string }),
+  getshares: async (auth) => handlers.handleGetShares(auth),
+  updateshare: async (auth, params) => handlers.handleUpdateShare(auth, params),
+  deleteshare: async (auth, params) => handlers.handleDeleteShare(auth, params),
 };
 
 function getParams(req: Request): Record<string, string> {
@@ -195,6 +201,27 @@ function getPlayQueueSaveParams(req: Request): {
   return { playQueueIds: ids, current, position, changedBy };
 }
 
+/** Collect id[] and optional description/expires for createShare. */
+function getCreateShareParams(req: Request): { ids: string[]; description?: string; expires?: string } {
+  const q = req.query as Record<string, unknown>;
+  const body = (req.body as Record<string, unknown>) ?? {};
+  const ids: string[] = [];
+  for (const [k, v] of Object.entries(q)) {
+    if (k !== "id" && !k.startsWith("id[")) continue;
+    ids.push(...toIdStrings(v));
+  }
+  for (const [k, v] of Object.entries(body)) {
+    if (k !== "id" && !k.startsWith("id[")) continue;
+    ids.push(...toIdStrings(v));
+  }
+  const one = (v: unknown): string => (v === undefined || v === null ? "" : Array.isArray(v) ? String(v[0] ?? "") : String(v));
+  return {
+    ids,
+    description: one(q.description ?? body.description).trim() || undefined,
+    expires: one(q.expires ?? body.expires).trim() || undefined,
+  };
+}
+
 /** Subsonic API default is XML; DSub and many clients omit f= and expect XML. */
 function getFormat(params: Record<string, string>): "json" | "xml" {
   const f = params.f?.toLowerCase();
@@ -218,6 +245,13 @@ function sendError(
   res.status(httpStatus).json(body);
 }
 
+/** Device identity for Jellyfin proxy requests (stream, download, cover, avatar). */
+function getDeviceForProxy(auth: { jellyfinDeviceId?: string; jellyfinDeviceName?: string }): { id: string; name: string } | undefined {
+  return auth.jellyfinDeviceId && auth.jellyfinDeviceName
+    ? { id: auth.jellyfinDeviceId, name: auth.jellyfinDeviceName }
+    : undefined;
+}
+
 export function subsonicRouter(req: Request, res: Response): void {
   const rawParam = req.params.method ?? "";
   const raw = (typeof rawParam === "string" ? rawParam : rawParam[0] ?? "").replace(/\.view$/i, "").trim();
@@ -228,6 +262,11 @@ export function subsonicRouter(req: Request, res: Response): void {
 
   // Auth
   let authResult = resolveAuth(params);
+  // When u/p not sent (e.g. share page player with cookie), try share cookie
+  if ("code" in authResult && authResult.code === 10) {
+    const shareAuth = resolveAuthFromShareCookie(req);
+    if (shareAuth) authResult = shareAuth;
+  }
   // getCoverArt: some clients (e.g. Musly image loader) send credentials only in Authorization header
   if ("code" in authResult && method === "getcoverart") {
     const headerAuth = resolveAuthFromBasicHeader(req.get("authorization"));
@@ -251,6 +290,10 @@ export function subsonicRouter(req: Request, res: Response): void {
       sendError(res, format, ErrorCode.RequiredParameterMissing, "Missing id");
       return;
     }
+    if (auth.shareAllowedIds && !auth.shareAllowedIds.has(stripSubsonicIdPrefix(id))) {
+      sendError(res, format, ErrorCode.NotFound, "Not found", 404);
+      return;
+    }
     // Do not report playback start on stream: many clients pre-fetch the next track for gapless
     // playback, so we would mark the wrong track as "now playing". For "now playing" to update
     // when the queue auto-advances, the client must send scrobble(id, submission=false) when the
@@ -264,11 +307,7 @@ export function subsonicRouter(req: Request, res: Response): void {
       if (config.logRest) {
         console.log(`[STREAM] url=${url}`);
       }
-      const device =
-        auth.jellyfinDeviceId && auth.jellyfinDeviceName
-          ? { id: auth.jellyfinDeviceId, name: auth.jellyfinDeviceName }
-          : undefined;
-      proxyBinary(url, auth.jellyfinAccessToken, req, res, device);
+      proxyBinary(url, auth.jellyfinAccessToken, req, res, getDeviceForProxy(auth));
       return;
     } catch (err) {
       console.error("Error resolving stream URL", err);
@@ -283,16 +322,16 @@ export function subsonicRouter(req: Request, res: Response): void {
       sendError(res, format, ErrorCode.RequiredParameterMissing, "Missing id");
       return;
     }
+    if (auth.shareAllowedIds && !auth.shareAllowedIds.has(stripSubsonicIdPrefix(id))) {
+      sendError(res, format, ErrorCode.NotFound, "Not found", 404);
+      return;
+    }
     try {
       const url = handlers.getDownloadRedirectUrl(auth, id);
       if (config.logRest) {
         console.log(`[DOWNLOAD] url=${url}`);
       }
-      const device =
-        auth.jellyfinDeviceId && auth.jellyfinDeviceName
-          ? { id: auth.jellyfinDeviceId, name: auth.jellyfinDeviceName }
-          : undefined;
-      proxyBinary(url, auth.jellyfinAccessToken, req, res, device);
+      proxyBinary(url, auth.jellyfinAccessToken, req, res, getDeviceForProxy(auth));
       return;
     } catch (err) {
       console.error("Error resolving download URL", err);
@@ -307,6 +346,10 @@ export function subsonicRouter(req: Request, res: Response): void {
       sendError(res, format, ErrorCode.RequiredParameterMissing, "Missing id");
       return;
     }
+    if (auth.shareAllowedIds && !auth.shareAllowedIds.has(stripSubsonicIdPrefix(id))) {
+      sendError(res, format, ErrorCode.NotFound, "Not found", 404);
+      return;
+    }
     try {
       const size = params.size ? Number.parseInt(params.size, 10) || undefined : undefined;
       const url = handlers.getCoverArtRedirectUrl(auth, id, size);
@@ -317,11 +360,7 @@ export function subsonicRouter(req: Request, res: Response): void {
         sendError(res, format, ErrorCode.NotFound, "Cover art not found");
         return;
       }
-      const device =
-        auth.jellyfinDeviceId && auth.jellyfinDeviceName
-          ? { id: auth.jellyfinDeviceId, name: auth.jellyfinDeviceName }
-          : undefined;
-      proxyBinary(url, auth.jellyfinAccessToken, req, res, device);
+      proxyBinary(url, auth.jellyfinAccessToken, req, res, getDeviceForProxy(auth));
       return;
     } catch (err) {
       sendError(res, format, ErrorCode.NotFound, "Cover art not found");
@@ -337,11 +376,7 @@ export function subsonicRouter(req: Request, res: Response): void {
       sendError(res, format, ErrorCode.NotFound, "Avatar not found");
       return;
     }
-    const device =
-      auth.jellyfinDeviceId && auth.jellyfinDeviceName
-        ? { id: auth.jellyfinDeviceId, name: auth.jellyfinDeviceName }
-        : undefined;
-    proxyBinary(url, auth.jellyfinAccessToken, req, res, device);
+    proxyBinary(url, auth.jellyfinAccessToken, req, res, getDeviceForProxy(auth));
     return;
   }
 
@@ -356,6 +391,18 @@ export function subsonicRouter(req: Request, res: Response): void {
   }
   if (method === "saveplayqueue") {
     Object.assign(params, getPlayQueueSaveParams(req));
+  }
+  if (method === "createshare") {
+    Object.assign(params, getCreateShareParams(req));
+  }
+
+  // Share allowlist: when auth is share-scoped, only allow access to track ids in the share.
+  if (method === "getsong" && auth.shareAllowedIds) {
+    const id = params.id?.trim();
+    if (!id || !auth.shareAllowedIds.has(stripSubsonicIdPrefix(id))) {
+      sendError(res, format, ErrorCode.NotFound, "Not found", 404);
+      return;
+    }
   }
 
   handler(auth, params)
@@ -1022,11 +1069,13 @@ export function subsonicRouter(req: Request, res: Response): void {
             "<starred>",
           ];
           for (const a of artists) {
-            parts.push(
-              `<artist id="${escapeXmlAttr(String(a.id ?? ""))}" name="${escapeXmlAttr(
-                String(a.name ?? "")
-              )}"/>`
-            );
+            let tag = `<artist id="${escapeXmlAttr(String(a.id ?? ""))}" name="${escapeXmlAttr(
+              String(a.name ?? "")
+            )}"`;
+            if (a.coverArt != null && a.coverArt !== "") tag += ` coverArt="${escapeXmlAttr(String(a.coverArt))}"`;
+            if (a.albumCount != null) tag += ` albumCount="${a.albumCount}"`;
+            tag += "/>";
+            parts.push(tag);
           }
           for (const al of albums) {
             let tag = `<album id="${escapeXmlAttr(String(al.id ?? ""))}" name="${escapeXmlAttr(
@@ -1035,6 +1084,8 @@ export function subsonicRouter(req: Request, res: Response): void {
             if (al.artist) tag += ` artist="${escapeXmlAttr(String(al.artist))}"`;
             if (al.artistId) tag += ` artistId="${escapeXmlAttr(String(al.artistId))}"`;
             if (al.coverArt) tag += ` coverArt="${escapeXmlAttr(String(al.coverArt))}"`;
+            if (al.created) tag += ` created="${escapeXmlAttr(String(al.created))}"`;
+            if (al.songCount != null) tag += ` songCount="${al.songCount}"`;
             tag += "/>";
             parts.push(tag);
           }
@@ -1078,11 +1129,13 @@ export function subsonicRouter(req: Request, res: Response): void {
             "<starred2>",
           ];
           for (const a of artists) {
-            parts.push(
-              `<artist id="${escapeXmlAttr(String(a.id ?? ""))}" name="${escapeXmlAttr(
-                String(a.name ?? "")
-              )}"/>`
-            );
+            let tag = `<artist id="${escapeXmlAttr(String(a.id ?? ""))}" name="${escapeXmlAttr(
+              String(a.name ?? "")
+            )}"`;
+            if (a.coverArt != null && a.coverArt !== "") tag += ` coverArt="${escapeXmlAttr(String(a.coverArt))}"`;
+            if (a.albumCount != null) tag += ` albumCount="${a.albumCount}"`;
+            tag += "/>";
+            parts.push(tag);
           }
           for (const al of albums) {
             let tag = `<album id="${escapeXmlAttr(String(al.id ?? ""))}" name="${escapeXmlAttr(
@@ -1091,6 +1144,8 @@ export function subsonicRouter(req: Request, res: Response): void {
             if (al.artist) tag += ` artist="${escapeXmlAttr(String(al.artist))}"`;
             if (al.artistId) tag += ` artistId="${escapeXmlAttr(String(al.artistId))}"`;
             if (al.coverArt) tag += ` coverArt="${escapeXmlAttr(String(al.coverArt))}"`;
+            if (al.created) tag += ` created="${escapeXmlAttr(String(al.created))}"`;
+            if (al.songCount != null) tag += ` songCount="${al.songCount}"`;
             tag += "/>";
             parts.push(tag);
           }
@@ -1144,6 +1199,15 @@ export function subsonicRouter(req: Request, res: Response): void {
           format,
           ErrorCode.RequiredParameterMissing,
           "Required parameter 'id' is missing."
+        );
+        return;
+      }
+      if (err?.message === "No valid audio entries found for the given ids") {
+        sendError(
+          res,
+          format,
+          ErrorCode.Generic,
+          "No playable tracks found for the given id(s). Use track, album (al-), or playlist ids."
         );
         return;
       }

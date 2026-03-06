@@ -180,7 +180,11 @@ DSub2000 parses XML responses and maps them into Java domain objects that freque
 
 If you see DSub exceptions like `Attempt to invoke virtual method 'int java.lang.Integer.intValue()' on a null object reference`, revisit your integer defaults and XML attributes for the relevant endpoint.
 
-## 5. Debugging workflow
+## 5. Development validation workflow (mandatory)
+
+For any change to endpoints or Jellyfin integration, follow the **development validation workflow** so that: (1) the local container is rebuilt and run with correct volumes/vars, (2) credentials are captured from `data/`, (3) client-mimic calls are run against local Subfin and responses captured, (4) results are verified against Jellyfin directly for content parity, (5) issues are remediated and the loop repeated until known clients would succeed and Subfin data matches Jellyfin. Full steps and commands: **`.local-testing/README.md`** and the **subfin-development-validation** skill. **If credential validation fails:** prompt the user to re-create credentials for the test account (e.g. re-link device); do not retry in a loop—the user will perform the required steps.
+
+## 6. Debugging workflow
 
 When something breaks (connection failure, crash, missing data):
 
@@ -196,11 +200,12 @@ When something breaks (connection failure, crash, missing data):
    - For quick manual checks against the hosted test instances (`https://subfin.kray.pw`, `https://jellyfin.kray.pw`), you can use the local testing credentials stored in `.local-testing/subfin-api-credentials.json` (git-ignored).
    - Use those values with tools like `curl`, `httpie`, or REST clients to:
      - Call Subsonic/OpenSubsonic endpoints on `https://subfin.kray.pw` with `u` and `p`/`t`/`s` params using the known app password.
-     - Call Jellyfin APIs on `https://jellyfin.kray.pw` by setting the `X-Emby-Authorization` header (via the existing `buildJellyfinAuthHeader` convention) with the stored `jellyfin_access_token`.
+     - Call Jellyfin APIs on `https://jellyfin.kray.pw` by setting the `Authorization` header (e.g. `MediaBrowser Token="..."` or via `buildJellyfinAuthHeader`) with the stored `jellyfin_access_token`.
+   - **Extracting and validating credentials:** See **`.local-testing/README.md`** and the **subfin-development-validation** skill for the full process. If credential validation fails, prompt the user to re-create credentials; do not loop.
 
 Use this skill as a mental checklist before and after changes to ensure new endpoints and refactors preserve the hard-earned interop behaviors between OpenSubsonic clients and Jellyfin.
 
-## 6. Client-specific quirks (beyond DSub)
+## 7. Client-specific quirks (beyond DSub)
 
 ### 6.1 Youamp
 
@@ -222,6 +227,7 @@ Use this skill as a mental checklist before and after changes to ensure new endp
 - **Favorites:**
   - Only `getStarred2` is used; `getStarred` is ignored.
   - `star` / `unstar` must be implemented (even as simple 200 responses) and `getStarred2` must reflect the change.
+  - Subfin’s getStarred2 returns `artist[]`, `album[]`, `song[]` with safe fallbacks: albums have `id`, `name`, `album` (same as name), `artist`, `created`, `artistId`, `coverArt`, `songCount`; songs use `toSubsonicSong` (id, title, suffix, contentType, size, etc.); artists have `id`, `name`, `coverArt`, `albumCount` (empty string for missing ids so clients do not see undefined).
 
 ### 6.2 Musly
 
@@ -236,6 +242,13 @@ Use this skill as a mental checklist before and after changes to ensure new endp
   - Starred songs and albums work correctly as long as `starred2` exposes:
     - `album[]` with `id` and `name` (and ideally `artist`, `created`).
     - `song[]` with full song fields.
+  - Subfin provides these; album entries also include `artist`, `created`, `artistId`, `coverArt`, `songCount`, and `album` (same as name). Artists are included with `id`, `name`, `coverArt`, `albumCount`.
   - Musly currently does not send any follow-up REST calls when tapping a starred album tile; this appears to be a client limitation rather than something Subfin can fix.
+
+### 6.3 Tempus – createShare and playlist IDs
+
+- **createShare:** Some clients (e.g. Tempus) send the playlist id from `getPlaylists` **without** a `pl-` prefix (raw Jellyfin GUID). Subfin’s `getPlaylists` returns `id: p.id` (raw); only `coverArt` uses `pl-<id>`.
+- **Impact:** `handleCreateShare` must accept raw playlist IDs: when an id has no `al-`/`pl-` prefix and `getSong` returns null, Subfin tries `getPlaylistItems` for that id so “share playlist” works. See `.tempus-analysis/ANALYSIS.md` for Tempus-specific notes.
+- **Errors:** When no valid audio entries are found, Subfin returns a structured Subsonic error (not a bare throw) so clients can show a message instead of crashing.
 
 

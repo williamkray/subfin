@@ -500,6 +500,29 @@ export async function getAlbumsForLibrary(
     });
   }
 
+  // Highest rated: Subfin maps Subsonic rating to Jellyfin Likes (like/unlike).
+  // "Highest" = albums the user has liked or favorited (IsFavoriteOrLikes).
+  if (typeLower === "highest" && opts.userId) {
+    const { accessToken, device } = normalizeContext(ctx);
+    const api: any = getApi(ctx);
+    const authHeader = buildJellyfinAuthHeader(accessToken, device);
+    const base = jf.baseUrl.replace(/\/$/, "");
+    const url = new URL(`${base}/Users/${opts.userId}/Items`);
+    url.searchParams.set("IncludeItemTypes", BaseItemKind.MusicAlbum);
+    url.searchParams.set("Recursive", "true");
+    url.searchParams.set("Filters", "IsFavoriteOrLikes");
+    url.searchParams.set("SortBy", "SortName");
+    url.searchParams.set("SortOrder", "Ascending");
+    url.searchParams.set("Limit", String(requestedSize));
+    url.searchParams.set("StartIndex", String(offset ?? 0));
+    if (musicFolderId) url.searchParams.set("ParentId", musicFolderId);
+    if (genre) url.searchParams.set("Genres", genre);
+    const response = await api.axiosInstance.get(url.toString(), {
+      headers: { Authorization: authHeader },
+    });
+    return (response.data?.Items as BaseItemDto[] | undefined) ?? [];
+  }
+
   switch (typeLower) {
     case "newest":
       sortBy = ["DateCreated"];
@@ -906,6 +929,53 @@ export async function getFavoriteAlbums(
     sortOrder: ["Ascending"],
     limit: size ?? 200,
     startIndex: offset ?? 0,
+  } as any);
+  return response.data?.Items ?? [];
+}
+
+/** Get favorited artists (MusicArtist) for the current user. */
+export async function getFavoriteArtists(
+  ctx: JellyfinContext,
+  opts: { musicFolderId?: string; size?: number; offset?: number }
+): Promise<BaseItemDto[]> {
+  const { accessToken, device } = normalizeContext(ctx);
+  const api: any = getApi(ctx);
+  const size = opts.size ?? 200;
+  const offset = opts.offset ?? 0;
+  const musicFolderId = opts.musicFolderId || undefined;
+
+  // Prefer explicit userId when available so we can hit /Users/{userId}/Items with Filters=IsFavorite,
+  // which is how Jellyfin exposes user-specific favorite artists.
+  const userId = typeof ctx === "string" ? undefined : ctx.userId;
+  const authHeader = buildJellyfinAuthHeader(accessToken, device);
+
+  if (userId) {
+    const base = jf.baseUrl.replace(/\/$/, "");
+    const url = new URL(`${base}/Users/${userId}/Items`);
+    url.searchParams.set("IncludeItemTypes", BaseItemKind.MusicArtist);
+    url.searchParams.set("Recursive", "true");
+    url.searchParams.set("Limit", String(size));
+    url.searchParams.set("StartIndex", String(offset));
+    url.searchParams.set("Filters", "IsFavorite");
+    if (musicFolderId) url.searchParams.set("ParentId", musicFolderId);
+    const response = await api.axiosInstance.get(url.toString(), {
+      headers: { Authorization: authHeader },
+    });
+    return (response.data?.Items as BaseItemDto[] | undefined) ?? [];
+  }
+
+  // Fallback: legacy ItemsApi path without explicit user id. This may not see user-specific
+  // favorites in all Jellyfin setups but keeps behavior for older contexts.
+  const itemsApi = getItemsApi(api);
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.MusicArtist],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    isFavorite: true as any,
+    sortBy: ["SortName"],
+    sortOrder: ["Ascending"],
+    limit: size,
+    startIndex: offset,
   } as any);
   return response.data?.Items ?? [];
 }

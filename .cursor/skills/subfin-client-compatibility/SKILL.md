@@ -115,6 +115,10 @@ When working on lyrics endpoints:
 - **Synced lyrics**  
   - When Jellyfin exposes synced lyrics with timestamps, convert those to milliseconds and expose them via OpenSubsonic’s `lyricsList.structuredLyrics` format so clients like Musly can do proper karaoke/scrolling.
 
+## Development validation workflow (mandatory)
+
+Before considering any handler/mapper change complete, follow the **development validation workflow**: rebuild local container, capture credentials from `data/`, run client-mimic calls to local Subfin, verify responses against Jellyfin for content parity, remediate and repeat until known clients would succeed and Subfin data matches Jellyfin. Full process: **`.local-testing/README.md`** and the **subfin-development-validation** skill. **If credential validation fails:** prompt the user to re-create credentials for the test account; do not retry in a loop.
+
 ## General debugging workflow for compatibility
 
 When a client misbehaves or crashes:
@@ -139,6 +143,7 @@ When a client misbehaves or crashes:
 7. **Optionally sanity-check via raw API calls**  
    - For quick spot-checks against the hosted Subfin/Jellyfin test instances (`https://subfin.kray.pw`, `https://jellyfin.kray.pw`), you can reuse the local testing credentials stored in `.local-testing/subfin-api-credentials.json` (git-ignored).
    - Use those credentials to hit specific OpenSubsonic endpoints with `curl` or a REST client when you want to confirm that a mapper or handler change behaves correctly without involving a full client app session.
+   - **Credential source and validation:** See **`.local-testing/README.md`** and the **subfin-development-validation** skill. If credential validation fails, prompt the user to re-create credentials; do not loop.
 
 ## Examples
 

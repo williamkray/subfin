@@ -3,7 +3,15 @@
  */
 import * as jf from "../jellyfin/client.js";
 import { config } from "../config.js";
-import { clearPlayQueue, getPlayQueue, savePlayQueue } from "../store/index.js";
+import {
+  clearPlayQueue,
+  getPlayQueue,
+  savePlayQueue,
+  createShare as storeCreateShare,
+  getSharesForUser,
+  updateShare as storeUpdateShare,
+  deleteShare as storeDeleteShare,
+} from "../store/index.js";
 import {
   stripSubsonicIdPrefix,
   toSubsonicArtistsIndex,
@@ -324,6 +332,7 @@ export async function handleGetAlbumList(
       merged.sort((a, b) => playCount(b) - playCount(a));
     } else if (
       typeLower === "starred" ||
+      typeLower === "highest" ||
       typeLower === "alphabeticalbyname" ||
       typeLower === "alphabeticalbyartist"
     ) {
@@ -694,7 +703,7 @@ export async function handleGetArtistInfo2(
   return { artistInfo2: res.artistInfo };
 }
 
-/** getStarred / getStarred2: favorites backed by Jellyfin user favorites (albums and songs). */
+/** getStarred / getStarred2: favorites backed by Jellyfin user favorites (artists, albums, songs). */
 export async function handleGetStarred(
   auth: AuthResult,
   params: Record<string, string>
@@ -702,42 +711,47 @@ export async function handleGetStarred(
   const size = Number.parseInt(params.size ?? "200", 10) || 200;
   const offset = Number.parseInt(params.offset ?? "0", 10) || 0;
   const musicFolderId = params.musicFolderId?.trim() || undefined;
-  const [albums, songs] = await Promise.all([
-    jf.getFavoriteAlbums(toJellyfinContext(auth), { musicFolderId, size, offset }),
-    jf.getFavoriteSongs(toJellyfinContext(auth), { musicFolderId, size, offset }),
+  const ctx = toJellyfinContext(auth);
+  const [artists, albums, songs] = await Promise.all([
+    jf.getFavoriteArtists(ctx, { musicFolderId, size, offset }),
+    jf.getFavoriteAlbums(ctx, { musicFolderId, size, offset }),
+    jf.getFavoriteSongs(ctx, { musicFolderId, size, offset }),
   ]);
   if (config.logRest) {
     console.log(
-      "[STARRED] getStarred favorites: albums=%d songs=%d",
+      "[STARRED] getStarred favorites: artists=%d albums=%d songs=%d",
+      artists.length,
       albums.length,
       songs.length
     );
-    const sample = albums[0];
-    if (sample) {
-      const albumArtistIds = (sample as { AlbumArtistIds?: string[] }).AlbumArtistIds;
-      console.log(
-        "[STARRED] sample album: id=%s name=%s parentId=%s albumArtistIds=%j",
-        sample.Id ?? "",
-        sample.Name ?? "",
-        sample.ParentId ?? "",
-        albumArtistIds ?? []
-      );
-    }
   }
   return {
     starred: {
-      artist: [],
+      // Artist: id, name, coverArt, albumCount (required by OpenSubsonic; safe fallbacks for Youamp/Musly).
+      artist: artists.map((a) => ({
+        id: a.Id ? `ar-${a.Id}` : "",
+        name: a.Name ?? "",
+        coverArt: a.Id ? `ar-${a.Id}` : "",
+        albumCount: a.AlbumCount ?? 0,
+      })),
+      // Album: id, name, artist, created required by Youamp; "album" = name for clients that expect it.
       album: albums.map((a) => {
         const primaryArtistId = resolvePrimaryArtistIdForAlbum(a);
+        const name = a.Name ?? "";
         return {
-          id: a.Id ? `al-${a.Id}` : undefined,
-          name: a.Name ?? "",
+          id: a.Id ? `al-${a.Id}` : "",
+          name,
+          album: name,
           artist: a.AlbumArtist ?? a.Artists?.[0] ?? "",
-          artistId: primaryArtistId ? `ar-${primaryArtistId}` : undefined,
-          coverArt: a.Id ? `al-${a.Id}` : undefined,
+          artistId: primaryArtistId ? `ar-${primaryArtistId}` : "",
+          coverArt: a.Id ? `al-${a.Id}` : "",
           created: a.DateCreated ?? new Date(0).toISOString(),
+          songCount: a.ChildCount ?? 0,
+          year: a.ProductionYear ?? undefined,
+          genre: a.Genres?.[0] ?? undefined,
         };
       }),
+      // Song: toSubsonicSong already provides id, title, suffix, contentType, size and full child shape.
       song: songs.map((s) => toSubsonicSong(s)),
     },
   };
@@ -1356,6 +1370,196 @@ export async function handleGetSong(
   return {
     song: toSubsonicSong(song),
   };
+}
+
+/** OpenSubsonic createShare: expand ids to tracks, create linked device + share row, return share with url and entry[]. */
+export async function handleCreateShare(
+  auth: AuthResult,
+  params: { ids: string[]; description?: string; expires?: string }
+): Promise<Record<string, unknown>> {
+  const ids = params.ids?.filter((id) => typeof id === "string" && id.trim()) ?? [];
+  if (ids.length === 0) throw new Error("At least one id is required");
+
+  const ctx = toJellyfinContext(auth);
+  const entryIds: string[] = [];
+  const entryIdsFlat: string[] = [];
+  const seen = new Set<string>();
+  const itemsForEntry: NonNullable<Awaited<ReturnType<typeof jf.getSong>>>[] = [];
+
+  for (const id of ids) {
+    const trimmed = id.trim();
+    entryIds.push(trimmed);
+    if (trimmed.toLowerCase().startsWith("ar-")) {
+      const artistId = stripSubsonicIdPrefix(trimmed);
+      const albums = await jf.getAlbumsByArtist(ctx, artistId);
+      for (const album of albums) {
+        if (!album.Id) continue;
+        const songs = await jf.getSongsByAlbum(ctx, album.Id);
+        for (const s of songs) {
+          if (s.Id && !seen.has(s.Id)) {
+            seen.add(s.Id);
+            entryIdsFlat.push(s.Id);
+            itemsForEntry.push(s);
+          }
+        }
+      }
+    } else if (trimmed.toLowerCase().startsWith("al-")) {
+      const albumId = stripSubsonicIdPrefix(trimmed);
+      const album = await jf.getAlbum(ctx, albumId);
+      if (!album) continue;
+      const songs = await jf.getSongsByAlbum(ctx, albumId);
+      for (const s of songs) {
+        if (s.Id && !seen.has(s.Id)) {
+          seen.add(s.Id);
+          entryIdsFlat.push(s.Id);
+          itemsForEntry.push(s);
+        }
+      }
+    } else if (trimmed.toLowerCase().startsWith("pl-")) {
+      const playlistId = stripSubsonicIdPrefix(trimmed);
+      const items = await jf.getPlaylistItems(ctx, playlistId, auth.jellyfinUserId);
+      for (const item of items) {
+        if (item.Id && !seen.has(item.Id)) {
+          seen.add(item.Id);
+          entryIdsFlat.push(item.Id);
+          itemsForEntry.push(item);
+        }
+      }
+    } else {
+      const trackId = stripSubsonicIdPrefix(trimmed);
+      const song = await jf.getSong(ctx, trackId);
+      if (song && song.Id && !seen.has(song.Id)) {
+        seen.add(song.Id);
+        entryIdsFlat.push(song.Id);
+        itemsForEntry.push(song);
+      } else {
+        // Clients (e.g. Tempus) may send playlist id from getPlaylists without pl- prefix.
+        let added = entryIdsFlat.length;
+        try {
+          const items = await jf.getPlaylistItems(ctx, trackId, auth.jellyfinUserId);
+          for (const item of items) {
+            if (item.Id && !seen.has(item.Id)) {
+              seen.add(item.Id);
+              entryIdsFlat.push(item.Id);
+              itemsForEntry.push(item);
+            }
+          }
+        } catch {
+          // Not a playlist or not accessible.
+        }
+        // If still no entries from playlist, try as album (e.g. Jellyfin URL paste).
+        if (entryIdsFlat.length === added) {
+          const album = await jf.getAlbum(ctx, trackId);
+          if (album) {
+            const songs = await jf.getSongsByAlbum(ctx, trackId);
+            for (const s of songs) {
+              if (s.Id && !seen.has(s.Id)) {
+                seen.add(s.Id);
+                entryIdsFlat.push(s.Id);
+                itemsForEntry.push(s);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (entryIdsFlat.length === 0) throw new Error("No valid audio entries found for the given ids");
+
+  const description = params.description?.trim() || null;
+  const expiresAt = params.expires ? Number.parseInt(params.expires, 10) || null : null;
+  if (expiresAt !== null && (Number.isNaN(expiresAt) || expiresAt < 0)) throw new Error("Invalid expires");
+
+  const { shareUid, secret } = storeCreateShare(auth.subsonicUsername, auth.jellyfinUserId, auth.jellyfinAccessToken, {
+    entryIds,
+    entryIdsFlat,
+    description,
+    expiresAt,
+  });
+
+  const baseUrl = (config.subfinPublicUrl || "http://localhost:4040").replace(/\/$/, "");
+  const url = `${baseUrl}/share/${shareUid}?secret=${encodeURIComponent(secret)}`;
+
+  const entry = itemsForEntry.map((i) => toSubsonicSong(i));
+
+  return {
+    shares: {
+      share: [
+        {
+          id: shareUid,
+          url,
+          description: description ?? undefined,
+          username: auth.subsonicUsername,
+          created: new Date().toISOString(),
+          visitCount: 0,
+          entry,
+        },
+      ],
+    },
+  };
+}
+
+/** OpenSubsonic getShares: list shares for the authenticated user with entry[] from entry_ids_flat. */
+export async function handleGetShares(auth: AuthResult): Promise<Record<string, unknown>> {
+  const shares = getSharesForUser(auth.subsonicUsername);
+  const baseUrl = (config.subfinPublicUrl || "http://localhost:4040").replace(/\/$/, "");
+  const ctx = toJellyfinContext(auth);
+  const shareList: Record<string, unknown>[] = [];
+
+  for (const s of shares) {
+    let flatIds: string[] = [];
+    try {
+      flatIds = JSON.parse(s.entry_ids_flat) as string[];
+      if (!Array.isArray(flatIds)) flatIds = [];
+    } catch {
+      flatIds = [];
+    }
+    const entries: Record<string, unknown>[] = [];
+    for (const id of flatIds) {
+      const song = await jf.getSong(ctx, id);
+      if (song) entries.push(toSubsonicSong(song));
+    }
+    const url = `${baseUrl}/share/${s.share_uid}`;
+    shareList.push({
+      id: s.share_uid,
+      url,
+      description: s.description ?? undefined,
+      username: auth.subsonicUsername,
+      created: s.created_at,
+      visitCount: s.visit_count ?? 0,
+      entry: entries,
+    });
+  }
+
+  return { shares: { share: shareList } };
+}
+
+/** OpenSubsonic updateShare: update description and/or expires. */
+export async function handleUpdateShare(
+  auth: AuthResult,
+  params: Record<string, string>
+): Promise<Record<string, unknown>> {
+  const id = params.id?.trim();
+  if (!id) throw new Error("Missing share id");
+  const description = params.description?.trim();
+  const expiresRaw = params.expires?.trim();
+  const expiresAt = expiresRaw !== undefined && expiresRaw !== "" ? Number.parseInt(expiresRaw, 10) : undefined;
+  const ok = storeUpdateShare(id, auth.subsonicUsername, {
+    description: description !== undefined ? description : undefined,
+    expiresAt: expiresAt !== undefined ? expiresAt : undefined,
+  });
+  if (!ok) throw new Error("Share not found or access denied");
+  return {};
+}
+
+/** OpenSubsonic deleteShare: delete share and unlink device (revoke password). */
+export async function handleDeleteShare(auth: AuthResult, params: Record<string, string>): Promise<Record<string, unknown>> {
+  const id = params.id?.trim();
+  if (!id) throw new Error("Missing share id");
+  const ok = storeDeleteShare(id, auth.subsonicUsername);
+  if (!ok) throw new Error("Share not found or access denied");
+  return {};
 }
 
 /** Returns Jellyfin stream URL used by the router to proxy the audio response. */

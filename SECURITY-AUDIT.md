@@ -1,12 +1,12 @@
 # Security Audit Report
 
 **Project:** Subfin  
-**Date:** 2026-03-05  
-**Scope:** Full codebase security review (including recent Web UI and store changes)
+**Date:** 2026-03-06  
+**Scope:** Full codebase security review (including Web UI, SQLite store, and Subsonic REST)
 
 ## Executive summary
 
-The review identified **1 High** and **3 Medium** severity issues, plus several **Low** and **Info** findings. The most serious is **plaintext storage of app passwords and Jellyfin tokens** in the JSON store (`subfin.json`), which allows anyone with read access to the file (e.g. host compromise, backup exposure) to impersonate users. **Web device unlink/reset does not verify the app password** when the request is made without a session cookie, allowing unlink or password reset with an arbitrary password for a known username and device ID. **No rate limiting** on login or link flows enables brute-force attempts. Recommended immediate actions: stop storing plaintext app passwords (or isolate/encrypt the store), verify credentials on unlink/reset when no session is present, and add rate limiting for auth and device-management endpoints.
+The review identified **1 High** (legacy only), **3 Medium**, and several **Low**/**Info** findings. The **active store is SQLite** with bcrypt-hashed app passwords and AES-256-GCM–encrypted Jellyfin tokens; the **High** finding applies only to **legacy** `subfin.json` (or backups) if they still exist. **Web device unlink/reset/rename** correctly require either a session cookie or username+app-password and the store enforces per-username device ownership (no IDOR). Remaining risks: **no rate limiting** on auth or device flows, **QuickConnect secrets in URLs** with no TTL, and **debug logging** that can leak tokens when `SUBFIN_LOG_REST` is on. **npm audit** reports 0 vulnerabilities. Recommended actions: remove or restrict legacy JSON store files; add rate limiting; expire pending QuickConnect entries; redact tokens in logs; set Secure cookie and security headers when deployed over HTTPS.
 
 ## Summary table
 
@@ -24,13 +24,13 @@ The review identified **1 High** and **3 Medium** severity issues, plus several 
 
 ## Findings
 
-### 1 Plaintext app passwords and Jellyfin tokens in legacy JSON store (High)
+### 1 Plaintext app passwords and Jellyfin tokens in legacy JSON store (High — legacy only)
 
-- **Location:** `src/store/index.ts` (legacy JSON migration); historical `subfin.json` store if still present.
-- **Changes since last review:** The project now defaults to an **SQLite-backed store with encryption at rest** for sensitive columns; the code automatically migrates from a legacy JSON store (`subfin.json`) into SQLite on first run and renames the old file to `subfin.json.migrated`. App passwords in the active SQLite store are hashed with bcrypt and only the encrypted form is kept; Jellyfin tokens are encrypted in both the active store and the pending QuickConnect table.
-- **Description:** If an old `subfin.json` file still exists and has not yet been migrated or securely removed, it may contain historical plaintext app passwords and Jellyfin tokens from older versions. The migration step now reads this file, encrypts and inserts data into SQLite, and then renames the JSON file to `subfin.json.migrated`, but any backups or extra copies of the JSON file remain sensitive.
-- **Impact:** Anyone with read access to an old JSON store (on disk or in backups) can still recover app passwords and Jellyfin tokens and impersonate users. The active SQLite store is significantly better protected (hashed app passwords, encrypted tokens), but legacy artifacts retain prior risk until removed or secured.
-- **Recommendation:** (1) After confirming migration to SQLite has completed, **remove or tightly restrict** any legacy `subfin.json` / `subfin.json.migrated` files (e.g. `chmod 600` and limit to the service user, or delete if no longer needed). (2) Highlight in deployment docs that these legacy JSON files are sensitive and should not be backed up in plaintext. (3) For new installs, ensure JSON-based storage is not used at all and that only the SQLite path is documented going forward.
+- **Location:** `src/store/index.ts` (legacy JSON migration); historical `subfin.json` or `subfin.json.migrated` if present.
+- **Current state:** The **active store is SQLite** (`config.dbPath`, default `subfin.db`). Sensitive columns use **bcrypt** (app passwords) and **AES-256-GCM** (app password plaintext for token auth, Jellyfin tokens) with a key derived from `SUBFIN_SALT`. Legacy `subfin.json` is migrated once into SQLite and renamed to `subfin.json.migrated`; the code does not write new plaintext to JSON.
+- **Description:** Any **pre-migration** or **backup** copy of `subfin.json` (or the renamed `.migrated` file) may still hold plaintext app passwords and Jellyfin tokens from before migration.
+- **Impact:** Read access to such legacy files allows impersonation. The live SQLite store is not affected.
+- **Recommendation:** Remove or tightly restrict (`chmod 600`, service user only) legacy `subfin.json` and `subfin.json.migrated`; do not back them up in plaintext. Document that new installs use SQLite only.
 - **References:** OWASP Storage of Sensitive Data; CWE-312 (Cleartext Storage).
 
 ### 2 Debug logging can leak Jellyfin tokens in URLs (Medium)
@@ -109,5 +109,5 @@ The review identified **1 High** and **3 Medium** severity issues, plus several 
 ## Appendix
 
 - **Methodology:** Manual code review of auth, store, web and Subsonic routes, config, and dependencies; `npm audit` for known vulnerabilities.
-- **Tools used:** grep/code search, npm audit.
-- **Positive notes:** Passwords are verified with bcrypt for login; Subsonic REST requires auth for all sensitive methods; Web UI uses HttpOnly and SameSite=Lax; Docker runs as non-root; `.gitignore` covers `subfin.json`, `.env`, and `.local-testing/`; XML output uses escaping for attributes and text.
+- **Tools used:** grep/code search, npm audit (0 vulnerabilities as of 2026-03-06).
+- **Positive notes:** Active store is SQLite with bcrypt and AES-256-GCM; Subsonic REST and Web device actions require auth; unlink/reset/rename enforce per-username device ownership (no IDOR); Web UI uses HttpOnly and SameSite=Lax; Docker runs as non-root; `.gitignore` covers `subfin.json`, `.env`, `.local-testing/`; XML/HTML output uses escaping for attributes and text.

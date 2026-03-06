@@ -71,6 +71,10 @@ The container runs as a non-root user and expects writable `/data` for the store
 - **Subsonic REST:** `http://localhost:4040/rest/` (e.g. `/rest/ping.view`, `/rest/getMusicFolders.view`)
 - **Web UI:** `http://localhost:4040/` (link device, manage devices)
 
+## Development and validation
+
+For any change to the API or Jellyfin integration, use the **development validation workflow**: (1) rebuild and run the local container with correct volumes/vars, (2) capture credentials from `data/`, (3) run client-mimic calls to local Subfin and capture responses, (4) verify against Jellyfin directly for content parity, (5) remediate and repeat until known clients would succeed and Subfin data matches Jellyfin. If credential validation fails, re-create credentials for the test account (e.g. re-link device in the web UI). Full commands and scripts: **`.local-testing/README.md`**. Canonical process: **`.cursor/skills/subfin-development-validation/SKILL.md`**.
+
 ## Web UI
 
 1. **Link a device** (`/link`): Sign in with Jellyfin via **Quick Connect** (recommended with OIDC) or **username/password**. Subfin shows a one-time **app password** — use it with your **Jellyfin username** in the Subsonic client.
@@ -126,6 +130,7 @@ Subfin exposes two lyrics endpoints:
   - `getLyrics` (by track `id` or by `artist`+`title`): returns plain lyrics from Jellyfin; when only artist+title is sent, Subfin tries multiple search results until one has lyrics (helps clients like Tempus).
   - `getLyricsBySongId` (OpenSubsonic): returns `lyricsList` with `structuredLyrics` (synced/unsynced lines).
 - **Starring & ratings**
+  - `getStarred` / `getStarred2`: return starred artists, albums, and songs from Jellyfin (OpenSubsonic shape: `starred2.artist`, `starred2.album`, `starred2.song`).
   - `star` / `unstar`: mark or clear favorites in Jellyfin (supports id, albumId, artistId, idList).
   - `setRating`: map Subsonic rating to Jellyfin like (4–5 like, 1–2 unlike, 3 clear).
 
@@ -133,7 +138,7 @@ Subfin exposes two lyrics endpoints:
 
 - Richer **artist/album metadata** (e.g. Last.fm links; biographies and similar artists already come from Jellyfin).
 - Playlist CRUD is implemented; remaining work is client testing and any Jellyfin permission edge cases.
-- **Album list types** for home screens: `getAlbumList` supports `random`, `newest`, **recent** (recently played), **frequent** (most played), **starred** (favorite albums), `alphabeticalByName`/`ByArtist`, `byGenre`, `byYear`. Not yet: **highest** (highest rated).
+- **Album list types** for home screens: `getAlbumList` supports `random`, `newest`, **recent** (recently played), **frequent** (most played), **starred** (favorite albums), **highest** (highest rated, via Jellyfin Likes/IsFavoriteOrLikes), `alphabeticalByName`/`ByArtist`, `byGenre`, `byYear`.
 - Further **search / discovery** refinements (e.g. full filter semantics for `getRandomSongs`, multi-genre/year for `getSongsByGenre`).
 - **Scrobbling** refinement (e.g. pause/resume precision) and other write APIs (play queue save).
 - More complete **error handling and diagnostics** around Jellyfin failures and network issues.
@@ -147,6 +152,9 @@ The following are **not prioritized or planned** for Subfin. The project focuses
 - **Internet radio** — no radio station endpoints or Live TV mapping.
 - **Video playback or streaming** — no video endpoints; `stream` / `download` are audio-only. `getVideos` / `getVideoInfo` will not be implemented.
 - **Bookmarking** — no bookmark endpoints (e.g. `createBookmark`, `getBookmarks`, `deleteBookmark`).
+- **tokenInfo** — no API to expose app-password / API key metadata from Subfin's store.
+- **User management** — no `createUser` / `updateUser` / `deleteUser` / `changePassword`; Jellyfin user management stays in Jellyfin.
+- **Chat** — no `addChatMessage` / `getChatMessages`; no Jellyfin equivalent and not in scope.
 
 If a client calls these APIs, Subfin will return “Unknown method” or an equivalent error.
 
@@ -161,7 +169,7 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 | `ping` | **Fully implemented** | N/A (internal health) | Returns a standard Subsonic `subsonic-response` without calling Jellyfin. |
 | `getLicense` | **Fully implemented** | N/A | Always reports a valid license; Jellyfin has no license concept. |
 | `getOpenSubsonicExtensions` | **Partially implemented** | N/A | Returns a static list of supported extensions (transcoders, formats, lyrics). |
-| `tokenInfo` | **Unimplemented** | N/A | Would expose app-password / API key metadata from Subfin’s JSON store, not Jellyfin. |
+| `tokenInfo` | **Not planned** | — | Out of scope; no API to expose app-password metadata from Subfin's store. |
 
 ### Browsing (library and metadata)
 
@@ -182,12 +190,12 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 
 | Endpoint | Status | Jellyfin mapping | Notes |
 |---------|--------|------------------|-------|
-| `getAlbumList` | **Partially implemented** | `ItemsApi.getItems(MusicAlbum)` + Audio for recent/frequent | Supports types: random, newest, **recent** (derived from recently played *tracks* so it matches scrobble history), **frequent** (derived from per-track play counts so it reflects real listening), **starred**, alphabeticalByName/ByArtist, byGenre, byYear. Not yet: highest (highest rated). |
+| `getAlbumList` | **Partially implemented** | `ItemsApi.getItems(MusicAlbum)` + Audio for recent/frequent; `/Users/{id}/Items` with Filters=IsFavoriteOrLikes for highest | Supports types: random, newest, **recent**, **frequent**, **starred**, **highest** (highest rated, via Jellyfin Likes/IsFavoriteOrLikes), alphabeticalByName/ByArtist, byGenre, byYear. |
 | `getAlbumList2` | **Partially implemented** | `ItemsApi.getItems(MusicAlbum)` | Reuses the same data as `getAlbumList` but returns it as `<albumList2>`; does not yet support full ID3-based semantics. |
 | `getRandomSongs` | **Partially implemented** | `ItemsApi.getItems(sortBy=Random, includeItemTypes=Audio)` | Returns random audio tracks via Jellyfin’s random sort; currently supports `size`, `offset`, and optional `musicFolderId` but ignores other filters (year, genre, etc.). |
 | `getSongsByGenre` | **Partially implemented** | `ItemsApi.getItems(Audio, genres=...)` | Filters audio items by a single genre with paging; currently uses Jellyfin text genres and doesn’t yet implement multi-genre or year/artist scoping. |
 | `getNowPlaying` | **Partially implemented** | Jellyfin `SessionApi.getSessions` | Reads active Jellyfin sessions for the current user and exposes audio `NowPlayingItem`s as Subsonic `nowPlaying` entries; does not yet aggregate across all users or support rich player state, and play/pause is inferred from sparse Subsonic scrobbles so Jellyfin’s dashboard may slightly overestimate play time when clients are paused. |
-| `getStarred` / `getStarred2` | **Partially implemented** | `ItemsApi.getItems(isFavorite=true, includeItemTypes=Audio)` | Returns the current user’s favorite songs from Jellyfin as Subsonic starred entries (artists/albums are not yet surfaced separately). |
+| `getStarred` / `getStarred2` | **Fully implemented** | `ItemsApi.getItems(isFavorite=true)` for MusicArtist, MusicAlbum, Audio | Returns starred artists, albums, and songs; response shape matches OpenSubsonic. Safe fallbacks for id/name/artist/created and album field (Youamp); full song fields (Musly). XML includes coverArt, albumCount, created, songCount. |
 | `star` / `unstar` / `setRating` | **Fully implemented** | Jellyfin `UserLibraryApi.markFavorite`, `unmarkFavorite`, `setUserLikeForItem` | Star/unstar mark items as favorite in Jellyfin (supports id, albumId, artistId, idList). setRating maps rating to Jellyfin like (4–5 like, 1–2 unlike, 3 clear). |
 | `getTopSongs` | **Partially implemented** | `ItemsApi.getItems(Audio, artistIds=..., sortBy=PlayCount)` | Returns top songs for a given artist by mapping the artist name to a Jellyfin `MusicArtist` and fetching that artist’s audio items sorted by play count; uses Jellyfin’s play statistics instead of external Last.fm data and may differ from Subsonic’s Last.fm-based rankings. |
 | `getSimilarSongs` / `getSimilarSongs2` | **Partially implemented** | Jellyfin `InstantMixApi.getInstantMixFromItem` | Instant mix / artist radio: accepts artist (`ar-*`), album (`al-*`), or song id and returns Jellyfin’s recommended similar songs (instant mix). |
@@ -214,7 +222,7 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 |---------|--------|------------------|-------|
 | `stream` | **Fully implemented (audio)** | Jellyfin universal audio (`/Audio/{id}/universal`) | Proxied from Jellyfin with proper `UserId`/`DeviceId` and bitrate; respects `maxBitRate` where provided. |
 | `download` | **Partially implemented (audio)** | Jellyfin audio stream (`/Audio/{id}/stream`) with `Static=true` | Proxied from Jellyfin for original audio files. HLS, video, and advanced transcoding controls are not yet exposed. |
-| `hls` / `getTranscodeStream` | **Unimplemented** | `AudioApi.getAudioStream` / HLS services | Could be built on Jellyfin’s HLS/segmented streaming APIs; not yet wired into Subfin. |
+| `hls` / `getTranscodeStream` | **Not planned** | — | Out of scope. HLS is commonly used for video; for audio, streaming and bitrate control are already covered by `stream` (Jellyfin universal audio, `maxBitRate`). Explicit HLS/transcode endpoints are not planned. |
 | `getCoverArt` | **Fully implemented** | `Items/{id}/Images/Primary` | Maps Subsonic `coverArt` IDs (`ar-`, `al-`, or raw) to Jellyfin item IDs; proxied from Jellyfin. |
 | `getLyrics` | **Partially implemented** | Jellyfin `/Audio/{itemId}/Lyrics` | Resolves by `id` or `artist`+`title`; when only artist+title is sent, tries multiple search results until one has lyrics. Returns `lyrics.artist`, `lyrics.title`, `lyrics.value`. |
 | `getLyricsBySongId` | **Partially implemented** | Same lyrics API | OpenSubsonic; takes track `id`, returns `lyricsList.structuredLyrics` (synced/unsynced lines). |
@@ -226,7 +234,7 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 | Endpoint | Status | Jellyfin mapping | Notes |
 |---------|--------|------------------|-------|
 | `getUser` / `getUsers` | **Partially implemented** | `UserApi.getCurrentUser` / `UserApi.getUsers` | Returns only basic user info (username, email empty); roles, folder access, and admin flags are not yet exposed. |
-| `createUser` / `updateUser` / `deleteUser` / `changePassword` | **Unimplemented** | Jellyfin admin user APIs | Would require Subfin to act as an admin client to manage Jellyfin users. |
+| `createUser` / `updateUser` / `deleteUser` / `changePassword` | **Not planned** | — | Out of scope; Jellyfin user management stays in Jellyfin. |
 
 ### Podcasts, radio, sharing, bookmarks, chat, and misc.
 
@@ -238,9 +246,10 @@ Most of the remaining items below are **currently unimplemented** (exceptions: `
 - **Internet radio** *(not planned)*: `getInternetRadioStations`, create/update/delete — no implementation intended.
 - **Sharing**: `createShare`, `getShares`, `updateShare`, `deleteShare` → Jellyfin sharing or a Subfin-managed public URL layer.
 - **Bookmarks** *(not planned)*: `createBookmark`, `getBookmarks`, `deleteBookmark` — no implementation intended.
-- **Chat**: `addChatMessage`, `getChatMessages` → no Jellyfin equivalent; would have to be implemented entirely in Subfin.
+- **Chat** *(not planned)*: `addChatMessage`, `getChatMessages` — no implementation intended.
 - **Playback state**: `savePlayQueue`, `savePlayQueueByIndex`, `getPlayQueue`, `getPlayQueueByIndex`, `scrobble`, `setRating`, `star`, `unstar` → Jellyfin play queue, playback reporting, and rating/favorite APIs.
-  - **`savePlayQueue`** and **`getPlayQueue`** are **fully implemented**: Subfin stores one play queue per user (in SQLite). Clients can save the current queue (ids, current track, position) and restore it on any device for cross-device continuity. Call `savePlayQueue` with no parameters to clear the saved queue. `savePlayQueueByIndex` / `getPlayQueueByIndex` (index-based) are not yet implemented.
+  - **`savePlayQueue`** and **`getPlayQueue`** are **fully implemented**: Subfin stores one play queue per user (in SQLite). Clients save the queue as a list of **entry IDs** (track ids), plus the current track id and position in ms, and restore it on any device for cross-device continuity. Call `savePlayQueue` with no parameters to clear the saved queue.
+  - **`savePlayQueueByIndex`** / **`getPlayQueueByIndex`** are **not yet implemented**. The “index” here is the **0-based position in the queue** (e.g. index 0 = first track, index 2 = third track). So instead of saving/restoring by entry id, the client would save “current index 3” and an ordered list of entries; some clients prefer this when they think in terms of “position in list” rather than ids. Same underlying play-queue feature, alternative API. Not yet wired in Subfin.
   - `scrobble` is wired to Jellyfin’s playstate API (start/progress/stop) using Subsonic scrobbles as coarse-grained signals; we intentionally **do not** infer playback from raw `stream` calls to avoid treating pre-fetched (gapless) streams as “now playing”. For Jellyfin’s “now playing” and dashboard to update **as soon as** a new track starts (e.g. when the queue auto-advances), the client should send **scrobble with `submission=false`** when that track actually starts, not only when it ends (`submission=true`). Otherwise Subfin only reports the track when it receives the end-of-track scrobble, so the dashboard updates late. Pause/resume still cannot be tracked precisely, so Jellyfin’s notion of elapsed time is approximate.
   - `setRating`, `star`, and `unstar` are **fully implemented**: they call Jellyfin’s favorite and user-like APIs (`markFavorite`, `unmarkFavorite`, `setUserLikeForItem`), so favorites and likes stay in sync with Jellyfin.
 - **Library scanning / transcoding**: `startScan`, `getScanStatus`, `getTranscodeDecision` → Jellyfin library scan and transcoding APIs (not yet surfaced by Subfin).

@@ -4,7 +4,7 @@
  */
 import Database from "better-sqlite3";
 import bcrypt from "bcrypt";
-import { randomFillSync } from "node:crypto";
+import { randomFillSync, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -463,6 +463,212 @@ export function getPlayQueue(subsonicUsername: string): {
 export function clearPlayQueue(subsonicUsername: string): void {
   const database = openDb();
   database.prepare("DELETE FROM play_queue WHERE subsonic_username = ?").run(subsonicUsername);
+}
+
+// --- Shares (public share = one linked device + metadata/allowlist) ---
+
+export interface ShareRow {
+  share_uid: string;
+  linked_device_id: number;
+  entry_ids: string;
+  entry_ids_flat: string;
+  description: string | null;
+  expires_at: string | null;
+  visit_count: number;
+  created_at: string;
+}
+
+/** Create a share: one linked device + one shares row. Returns shareUid and the app password (secret). */
+export function createShare(
+  subsonicUsername: string,
+  jellyfinUserId: string,
+  jellyfinAccessToken: string,
+  opts: {
+    entryIds: string[];
+    entryIdsFlat: string[];
+    description?: string | null;
+    expiresAt?: number | null;
+  }
+): { shareUid: string; secret: string; linkedDeviceId: number } {
+  const database = openDb();
+  const shareUid = randomUUID();
+  const description = opts.description?.trim() || null;
+  const deviceLabel = description ? `SHARE: ${description}` : "SHARE: Share";
+  const secret = addLinkedDevice(subsonicUsername, jellyfinUserId, jellyfinAccessToken, deviceLabel);
+  const deviceRow = database
+    .prepare("SELECT id FROM linked_devices WHERE subsonic_username = ? ORDER BY id DESC LIMIT 1")
+    .get(subsonicUsername) as { id: number } | undefined;
+  if (!deviceRow) throw new Error("Failed to get created device id");
+  const linkedDeviceId = deviceRow.id;
+  const expiresAt =
+    opts.expiresAt != null && opts.expiresAt > 0 ? new Date(opts.expiresAt).toISOString() : null;
+  database
+    .prepare(
+      `INSERT INTO shares (share_uid, linked_device_id, entry_ids, entry_ids_flat, description, expires_at, visit_count, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, 0, datetime('now'))`
+    )
+    .run(
+      shareUid,
+      linkedDeviceId,
+      JSON.stringify(opts.entryIds),
+      JSON.stringify(opts.entryIdsFlat),
+      description,
+      expiresAt
+    );
+  return { shareUid, secret, linkedDeviceId };
+}
+
+/** Get share by public uid, with linked device's subsonic_username (owner). */
+export function getShareByUid(
+  shareUid: string
+): (ShareRow & { subsonic_username: string }) | null {
+  const database = openDb();
+  const row = database
+    .prepare(
+      `SELECT s.share_uid, s.linked_device_id, s.entry_ids, s.entry_ids_flat, s.description, s.expires_at, s.visit_count, s.created_at, d.subsonic_username
+       FROM shares s JOIN linked_devices d ON d.id = s.linked_device_id WHERE s.share_uid = ?`
+    )
+    .get(shareUid) as (ShareRow & { subsonic_username: string }) | undefined;
+  return row ?? null;
+}
+
+/** List shares owned by the given user. */
+export function getSharesForUser(subsonicUsername: string): ShareRow[] {
+  const database = openDb();
+  const rows = database
+    .prepare(
+      `SELECT s.share_uid, s.linked_device_id, s.entry_ids, s.entry_ids_flat, s.description, s.expires_at, s.visit_count, s.created_at
+       FROM shares s JOIN linked_devices d ON d.id = s.linked_device_id WHERE d.subsonic_username = ?
+       ORDER BY s.created_at DESC`
+    )
+    .all(subsonicUsername) as ShareRow[];
+  return rows;
+}
+
+/** Update share description and/or expiry. Returns true if updated. */
+export function updateShare(
+  shareUid: string,
+  subsonicUsername: string,
+  opts: { description?: string | null; expiresAt?: number | null }
+): boolean {
+  const database = openDb();
+  const share = getShareByUid(shareUid);
+  if (!share || share.subsonic_username !== subsonicUsername) return false;
+  const description =
+    opts.description !== undefined ? (opts.description?.trim() || null) : share.description;
+  const expiresAt =
+    opts.expiresAt !== undefined
+      ? opts.expiresAt != null && opts.expiresAt > 0
+        ? new Date(opts.expiresAt).toISOString()
+        : null
+      : share.expires_at;
+  database
+    .prepare("UPDATE shares SET description = ?, expires_at = ? WHERE share_uid = ?")
+    .run(description, expiresAt, shareUid);
+  const deviceLabel = description ? `SHARE: ${description}` : `SHARE: Share ${shareUid.slice(0, 8)}`;
+  database
+    .prepare("UPDATE linked_devices SET device_label = ? WHERE id = ? AND subsonic_username = ?")
+    .run(deviceLabel, share.linked_device_id, subsonicUsername);
+  return true;
+}
+
+/** Delete share and unlink the associated device (revoke password). Returns true if deleted. */
+export function deleteShare(shareUid: string, subsonicUsername: string): boolean {
+  const share = getShareByUid(shareUid);
+  if (!share || share.subsonic_username !== subsonicUsername) return false;
+  const database = openDb();
+  database.prepare("DELETE FROM shares WHERE share_uid = ?").run(shareUid);
+  const unlinked = unlinkDevice(share.linked_device_id, subsonicUsername);
+  return unlinked;
+}
+
+/** Resolve share access by (share_uid, secret). Checks expiry. Returns credentials + allowed track ids or null. */
+export function resolveShareAuth(
+  shareUid: string,
+  secret: string
+): {
+  subsonicUsername: string;
+  jellyfinUserId: string;
+  jellyfinAccessToken: string;
+  linkedDeviceId: number;
+  allowedTrackIds: Set<string>;
+  description: string | null;
+  expiresAt: string | null;
+} | null {
+  const share = getShareByUid(shareUid);
+  if (!share) return null;
+  if (share.expires_at && new Date(share.expires_at) < new Date()) return null;
+  const database = openDb();
+  const deviceRow = database
+    .prepare(
+      "SELECT app_password_hash, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted FROM linked_devices WHERE id = ?"
+    )
+    .get(share.linked_device_id) as
+    | {
+        app_password_hash: string;
+        app_password_encrypted: Buffer;
+        jellyfin_user_id: string;
+        jellyfin_access_token_encrypted: Buffer;
+      }
+    | undefined;
+  if (!deviceRow) return null;
+  const cfg = getConfig();
+  const passwordMatch = bcrypt.compareSync(secret, deviceRow.app_password_hash);
+  if (!passwordMatch) return null;
+  const jellyfinAccessToken = decrypt(deviceRow.jellyfin_access_token_encrypted, cfg);
+  let allowedTrackIds: string[];
+  try {
+    allowedTrackIds = JSON.parse(share.entry_ids_flat) as string[];
+    if (!Array.isArray(allowedTrackIds)) allowedTrackIds = [];
+  } catch {
+    allowedTrackIds = [];
+  }
+  return {
+    subsonicUsername: share.subsonic_username,
+    jellyfinUserId: deviceRow.jellyfin_user_id,
+    jellyfinAccessToken,
+    linkedDeviceId: share.linked_device_id,
+    allowedTrackIds: new Set(allowedTrackIds),
+    description: share.description,
+    expiresAt: share.expires_at,
+  };
+}
+
+/** Get share credentials and allowlist by share_uid only (no secret check). For use when auth was already validated e.g. via share cookie. Checks expiry. */
+export function getShareAuthByUid(shareUid: string): {
+  subsonicUsername: string;
+  jellyfinUserId: string;
+  jellyfinAccessToken: string;
+  allowedTrackIds: Set<string>;
+} | null {
+  const share = getShareByUid(shareUid);
+  if (!share) return null;
+  if (share.expires_at && new Date(share.expires_at) < new Date()) return null;
+  const database = openDb();
+  const deviceRow = database
+    .prepare("SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM linked_devices WHERE id = ?")
+    .get(share.linked_device_id) as { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer } | undefined;
+  if (!deviceRow) return null;
+  const jellyfinAccessToken = decrypt(deviceRow.jellyfin_access_token_encrypted, getConfig());
+  let allowedTrackIds: string[] = [];
+  try {
+    allowedTrackIds = JSON.parse(share.entry_ids_flat) as string[];
+    if (!Array.isArray(allowedTrackIds)) allowedTrackIds = [];
+  } catch {
+    allowedTrackIds = [];
+  }
+  return {
+    subsonicUsername: share.subsonic_username,
+    jellyfinUserId: deviceRow.jellyfin_user_id,
+    jellyfinAccessToken,
+    allowedTrackIds: new Set(allowedTrackIds),
+  };
+}
+
+/** Increment visit_count for a share. */
+export function incrementShareVisitCount(shareUid: string): void {
+  const database = openDb();
+  database.prepare("UPDATE shares SET visit_count = visit_count + 1 WHERE share_uid = ?").run(shareUid);
 }
 
 /** Ensure store is initialized (call on startup). */
