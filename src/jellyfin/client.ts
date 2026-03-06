@@ -321,18 +321,33 @@ async function getRecentAlbumsFromTracks(
   opts: { userId: string; musicFolderId?: string; size?: number; offset?: number }
 ): Promise<BaseItemDto[]> {
   const { userId, musicFolderId, size = 50, offset = 0 } = opts;
-  const tracks = await getRecentlyPlayedTracks(ctx, {
-    userId,
-    musicFolderId,
-    limit: 500,
-  });
+  const targetAlbums = size;
+  const buffer = 10;
+  const maxAlbums = targetAlbums + buffer;
   const seen = new Set<string>();
   const albumIds: string[] = [];
-  for (const t of tracks) {
-    const albumId = (t as { AlbumId?: string }).AlbumId ?? t.ParentId;
-    if (albumId && !seen.has(albumId)) {
-      seen.add(albumId);
-      albumIds.push(albumId);
+  const batchSize = 50;
+  const maxBatches = 3; // up to 150 tracks total
+
+  for (let batchIndex = 0; batchIndex < maxBatches && albumIds.length < maxAlbums; batchIndex++) {
+    const tracks = await getRecentlyPlayedTracks(ctx, {
+      userId,
+      musicFolderId,
+      limit: batchSize,
+      offset: batchIndex * batchSize,
+    });
+    if (tracks.length === 0) break;
+    for (const t of tracks) {
+      const albumId = (t as { AlbumId?: string }).AlbumId ?? t.ParentId;
+      if (albumId && !seen.has(albumId)) {
+        seen.add(albumId);
+        albumIds.push(albumId);
+        if (albumIds.length >= maxAlbums) break;
+      }
+    }
+    if (tracks.length < batchSize) {
+      // Fewer tracks than requested means we've reached the end of the history.
+      break;
     }
   }
   const pageIds = albumIds.slice(offset, offset + size);
@@ -340,14 +355,20 @@ async function getRecentAlbumsFromTracks(
 
   const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
-  const response = await itemsApi.getItems({
-    ids: pageIds,
-    includeItemTypes: [BaseItemKind.MusicAlbum],
-    enableUserData: true as any,
-  } as any);
-  const items = response.data?.Items ?? [];
+  // Jellyfin limits URI length; chunk ids to avoid 414 Request URI Too Long when many albums.
+  const allItems: BaseItemDto[] = [];
+  const chunkSize = 50;
+  for (let i = 0; i < pageIds.length; i += chunkSize) {
+    const chunk = pageIds.slice(i, i + chunkSize);
+    const response = await itemsApi.getItems({
+      ids: chunk,
+      includeItemTypes: [BaseItemKind.MusicAlbum],
+      enableUserData: true as any,
+    } as any);
+    allItems.push(...(response.data?.Items ?? []));
+  }
   const byId = new Map<string, BaseItemDto>();
-  for (const a of items) if (a.Id) byId.set(a.Id, a);
+  for (const a of allItems) if (a.Id) byId.set(a.Id, a);
   return pageIds.map((id) => byId.get(id)).filter((a): a is BaseItemDto => a != null);
 }
 
@@ -358,7 +379,7 @@ async function getMostPlayedTracks(
 ): Promise<BaseItemDto[]> {
   const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
-  const { userId, musicFolderId, limit = 1000 } = opts;
+  const { userId, musicFolderId, limit = 150 } = opts;
   const response = await itemsApi.getItems({
     userId,
     includeItemTypes: [BaseItemKind.Audio],
@@ -382,7 +403,7 @@ async function getFrequentAlbumsFromTracks(
   const tracks = await getMostPlayedTracks(ctx, {
     userId,
     musicFolderId,
-    limit: 1000,
+    limit: 150,
   });
 
   const albumTotals = new Map<string, { total: number }>();
@@ -410,12 +431,19 @@ async function getFrequentAlbumsFromTracks(
 
   const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
-  const response = await itemsApi.getItems({
-    ids: pageIds,
-    includeItemTypes: [BaseItemKind.MusicAlbum],
-    enableUserData: true as any,
-  } as any);
-  const items = response.data?.Items ?? [];
+  // Chunk ids to avoid very long query strings when many albums are in the page.
+  const allItems: BaseItemDto[] = [];
+  const chunkSize = 50;
+  for (let i = 0; i < pageIds.length; i += chunkSize) {
+    const chunk = pageIds.slice(i, i + chunkSize);
+    const response = await itemsApi.getItems({
+      ids: chunk,
+      includeItemTypes: [BaseItemKind.MusicAlbum],
+      enableUserData: true as any,
+    } as any);
+    allItems.push(...(response.data?.Items ?? []));
+  }
+  const items = allItems;
   const byId = new Map<string, BaseItemDto>();
   for (const a of items) if (a.Id) byId.set(a.Id, a);
   return pageIds.map((id) => byId.get(id)).filter((a): a is BaseItemDto => a != null);
@@ -438,6 +466,7 @@ export async function getAlbumsForLibrary(
   const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   const { userId, musicFolderId, type, size, offset, genre, fromYear, toYear } = opts;
+  const requestedSize = size ?? 40;
 
   // Map Subsonic album list types to Jellyfin sort options.
   let sortBy: string[] = [];
@@ -450,10 +479,11 @@ export async function getAlbumsForLibrary(
   // Derive recent albums from recently played tracks so the list matches scrobble history.
   // userId is required so Jellyfin returns that user's DatePlayed (required for correct sort).
   if (typeLower === "recent" && opts.userId) {
+    const effectiveSize = Math.min(requestedSize, 100);
     return getRecentAlbumsFromTracks(ctx, {
       userId: opts.userId,
       musicFolderId,
-      size: size ?? 50,
+      size: effectiveSize,
       offset: offset ?? 0,
     });
   }
@@ -461,10 +491,11 @@ export async function getAlbumsForLibrary(
   // Most played: album-level PlayCount can be unreliable; derive most played albums
   // from per-track play counts. userId required for user-specific PlayCount.
   if (typeLower === "frequent" && opts.userId) {
+    const effectiveSize = Math.min(requestedSize, 100);
     return getFrequentAlbumsFromTracks(ctx, {
       userId: opts.userId,
       musicFolderId,
-      size: size ?? 50,
+      size: effectiveSize,
       offset: offset ?? 0,
     });
   }
@@ -630,11 +661,12 @@ export async function getRecentlyPlayedTracks(
     userId: string;
     musicFolderId?: string;
     limit?: number;
+    offset?: number;
   }
 ): Promise<BaseItemDto[]> {
   const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
-  const { userId, musicFolderId, limit = 300 } = opts;
+  const { userId, musicFolderId, limit = 150, offset = 0 } = opts;
   const response = await itemsApi.getItems({
     userId,
     includeItemTypes: [BaseItemKind.Audio],
@@ -643,7 +675,7 @@ export async function getRecentlyPlayedTracks(
     sortBy: ["DatePlayed"],
     sortOrder: ["Descending"],
     limit,
-    startIndex: 0,
+    startIndex: offset,
     enableUserData: true as any,
   } as any);
   return response.data?.Items ?? [];
