@@ -232,7 +232,7 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 
 **Not planned (out of scope):** Podcasts, internet radio, video playback/streaming, and bookmarking are **not prioritized or planned** — see [Out of scope (not planned)](#out-of-scope-not-planned) above.
 
-Most of the remaining items below are **currently unimplemented** (exceptions: `scrobble`, `setRating`, `star`, `unstar` — see Playback state). Conceptually, the rest would be mapped as follows:
+Most of the remaining items below are **currently unimplemented** (exceptions: `savePlayQueue`, `getPlayQueue`, `scrobble`, `setRating`, `star`, `unstar` — see Playback state). Conceptually, the rest would be mapped as follows:
 
 - **Podcasts** *(not planned)*: `getPodcasts`, `getPodcastEpisode`, etc. — no implementation intended.
 - **Internet radio** *(not planned)*: `getInternetRadioStations`, create/update/delete — no implementation intended.
@@ -240,6 +240,7 @@ Most of the remaining items below are **currently unimplemented** (exceptions: `
 - **Bookmarks** *(not planned)*: `createBookmark`, `getBookmarks`, `deleteBookmark` — no implementation intended.
 - **Chat**: `addChatMessage`, `getChatMessages` → no Jellyfin equivalent; would have to be implemented entirely in Subfin.
 - **Playback state**: `savePlayQueue`, `savePlayQueueByIndex`, `getPlayQueue`, `getPlayQueueByIndex`, `scrobble`, `setRating`, `star`, `unstar` → Jellyfin play queue, playback reporting, and rating/favorite APIs.
+  - **`savePlayQueue`** and **`getPlayQueue`** are **fully implemented**: Subfin stores one play queue per user (in SQLite). Clients can save the current queue (ids, current track, position) and restore it on any device for cross-device continuity. Call `savePlayQueue` with no parameters to clear the saved queue. `savePlayQueueByIndex` / `getPlayQueueByIndex` (index-based) are not yet implemented.
   - `scrobble` is wired to Jellyfin’s playstate API (start/progress/stop) using Subsonic scrobbles as coarse-grained signals; we intentionally **do not** infer playback from raw `stream` calls to avoid treating pre-fetched (gapless) streams as “now playing”. For Jellyfin’s “now playing” and dashboard to update **as soon as** a new track starts (e.g. when the queue auto-advances), the client should send **scrobble with `submission=false`** when that track actually starts, not only when it ends (`submission=true`). Otherwise Subfin only reports the track when it receives the end-of-track scrobble, so the dashboard updates late. Pause/resume still cannot be tracked precisely, so Jellyfin’s notion of elapsed time is approximate.
   - `setRating`, `star`, and `unstar` are **fully implemented**: they call Jellyfin’s favorite and user-like APIs (`markFavorite`, `unmarkFavorite`, `setUserLikeForItem`), so favorites and likes stay in sync with Jellyfin.
 - **Library scanning / transcoding**: `startScan`, `getScanStatus`, `getTranscodeDecision` → Jellyfin library scan and transcoding APIs (not yet surfaced by Subfin).

@@ -31,3 +31,14 @@ CREATE TABLE IF NOT EXISTS jellyfin_sessions (
   jellyfin_access_token_encrypted BLOB NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Saved play queue per user (OpenSubsonic savePlayQueue/getPlayQueue). One queue per user so
+-- any device can save and any device can restore (cross-device continuity).
+CREATE TABLE IF NOT EXISTS play_queue (
+  subsonic_username TEXT PRIMARY KEY,
+  entry_ids TEXT NOT NULL,
+  current_id TEXT,
+  position_ms INTEGER NOT NULL DEFAULT 0,
+  changed_at TEXT NOT NULL,
+  changed_by TEXT NOT NULL DEFAULT ''
+);

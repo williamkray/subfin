@@ -225,13 +225,27 @@ export async function getArtist(
   const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   try {
+    if (config.logRest) {
+      console.log("[JF] getArtist request ids=%j", [id]);
+    }
     const response = await itemsApi.getItems({
       ids: [id],
       includeItemTypes: [BaseItemKind.MusicArtist],
     });
     const item = response.data?.Items?.[0];
+    if (config.logRest) {
+      console.log(
+        "[JF] getArtist response found=%s id=%s name=%s",
+        !!item,
+        item?.Id ?? "",
+        item?.Name ?? ""
+      );
+    }
     return item ?? null;
-  } catch {
+  } catch (err) {
+    if (config.logRest) {
+      console.error("[JF] getArtist error", err);
+    }
     return null;
   }
 }
@@ -284,6 +298,9 @@ export async function getAlbumsByArtist(
 ): Promise<BaseItemDto[]> {
   const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
+  if (config.logRest) {
+    console.log("[JF] getAlbumsByArtist request parentId=%s", artistId);
+  }
   const response = await itemsApi.getItems({
     parentId: artistId,
     includeItemTypes: [BaseItemKind.MusicAlbum],
@@ -291,7 +308,11 @@ export async function getAlbumsByArtist(
     sortBy: ["SortName"],
     sortOrder: ["Ascending"],
   });
-  return response.data?.Items ?? [];
+  const items = response.data?.Items ?? [];
+  if (config.logRest) {
+    console.log("[JF] getAlbumsByArtist response count=%d", items.length);
+  }
+  return items;
 }
 
 /** Derive recently played albums from recently played tracks (Jellyfin sets DatePlayed on Audio, not on albums). */
@@ -508,12 +529,28 @@ export async function getAlbum(
   const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   try {
+    if (config.logRest) {
+      console.log("[JF] getAlbum request ids=%j", [id]);
+    }
     const response = await itemsApi.getItems({
       ids: [id],
       includeItemTypes: [BaseItemKind.MusicAlbum],
     });
-    return response.data?.Items?.[0] ?? null;
-  } catch {
+    const item = response.data?.Items?.[0];
+    if (config.logRest) {
+      console.log(
+        "[JF] getAlbum response found=%s id=%s name=%s parentId=%s",
+        !!item,
+        item?.Id ?? "",
+        item?.Name ?? "",
+        item?.ParentId ?? ""
+      );
+    }
+    return item ?? null;
+  } catch (err) {
+    if (config.logRest) {
+      console.error("[JF] getAlbum error", err);
+    }
     return null;
   }
 }

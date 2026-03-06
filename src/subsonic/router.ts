@@ -54,8 +54,8 @@ const HANDLERS: Record<
   setrating: async (auth, params) => handlers.handleSetRating(auth, params),
   star: async (auth, params) => handlers.handleStar(auth, params),
   unstar: async (auth, params) => handlers.handleUnstar(auth, params),
-  saveplayqueue: async () => handlers.handleSavePlayQueue(),
-  getplayqueue: async () => handlers.handleGetPlayQueue(),
+  saveplayqueue: async (auth, params) => handlers.handleSavePlayQueue(auth, params),
+  getplayqueue: async (auth) => handlers.handleGetPlayQueue(auth),
 };
 
 function getParams(req: Request): Record<string, string> {
@@ -168,6 +168,31 @@ function getPlaylistArrays(req: Request): {
     .map((s) => Number.parseInt(s, 10))
     .filter((n) => !Number.isNaN(n));
   return { songIds, songIdsToAdd, songIndexesToRemove };
+}
+
+/** Collect savePlayQueue params: multiple id, current, position, client name (c). */
+function getPlayQueueSaveParams(req: Request): {
+  playQueueIds: string[];
+  current: string;
+  position: string;
+  changedBy: string;
+} {
+  const q = req.query as Record<string, unknown>;
+  const body = (req.body as Record<string, unknown>) ?? {};
+  const ids: string[] = [];
+  for (const [k, v] of Object.entries(q)) {
+    if (k !== "id" && !k.startsWith("id[")) continue;
+    ids.push(...toIdStrings(v));
+  }
+  for (const [k, v] of Object.entries(body)) {
+    if (k !== "id" && !k.startsWith("id[")) continue;
+    ids.push(...toIdStrings(v));
+  }
+  const one = (v: unknown): string => (v === undefined || v === null ? "" : Array.isArray(v) ? String(v[0] ?? "") : String(v));
+  const current = one(q.current ?? body.current).trim();
+  const position = one(q.position ?? body.position).trim() || "0";
+  const changedBy = one(q.c ?? body.c).trim();
+  return { playQueueIds: ids, current, position, changedBy };
 }
 
 /** Subsonic API default is XML; DSub and many clients omit f= and expect XML. */
@@ -329,6 +354,9 @@ export function subsonicRouter(req: Request, res: Response): void {
   if (method === "createplaylist" || method === "updateplaylist") {
     Object.assign(params, getPlaylistArrays(req));
   }
+  if (method === "saveplayqueue") {
+    Object.assign(params, getPlayQueueSaveParams(req));
+  }
 
   handler(auth, params)
     .then((payload) => {
@@ -341,8 +369,6 @@ export function subsonicRouter(req: Request, res: Response): void {
           );
           if (method === "getgenres") {
             console.log("[GENRES_PAYLOAD]", JSON.stringify(payload));
-          } else if (method === "getstarred" || method === "getstarred2") {
-            console.log("[STARRED_PAYLOAD]", JSON.stringify(payload));
           }
         } catch {
           // ignore logging errors
@@ -1003,11 +1029,14 @@ export function subsonicRouter(req: Request, res: Response): void {
             );
           }
           for (const al of albums) {
-            parts.push(
-              `<album id="${escapeXmlAttr(String(al.id ?? ""))}" name="${escapeXmlAttr(
-                String(al.name ?? "")
-              )}"/>`
-            );
+            let tag = `<album id="${escapeXmlAttr(String(al.id ?? ""))}" name="${escapeXmlAttr(
+              String(al.name ?? "")
+            )}"`;
+            if (al.artist) tag += ` artist="${escapeXmlAttr(String(al.artist))}"`;
+            if (al.artistId) tag += ` artistId="${escapeXmlAttr(String(al.artistId))}"`;
+            if (al.coverArt) tag += ` coverArt="${escapeXmlAttr(String(al.coverArt))}"`;
+            tag += "/>";
+            parts.push(tag);
           }
           for (const s of songs) {
             let tag = `<song id="${escapeXmlAttr(String(s.id ?? ""))}"`;
@@ -1056,11 +1085,14 @@ export function subsonicRouter(req: Request, res: Response): void {
             );
           }
           for (const al of albums) {
-            parts.push(
-              `<album id="${escapeXmlAttr(String(al.id ?? ""))}" name="${escapeXmlAttr(
-                String(al.name ?? "")
-              )}"/>`
-            );
+            let tag = `<album id="${escapeXmlAttr(String(al.id ?? ""))}" name="${escapeXmlAttr(
+              String(al.name ?? "")
+            )}"`;
+            if (al.artist) tag += ` artist="${escapeXmlAttr(String(al.artist))}"`;
+            if (al.artistId) tag += ` artistId="${escapeXmlAttr(String(al.artistId))}"`;
+            if (al.coverArt) tag += ` coverArt="${escapeXmlAttr(String(al.coverArt))}"`;
+            tag += "/>";
+            parts.push(tag);
           }
           for (const s of songs) {
             let tag = `<song id="${escapeXmlAttr(String(s.id ?? ""))}"`;

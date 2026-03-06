@@ -17,6 +17,24 @@ function indexLetter(name: string | null | undefined): string {
   return "#";
 }
 
+/** Resolve a stable primary artist id for an album. Prefer AlbumArtistIds, then ArtistItems, then ArtistIds, then ParentId. */
+export function resolvePrimaryArtistIdForAlbum(item: BaseItemDto): string | undefined {
+  const anyItem = item as Record<string, any>;
+  const albumArtistIds = anyItem.AlbumArtistIds as string[] | undefined;
+  const artistItems = anyItem.ArtistItems as { Id?: string }[] | undefined;
+  const artistIds = anyItem.ArtistIds as string[] | undefined;
+  if (Array.isArray(albumArtistIds) && albumArtistIds.length > 0) {
+    return albumArtistIds[0];
+  }
+  if (Array.isArray(artistItems) && artistItems.length > 0 && artistItems[0]?.Id) {
+    return String(artistItems[0].Id);
+  }
+  if (Array.isArray(artistIds) && artistIds.length > 0) {
+    return artistIds[0];
+  }
+  return item.ParentId ?? undefined;
+}
+
 /** Subsonic artist (in index list). */
 export function toSubsonicArtist(item: BaseItemDto): Record<string, unknown> {
   return {
@@ -30,8 +48,7 @@ export function toSubsonicArtist(item: BaseItemDto): Record<string, unknown> {
 /** Subsonic album (in artist view). */
 export function toSubsonicAlbumShort(item: BaseItemDto): Record<string, unknown> {
   const created = item.DateCreated ?? new Date(0).toISOString();
-  const albumArtistIds = (item as Record<string, string[] | undefined>).AlbumArtistIds;
-  const primaryArtistId = Array.isArray(albumArtistIds) && albumArtistIds.length > 0 ? albumArtistIds[0] : undefined;
+  const primaryArtistId = resolvePrimaryArtistIdForAlbum(item);
   return {
     id: item.Id,
     name: item.Name ?? "",
@@ -118,8 +135,7 @@ export function toSubsonicAlbum(
 ): Record<string, unknown> {
   const artistName = album.AlbumArtist ?? album.Name ?? "";
   const created = album.DateCreated ?? new Date(0).toISOString();
-  const albumArtistIds = (album as Record<string, string[] | undefined>).AlbumArtistIds;
-  const primaryArtistId = Array.isArray(albumArtistIds) && albumArtistIds.length > 0 ? albumArtistIds[0] : undefined;
+  const primaryArtistId = resolvePrimaryArtistIdForAlbum(album);
   return {
     id: album.Id,
     parent: album.ParentId,

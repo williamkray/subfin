@@ -3,12 +3,14 @@
  */
 import * as jf from "../jellyfin/client.js";
 import { config } from "../config.js";
+import { clearPlayQueue, getPlayQueue, savePlayQueue } from "../store/index.js";
 import {
   stripSubsonicIdPrefix,
   toSubsonicArtistsIndex,
   toSubsonicArtistWithAlbums,
   toSubsonicAlbum,
   toSubsonicSong,
+  resolvePrimaryArtistIdForAlbum,
   ticksToSeconds,
 } from "./mappers.js";
 import { toJellyfinContext, type AuthResult } from "./auth.js";
@@ -121,14 +123,26 @@ export async function handleGetArtist(
   const id = params.id?.trim();
   if (!id) throw new Error("Missing id");
   const cleanId = stripSubsonicIdPrefix(id);
+  if (config.logRest) {
+    console.log("[ARTIST] getArtist params: id=%s cleanId=%s", id, cleanId);
+  }
   const [artist, albums] = await Promise.all([
     jf.getArtist(toJellyfinContext(auth), cleanId),
     jf.getAlbumsByArtist(toJellyfinContext(auth), cleanId),
   ]);
   if (!artist) throw new Error("NotFound");
-  return {
+  const payload = {
     artist: toSubsonicArtistWithAlbums(artist, albums),
   };
+  if (config.logRest) {
+    console.log(
+      "[ARTIST] getArtist response: artistId=%s name=%s albumCount=%d",
+      artist.Id ?? "",
+      artist.Name ?? "",
+      albums.length
+    );
+  }
+  return payload;
 }
 
 /** Subsonic getMusicDirectory: artist → albums, album → songs. */
@@ -147,6 +161,14 @@ export async function handleGetMusicDirectory(
   if (album) {
     const songs = await jf.getSongsByAlbum(toJellyfinContext(auth), cleanId);
     const artistName = album.AlbumArtist ?? album.Artists?.[0] ?? "";
+    if (config.logRest) {
+      console.log(
+        "[MUSIC_DIRECTORY] treating id=%s as album cleanId=%s songs=%d",
+        id,
+        cleanId,
+        songs.length
+      );
+    }
     return {
       musicDirectory: {
         id: album.Id,
@@ -168,6 +190,14 @@ export async function handleGetMusicDirectory(
     throw new Error("NotFound");
   }
   const artistName = artist.Name ?? "";
+  if (config.logRest) {
+    console.log(
+      "[MUSIC_DIRECTORY] treating id=%s as artist cleanId=%s albums=%d",
+      id,
+      cleanId,
+      albums.length
+    );
+  }
   return {
     musicDirectory: {
       id: artist.Id,
@@ -200,13 +230,26 @@ export async function handleGetAlbum(
     throw new Error("Missing id");
   }
   const cleanId = stripSubsonicIdPrefix(id);
+  if (config.logRest) {
+    console.log("[ALBUM] getAlbum params: id=%s cleanId=%s", id, cleanId);
+  }
   const [album, songs] = await Promise.all([
     jf.getAlbum(toJellyfinContext(auth), cleanId),
     jf.getSongsByAlbum(toJellyfinContext(auth), cleanId),
   ]);
   if (!album) throw new Error("NotFound");
+  const subsonicAlbum = toSubsonicAlbum(album, songs, auth.jellyfinAccessToken);
+  if (config.logRest) {
+    console.log(
+      "[ALBUM] getAlbum response: albumId=%s artist=%s artistId=%s songCount=%d",
+      String(subsonicAlbum.id ?? ""),
+      String(subsonicAlbum.artist ?? ""),
+      String(subsonicAlbum.artistId ?? ""),
+      songs.length
+    );
+  }
   return {
-    album: toSubsonicAlbum(album, songs, auth.jellyfinAccessToken),
+    album: subsonicAlbum,
   };
 }
 
@@ -297,29 +340,27 @@ export async function handleGetAlbumList(
 
   return {
     albumList: {
-      album: albums.map((a) => ({
-        id: a.Id,
-        name: a.Name ?? "",
-        artist: a.AlbumArtist ?? a.Artists?.[0] ?? "",
-        artistId: (() => {
-          const albumArtistIds = (a as { AlbumArtistIds?: string[] }).AlbumArtistIds;
-          const primaryArtistId =
-            Array.isArray(albumArtistIds) && albumArtistIds.length > 0 ? albumArtistIds[0] : undefined;
-          return primaryArtistId ? `ar-${primaryArtistId}` : undefined;
-        })(),
-        coverArt: a.Id ? `al-${a.Id}` : undefined,
-        songCount: a.ChildCount ?? 0,
-        // Duration and playCount are part of the OpenSubsonic album list model and
-        // many clients treat them as always-present. Prefer Jellyfin's RunTimeTicks /
-        // PlayCount when available, otherwise fall back to 0.
-        duration: (() => {
-          const ticks = (a as { RunTimeTicks?: number }).RunTimeTicks;
-          return ticks != null ? ticksToSeconds(ticks) : 0;
-        })(),
-        playCount: (a as { PlayCount?: number }).PlayCount ?? 0,
-        year: a.ProductionYear ?? undefined,
-        created: a.DateCreated ?? new Date(0).toISOString(),
-      })),
+      album: albums.map((a) => {
+        const primaryArtistId = resolvePrimaryArtistIdForAlbum(a);
+        return {
+          id: a.Id,
+          name: a.Name ?? "",
+          artist: a.AlbumArtist ?? a.Artists?.[0] ?? "",
+          artistId: primaryArtistId ? `ar-${primaryArtistId}` : undefined,
+          coverArt: a.Id ? `al-${a.Id}` : undefined,
+          songCount: a.ChildCount ?? 0,
+          // Duration and playCount are part of the OpenSubsonic album list model and
+          // many clients treat them as always-present. Prefer Jellyfin's RunTimeTicks /
+          // PlayCount when available, otherwise fall back to 0.
+          duration: (() => {
+            const ticks = (a as { RunTimeTicks?: number }).RunTimeTicks;
+            return ticks != null ? ticksToSeconds(ticks) : 0;
+          })(),
+          playCount: (a as { PlayCount?: number }).PlayCount ?? 0,
+          year: a.ProductionYear ?? undefined,
+          created: a.DateCreated ?? new Date(0).toISOString(),
+        };
+      }),
     },
   };
 }
@@ -653,7 +694,7 @@ export async function handleGetArtistInfo2(
   return { artistInfo2: res.artistInfo };
 }
 
-/** getStarred / getStarred2: favorites backed by Jellyfin user favorites (songs only for now). */
+/** getStarred / getStarred2: favorites backed by Jellyfin user favorites (albums and songs). */
 export async function handleGetStarred(
   auth: AuthResult,
   params: Record<string, string>
@@ -665,21 +706,38 @@ export async function handleGetStarred(
     jf.getFavoriteAlbums(toJellyfinContext(auth), { musicFolderId, size, offset }),
     jf.getFavoriteSongs(toJellyfinContext(auth), { musicFolderId, size, offset }),
   ]);
+  if (config.logRest) {
+    console.log(
+      "[STARRED] getStarred favorites: albums=%d songs=%d",
+      albums.length,
+      songs.length
+    );
+    const sample = albums[0];
+    if (sample) {
+      const albumArtistIds = (sample as { AlbumArtistIds?: string[] }).AlbumArtistIds;
+      console.log(
+        "[STARRED] sample album: id=%s name=%s parentId=%s albumArtistIds=%j",
+        sample.Id ?? "",
+        sample.Name ?? "",
+        sample.ParentId ?? "",
+        albumArtistIds ?? []
+      );
+    }
+  }
   return {
     starred: {
       artist: [],
-      album: albums.map((a) => ({
-        id: a.Id,
-        name: a.Name ?? "",
-        artist: a.AlbumArtist ?? a.Artists?.[0] ?? "",
-        artistId: (() => {
-          const albumArtistIds = (a as { AlbumArtistIds?: string[] }).AlbumArtistIds;
-          const primaryArtistId =
-            Array.isArray(albumArtistIds) && albumArtistIds.length > 0 ? albumArtistIds[0] : undefined;
-          return primaryArtistId ? `ar-${primaryArtistId}` : undefined;
-        })(),
-        created: a.DateCreated ?? new Date(0).toISOString(),
-      })),
+      album: albums.map((a) => {
+        const primaryArtistId = resolvePrimaryArtistIdForAlbum(a);
+        return {
+          id: a.Id ? `al-${a.Id}` : undefined,
+          name: a.Name ?? "",
+          artist: a.AlbumArtist ?? a.Artists?.[0] ?? "",
+          artistId: primaryArtistId ? `ar-${primaryArtistId}` : undefined,
+          coverArt: a.Id ? `al-${a.Id}` : undefined,
+          created: a.DateCreated ?? new Date(0).toISOString(),
+        };
+      }),
       song: songs.map((s) => toSubsonicSong(s)),
     },
   };
@@ -1351,20 +1409,72 @@ export function getAvatarRedirectUrl(
   return jf.getUserAvatarUrl(toJellyfinContext(auth), auth.jellyfinUserId, size);
 }
 
-/** Stub: save play queue (no-op so clients don't error). */
-export async function handleSavePlayQueue(): Promise<Record<string, unknown>> {
+/** Save play queue for this user (OpenSubsonic savePlayQueue). One queue per user for cross-device continuity. */
+export async function handleSavePlayQueue(
+  auth: AuthResult,
+  params: Record<string, string> & { playQueueIds?: string[] }
+): Promise<Record<string, unknown>> {
+  const ids = params.playQueueIds ?? [];
+  const rawIds = Array.isArray(ids) ? ids : [];
+  const entryIds = rawIds
+    .map((id) => (typeof id === "string" ? id : String(id)).trim())
+    .filter((id) => id && id !== "[object Object]")
+    .map((id) => stripSubsonicIdPrefix(id));
+
+  if (entryIds.length === 0) {
+    clearPlayQueue(auth.subsonicUsername);
+    return {};
+  }
+
+  const currentRaw = (params.current ?? "").trim();
+  const currentId = currentRaw ? stripSubsonicIdPrefix(currentRaw) : null;
+  const positionMs = Math.max(0, Number.parseInt(params.position ?? "0", 10) || 0);
+  const changedBy = (params.changedBy ?? params.c ?? "").trim().slice(0, 255);
+
+  savePlayQueue(auth.subsonicUsername, {
+    entryIds,
+    currentId: currentId && entryIds.includes(currentId) ? currentId : entryIds[0] ?? null,
+    positionMs,
+    changedBy,
+  });
   return {};
 }
 
-/** Stub: return empty play queue (Jellyfin has its own queue; clients often call this). */
-export async function handleGetPlayQueue(): Promise<Record<string, unknown>> {
+/** Return saved play queue for this user with full entry metadata from Jellyfin (OpenSubsonic getPlayQueue). */
+export async function handleGetPlayQueue(auth: AuthResult): Promise<Record<string, unknown>> {
+  const queue = getPlayQueue(auth.subsonicUsername);
+  if (!queue || queue.entryIds.length === 0) {
+    return {
+      playQueue: {
+        position: 0,
+        username: auth.subsonicUsername,
+        changed: new Date().toISOString(),
+        changedBy: "",
+        entry: [],
+      },
+    };
+  }
+
+  const ctx = toJellyfinContext(auth);
+  const entries: Record<string, unknown>[] = [];
+  for (const id of queue.entryIds) {
+    const song = await jf.getSong(ctx, id);
+    if (song) {
+      const albumId = (song as Record<string, unknown>).AlbumId as string | undefined;
+      const albumName = song.Album ?? undefined;
+      const artistName = song.AlbumArtist ?? song.Artists?.[0] ?? "";
+      entries.push(toSubsonicSong(song, albumId, albumName, artistName));
+    }
+  }
+
   return {
     playQueue: {
-      position: 0,
-      username: "",
-      changed: new Date().toISOString(),
-      changedBy: "",
-      entry: [],
+      current: queue.currentId ?? (queue.entryIds[0] ?? ""),
+      position: queue.positionMs,
+      username: auth.subsonicUsername,
+      changed: queue.changedAt,
+      changedBy: queue.changedBy,
+      entry: entries,
     },
   };
 }
