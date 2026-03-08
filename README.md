@@ -92,6 +92,8 @@ The web UI is used when you want **per-device app passwords**, **device manageme
 
 Subfin supports standard Subsonic auth: password (`p`, including `enc:`), token auth (`t`/`s`), and `apiKey` (all mapped to the app password when using app passwords, or to Jellyfin auth when using your Jellyfin password).
 
+**Legacy auth vs token auth (client setting):** Many clients have a “use legacy auth” or “token authentication” option. In the Subsonic/OpenSubsonic API, **token auth** means the client sends a one-way hash of your password plus a salt (`t` and `s`) instead of the password itself—more secure and the recommended default. **Legacy auth** means the client sends your actual password (`p`) with each request. Subfin can only use your **Jellyfin password** when the client sends it (legacy auth). With token auth, Subfin never sees the password, so it cannot log you in with Jellyfin unless it already has a stored app password for that client. So: to use your Jellyfin password directly in the client you must turn **on** “use legacy auth” (or turn **off** “token authentication”); to keep token auth and avoid sending your Jellyfin password, link the device once in the Subfin web UI and use the **app password** in the client—then token auth works because Subfin stores and verifies that app password.
+
 REST responses default to **XML** when the client does not send `f=` (Subsonic API default; required for DSub and similar clients).
 
 **Lyrics: API behavior and client consistency**
