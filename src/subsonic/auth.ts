@@ -141,11 +141,21 @@ export async function resolveAuth(
     return { code: 40, message: "Wrong username or password." };
   }
 
-  if (params.apiKey) {
-    // apiKey: treat as app-specific password (stored in our store)
+  // Prefer password (p) when present so Jellyfin pass-through works even if client also sends t+s.
+  if (params.p) {
+    let p = params.p;
+    if (p.startsWith("enc:")) {
+      try {
+        p = Buffer.from(p.slice(4), "hex").toString("utf-8");
+      } catch {
+        return { code: 40, message: "Wrong username or password." };
+      }
+    }
+    password = p;
+  } else if (params.apiKey) {
     password = params.apiKey;
   } else if (params.t && params.s) {
-    // Token auth: t = md5(password + s), where "password" is the Subsonic app password we issued.
+    // Token auth: t = md5(password + s). We only have stored app passwords to verify.
     const devices = getDevicesForToken(username);
     for (const d of devices) {
       if (!d.app_password_plain) continue;
@@ -162,16 +172,6 @@ export async function resolveAuth(
       }
     }
     return { code: 40, message: "Wrong username or password." };
-  } else if (params.p) {
-    let p = params.p;
-    if (p.startsWith("enc:")) {
-      try {
-        p = Buffer.from(p.slice(4), "hex").toString("utf-8");
-      } catch {
-        return { code: 40, message: "Wrong username or password." };
-      }
-    }
-    password = p;
   }
 
   if (!password) {
@@ -213,7 +213,7 @@ export function computeToken(password: string, salt: string): string {
 
 /**
  * Try to resolve auth from Authorization: Basic base64(username:password).
- * Used as fallback for getCoverArt when some clients (e.g. image loaders) send credentials only in the header.
+ * Store only (sync). Used when we don't need Jellyfin fallback (e.g. getCoverArt token path).
  */
 export function resolveAuthFromBasicHeader(
   authorization: string | undefined
@@ -237,6 +237,54 @@ export function resolveAuthFromBasicHeader(
       jellyfinDeviceId: dev.id,
       jellyfinDeviceName: dev.name,
     };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve auth from Basic header, trying store then Jellyfin native auth.
+ * Use when params auth failed and client may have sent credentials only in the header.
+ */
+export async function resolveAuthFromBasicHeaderWithJellyfin(
+  authorization: string | undefined,
+  clientInfo?: AuthClientInfo
+): Promise<AuthResult | null> {
+  if (!authorization || !authorization.startsWith("Basic ")) return null;
+  try {
+    const b64 = authorization.slice(6).trim();
+    const decoded = Buffer.from(b64, "base64").toString("utf-8");
+    const colon = decoded.indexOf(":");
+    if (colon <= 0) return null;
+    const username = decoded.slice(0, colon).trim();
+    const password = decoded.slice(colon + 1);
+    if (!username || !password) return null;
+    const resolved = resolveToJellyfinToken(username, password);
+    if (resolved) {
+      const dev = deviceDisplay(resolved.deviceId, resolved.deviceLabel);
+      return {
+        subsonicUsername: username,
+        jellyfinUserId: resolved.jellyfinUserId,
+        jellyfinAccessToken: resolved.jellyfinAccessToken,
+        jellyfinDeviceId: dev.id,
+        jellyfinDeviceName: dev.name,
+      };
+    }
+    if (clientInfo) {
+      const deviceId = nativeAuthDeviceId(clientInfo);
+      const deviceName = nativeAuthDeviceName(clientInfo);
+      const auth = await authenticateByNameWithDevice(username, password, deviceId, deviceName);
+      if (auth) {
+        return {
+          subsonicUsername: username,
+          jellyfinUserId: auth.userId,
+          jellyfinAccessToken: auth.accessToken,
+          jellyfinDeviceId: deviceId,
+          jellyfinDeviceName: deviceName,
+        };
+      }
+    }
+    return null;
   } catch {
     return null;
   }

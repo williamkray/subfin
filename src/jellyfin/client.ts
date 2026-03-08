@@ -1920,7 +1920,14 @@ export async function authenticateByNameWithDevice(
       return { userId, accessToken };
     }
     return null;
-  } catch {
+  } catch (err: unknown) {
+    if (config.logRest) {
+      const status = err && typeof err === "object" && "response" in err && err.response && typeof (err.response as { status?: number }).status === "number"
+        ? (err.response as { status: number }).status
+        : null;
+      const msg = status != null ? `Jellyfin AuthenticateByName failed: HTTP ${status}` : "Jellyfin AuthenticateByName failed (network or error)";
+      console.log(`[REST] ${msg}`);
+    }
     return null;
   }
 }

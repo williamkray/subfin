@@ -5,7 +5,12 @@ import { type Request, type Response } from "express";
 import http from "node:http";
 import https from "node:https";
 import type { AuthParams } from "./auth.js";
-import { resolveAuth, resolveAuthFromBasicHeader, resolveAuthFromBasicHeaderWithToken } from "./auth.js";
+import {
+  resolveAuth,
+  resolveAuthFromBasicHeader,
+  resolveAuthFromBasicHeaderWithJellyfin,
+  resolveAuthFromBasicHeaderWithToken,
+} from "./auth.js";
 import { getClientIp } from "../request-context.js";
 import { resolveAuthFromShareCookie } from "../web/share-session.js";
 import { subsonicEnvelope, subsonicError, ErrorCode, VERSION } from "./response.js";
@@ -295,7 +300,15 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
     const shareAuth = resolveAuthFromShareCookie(req);
     if (shareAuth) authResult = shareAuth;
   }
-  // getCoverArt: fallbacks when params auth failed (e.g. image loader sends t in header, u+s in URL)
+  // When params auth failed, try Authorization: Basic (store + Jellyfin pass-through) for any method
+  if ("code" in authResult && req.get("authorization")?.startsWith("Basic ")) {
+    const basicAuth = await resolveAuthFromBasicHeaderWithJellyfin(
+      req.get("authorization"),
+      clientInfo
+    );
+    if (basicAuth) authResult = basicAuth;
+  }
+  // getCoverArt: additional fallbacks when params auth failed (image loader sends t in header, u+s in URL)
   if ("code" in authResult && method === "getcoverart") {
     const headerAuth = resolveAuthFromBasicHeader(req.get("authorization"));
     if (headerAuth) authResult = headerAuth;

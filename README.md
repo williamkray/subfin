@@ -5,15 +5,14 @@ OpenSubsonic-to-Jellyfin compatibility layer. Use Subsonic/Navidrome clients (DS
 ## How it works
 
 - **Subsonic clients** point at Subfin using **host and port** (e.g. `http://your-server:4040`). Clients know the Subsonic API path and add `/rest/` themselves.
-- **Simplest flow:** In the Subsonic client, use your **Jellyfin username and password**. Subfin authenticates with Jellyfin on each request; no web UI or app password required. Each client gets a unique device in Jellyfin’s activity view.
-- **Optional web UI:** For **per-device app passwords**, **managing devices** (rename, reset, unlink), and **creating or managing shared media** (share links), use the Subfin web UI and **Quick Connect** to link devices. Subfin then issues app-specific passwords you use in the client instead of your Jellyfin password.
+- You **link your Jellyfin account** via the Subfin web UI (Quick Connect). Subfin gives you an **app password** to use in the Subsonic client with your Jellyfin username. You can manage devices (rename, reset, unlink) and create or manage shared media (share links) from the web UI.
 - Subfin translates OpenSubsonic API calls into Jellyfin API calls and returns Subsonic-shaped responses; stream, download, cover art, and avatar are proxied from Jellyfin.
 
 ## Requirements
 
 - Node.js 20+
 - A Jellyfin server with a music library
-- **Quick Connect:** Strongly recommended to **enable Quick Connect on your Jellyfin server** (Jellyfin → Dashboard → Quick Connect). It is required for the web UI flow: per-device app passwords, managing linked devices, and creating or managing shared media (share links) from the Subfin web interface. Without it, you can still use Subfin by entering your Jellyfin username and password directly in each Subsonic client.
+- **Quick Connect** enabled on your Jellyfin server (Jellyfin → Dashboard → Quick Connect). Required to link devices and obtain app passwords from the Subfin web UI.
 
 ## Setup
 
@@ -77,7 +76,7 @@ For any change to the API or Jellyfin integration, use the **development validat
 
 ## Web UI
 
-The web UI is used when you want **per-device app passwords**, **device management** (rename, reset, unlink), or **creating and managing shared media** (share links). It requires **Quick Connect** to be enabled on your Jellyfin server.
+Quick Connect must be enabled on your Jellyfin server. The web UI is where you link devices and get app passwords.
 
 1. **Link a device** (`/link`): Sign in with Jellyfin via **Quick Connect**. Subfin shows a one-time **app password** — use it with your **Jellyfin username** in the Subsonic client for that device.
 2. **Manage devices** (`/devices`): Sign in with Subsonic username + app password to list linked devices, rename them, **reset password**, or **unlink**. You can also create and manage **share links** (playlist/album shares) from the same page.
@@ -85,12 +84,10 @@ The web UI is used when you want **per-device app passwords**, **device manageme
 ## Subsonic client setup
 
 - **Server URL:** `http://your-subfin-host:4040` (or `https://...` if behind TLS). Use the base URL only (no `/rest` path); the client adds `/rest/` itself (e.g. DSub builds `.../rest/ping.view`).
-- **Username:** Your Jellyfin username.
-- **Password:** Either:
-  - **Jellyfin password:** Use your Jellyfin account password. Subfin authenticates with Jellyfin for each request; no web UI or app password needed. Each client is shown as a separate device in Jellyfin.
-  - **App password:** If you linked a device via the Subfin web UI (Quick Connect), use the app password Subfin showed you. Use the same Jellyfin username. This allows you to manage that device and create shares from the web UI.
+- **Username:** Your Jellyfin username (same as when you linked the device).
+- **Password:** The app password from the Subfin link page (or after a reset). Obtain it by linking the device in the Subfin web UI first.
 
-Subfin supports standard Subsonic auth: password (`p`, including `enc:`), token auth (`t`/`s`), and `apiKey` (all mapped to the app password when using app passwords, or to Jellyfin auth when using your Jellyfin password).
+Subfin supports standard Subsonic auth: password (`p`, including `enc:`), token auth (`t`/`s`), and `apiKey` (all mapped to the app password).
 
 **Legacy auth vs token auth (client setting):** Many clients have a “use legacy auth” or “token authentication” option. In the Subsonic/OpenSubsonic API, **token auth** means the client sends a one-way hash of your password plus a salt (`t` and `s`) instead of the password itself—more secure and the recommended default. **Legacy auth** means the client sends your actual password (`p`) with each request. Subfin can only use your **Jellyfin password** when the client sends it (legacy auth). With token auth, Subfin never sees the password, so it cannot log you in with Jellyfin unless it already has a stored app password for that client. So: to use your Jellyfin password directly in the client you must turn **on** “use legacy auth” (or turn **off** “token authentication”); to keep token auth and avoid sending your Jellyfin password, link the device once in the Subfin web UI and use the **app password** in the client—then token auth works because Subfin stores and verifies that app password.
 
@@ -117,8 +114,7 @@ Subfin exposes two lyrics endpoints:
 ### Working
 
 - **Auth & linking**
-  - **Jellyfin username + password** in the Subsonic client: no web UI or app password needed; Subfin authenticates with Jellyfin per request and each client gets a distinct device in Jellyfin.
-  - **Web UI:** Jellyfin linking via **Quick Connect** (per-device app passwords, device management, share links). App-specific passwords stored per Subsonic username/device.
+  - Jellyfin linking via **Quick Connect** in the Subfin web UI. Per-device app passwords; device management (rename, reset, unlink); share links. App passwords stored per Subsonic username/device.
   - Subsonic auth via `u` + `p` (including `enc:` format), `t` + `s` token auth, or `apiKey`.
 - **Core browsing**
   - `ping`, `getLicense`
