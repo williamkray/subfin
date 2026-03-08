@@ -23,8 +23,8 @@ app.use(express.urlencoded({ extended: true }));
 app.use(clientIpMiddleware);
 
 // Subsonic REST: /rest/ping.view, /rest/getMusicFolders.view, /rest/stream, etc.
-app.all(["/rest", "/rest/:method"], (req, res) => {
-  subsonicRouter(req, res);
+app.all(["/rest", "/rest/:method"], async (req, res) => {
+  await subsonicRouter(req, res);
 });
 
 // Web UI: link, devices, unlink, reset password

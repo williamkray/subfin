@@ -4,16 +4,16 @@ OpenSubsonic-to-Jellyfin compatibility layer. Use Subsonic/Navidrome clients (DS
 
 ## How it works
 
-- **Subsonic clients** point at Subfin (e.g. `http://your-server:4040/rest/`).
-- You **link your Jellyfin account** once via the web UI (Quick Connect or username/password).
-- Subfin gives you an **app-specific password** to use in the Subsonic client.
+- **Subsonic clients** point at Subfin using **host and port** (e.g. `http://your-server:4040`). Clients know the Subsonic API path and add `/rest/` themselves.
+- **Simplest flow:** In the Subsonic client, use your **Jellyfin username and password**. Subfin authenticates with Jellyfin on each request; no web UI or app password required. Each client gets a unique device in Jellyfin’s activity view.
+- **Optional web UI:** For **per-device app passwords**, **managing devices** (rename, reset, unlink), and **creating or managing shared media** (share links), use the Subfin web UI and **Quick Connect** to link devices. Subfin then issues app-specific passwords you use in the client instead of your Jellyfin password.
 - Subfin translates OpenSubsonic API calls into Jellyfin API calls and returns Subsonic-shaped responses; stream, download, cover art, and avatar are proxied from Jellyfin.
 
 ## Requirements
 
 - Node.js 20+
 - A Jellyfin server with a music library
-- For OIDC-only Jellyfin: Quick Connect enabled (to link devices via the web UI)
+- **Quick Connect:** Strongly recommended to **enable Quick Connect on your Jellyfin server** (Jellyfin → Dashboard → Quick Connect). It is required for the web UI flow: per-device app passwords, managing linked devices, and creating or managing shared media (share links) from the Subfin web interface. Without it, you can still use Subfin by entering your Jellyfin username and password directly in each Subsonic client.
 
 ## Setup
 
@@ -68,8 +68,8 @@ The container runs as a non-root user and expects writable `/data` for the store
 
 **Jellyfin activity panel (device & IP):** Each linked device appears in Jellyfin under its label (or “Subfin Device &lt;id&gt;”). Subfin sends the client’s IP on outbound requests via `X-Forwarded-For` (using the first value from the incoming request’s `X-Forwarded-For` or `X-Real-IP`, or the socket address). For that IP to show in Jellyfin’s activity panel, add Subfin’s IP (or your reverse proxy’s IP) to **Jellyfin → Dashboard → Network → Known Proxies**.
 
-- **Subsonic REST:** `http://localhost:4040/rest/` (e.g. `/rest/ping.view`, `/rest/getMusicFolders.view`)
-- **Web UI:** `http://localhost:4040/` (link device, manage devices)
+- **Subsonic clients:** Configure with base URL only, e.g. `http://localhost:4040` (no `/rest` path).
+- **Web UI:** `http://localhost:4040/` (link device, manage devices). REST API is at `/rest/` (e.g. `/rest/ping.view`).
 
 ## Development and validation
 
@@ -77,14 +77,20 @@ For any change to the API or Jellyfin integration, use the **development validat
 
 ## Web UI
 
-1. **Link a device** (`/link`): Sign in with Jellyfin via **Quick Connect** (recommended with OIDC) or **username/password**. Subfin shows a one-time **app password** — use it with your **Jellyfin username** in the Subsonic client.
-2. **Manage devices** (`/devices`): Sign in with Subsonic username + app password to list linked devices, **unlink** (revoke an app password), or **reset password** (issue a new app password and invalidate the old one).
+The web UI is used when you want **per-device app passwords**, **device management** (rename, reset, unlink), or **creating and managing shared media** (share links). It requires **Quick Connect** to be enabled on your Jellyfin server.
+
+1. **Link a device** (`/link`): Sign in with Jellyfin via **Quick Connect**. Subfin shows a one-time **app password** — use it with your **Jellyfin username** in the Subsonic client for that device.
+2. **Manage devices** (`/devices`): Sign in with Subsonic username + app password to list linked devices, rename them, **reset password**, or **unlink**. You can also create and manage **share links** (playlist/album shares) from the same page.
 
 ## Subsonic client setup
 
 - **Server URL:** `http://your-subfin-host:4040` (or `https://...` if behind TLS). Use the base URL only (no `/rest` path); the client adds `/rest/` itself (e.g. DSub builds `.../rest/ping.view`).
-- **Username:** Your Jellyfin username (as shown after linking).
-- **Password:** The app password from the link page (or after a reset). Subfin supports standard Subsonic auth: password (`p`, including `enc:`), token auth (`t`/`s`), and `apiKey` (all mapped to the app password).
+- **Username:** Your Jellyfin username.
+- **Password:** Either:
+  - **Jellyfin password:** Use your Jellyfin account password. Subfin authenticates with Jellyfin for each request; no web UI or app password needed. Each client is shown as a separate device in Jellyfin.
+  - **App password:** If you linked a device via the Subfin web UI (Quick Connect), use the app password Subfin showed you. Use the same Jellyfin username. This allows you to manage that device and create shares from the web UI.
+
+Subfin supports standard Subsonic auth: password (`p`, including `enc:`), token auth (`t`/`s`), and `apiKey` (all mapped to the app password when using app passwords, or to Jellyfin auth when using your Jellyfin password).
 
 REST responses default to **XML** when the client does not send `f=` (Subsonic API default; required for DSub and similar clients).
 
@@ -109,8 +115,8 @@ Subfin exposes two lyrics endpoints:
 ### Working
 
 - **Auth & linking**
-  - Jellyfin linking via **Quick Connect** or **username/password** in the web UI.
-  - App-specific passwords stored per Subsonic username/device.
+  - **Jellyfin username + password** in the Subsonic client: no web UI or app password needed; Subfin authenticates with Jellyfin per request and each client gets a distinct device in Jellyfin.
+  - **Web UI:** Jellyfin linking via **Quick Connect** (per-device app passwords, device management, share links). App-specific passwords stored per Subsonic username/device.
   - Subsonic auth via `u` + `p` (including `enc:` format), `t` + `s` token auth, or `apiKey`.
 - **Core browsing**
   - `ping`, `getLicense`

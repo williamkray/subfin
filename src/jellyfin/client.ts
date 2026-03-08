@@ -2,6 +2,7 @@
  * Jellyfin API client wrapper. Uses @jellyfin/sdk with an existing access token
  * (obtained via web UI linking). All methods are for a single user context.
  */
+import { randomUUID } from "node:crypto";
 import axios from "axios";
 import { Jellyfin } from "@jellyfin/sdk/lib/jellyfin.js";
 import { getAuthorizationHeader } from "@jellyfin/sdk/lib/utils/authentication.js";
@@ -1718,21 +1719,106 @@ export async function getQuickConnectEnabled(): Promise<boolean> {
   }
 }
 
-/** Start QuickConnect: returns { secret, code } for user to authorize in Jellyfin. */
-export async function initiateQuickConnect(): Promise<{
+/** Start QuickConnect: returns { secret, code, deviceId, deviceName } for user to authorize in Jellyfin.
+ * Uses a unique device id per call so Jellyfin treats each QC flow as a different device (avoids token overwrite).
+ * Optional deviceNameOverride: use a custom name (e.g. "Subfin Share: Summer playlist") so the device is identifiable in the Jellyfin dashboard. */
+export async function initiateQuickConnect(deviceNameOverride?: string): Promise<{
   secret: string;
   code: string;
+  deviceId: string;
+  deviceName: string;
 } | null> {
-  const api = getApi("");
+  const deviceId = "subfin-qc-" + randomUUID();
+  const deviceName = (deviceNameOverride?.trim() && deviceNameOverride.trim().length <= 128)
+    ? deviceNameOverride.trim()
+    : "Subfin QC";
+  const api = getApi({ accessToken: "", deviceId, deviceName });
   const qcApi = getQuickConnectApi(api);
   try {
     const response = await qcApi.initiateQuickConnect();
     const data = response.data;
-    if (data?.Secret && data?.Code) return { secret: data.Secret, code: data.Code };
+    if (data?.Secret && data?.Code) {
+      return { secret: data.Secret, code: data.Code, deviceId, deviceName };
+    }
     return null;
-  } catch {
+  } catch (err: unknown) {
+    if (QC_DEBUG) {
+      const ax = err as { response?: { status?: number; data?: unknown }; message?: string };
+      console.log("[QC] initiateQuickConnect error", ax.response?.status ?? ax.message, ax.response?.data ?? "");
+    }
     return null;
   }
+}
+
+/** Authorize a pending Quick Connect request (requires existing token). */
+export async function authorizeQuickConnect(
+  code: string,
+  userId: string,
+  existingAccessToken: string
+): Promise<boolean> {
+  const api = getApi(existingAccessToken);
+  const qcApi = getQuickConnectApi(api);
+  try {
+    await qcApi.authorizeQuickConnect({ code, userId });
+    return true;
+  } catch (err: unknown) {
+    if (QC_DEBUG) {
+      const ax = err as { response?: { status?: number; data?: unknown }; message?: string };
+      console.log("[QC] authorizeQuickConnect error", ax.response?.status ?? ax.message, ax.response?.data ?? "");
+    }
+    return false;
+  }
+}
+
+const QC_DEBUG = process.env.SUBFIN_LOG_QC === "1" || process.env.SUBFIN_LOG_QC === "true";
+
+function qcLog(msg: string, detail?: unknown): void {
+  if (QC_DEBUG && detail !== undefined) {
+    console.log("[QC]", msg, typeof detail === "object" ? JSON.stringify(detail) : detail);
+  } else if (QC_DEBUG) {
+    console.log("[QC]", msg);
+  }
+}
+
+/** Use existing token to approve a QC request and get a new token (for "unique token per device" without password).
+ * Flow: initiate QC → authorize with existing token → poll until authenticated → exchange for new token.
+ * Returns the Jellyfin device id/name used so callers can store them and send the same device on later requests
+ * (so the device appears as a distinct device in the Jellyfin dashboard).
+ * Optional options.deviceName: custom name for this device in Jellyfin (e.g. "Subfin Share: My playlist"). */
+export async function getNewTokenViaQuickConnect(
+  existingAccessToken: string,
+  jellyfinUserId: string,
+  options?: { deviceName?: string }
+): Promise<{ userId: string; accessToken: string; deviceId: string; deviceName: string } | null> {
+  const initiated = await initiateQuickConnect(options?.deviceName);
+  if (!initiated) {
+    console.warn("[QC] Link new device (no password): Quick Connect failed at initiate.");
+    return null;
+  }
+  qcLog("initiate ok", { code: initiated.code });
+  const { secret, code, deviceId, deviceName } = initiated;
+  const authorized = await authorizeQuickConnect(code, jellyfinUserId, existingAccessToken);
+  if (!authorized) {
+    console.warn("[QC] Link new device (no password): Quick Connect failed at authorize (check token validity).");
+    return null;
+  }
+  qcLog("authorize ok");
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 400));
+    const state = await getQuickConnectState(secret);
+    if (state.authenticated) {
+      const auth = await authenticateWithQuickConnect(secret, { id: deviceId, name: deviceName });
+      if (auth) {
+        qcLog("token exchange ok");
+        return { ...auth, deviceId, deviceName };
+      }
+      console.warn("[QC] Link new device (no password): Quick Connect authenticated but token exchange failed.");
+      return null;
+    }
+    qcLog(`poll ${i + 1}/10`, state);
+  }
+  console.warn("[QC] Link new device (no password): Quick Connect timed out waiting for authenticated state.");
+  return null;
 }
 
 /** Poll QuickConnect state. */
@@ -1743,18 +1829,26 @@ export async function getQuickConnectState(secret: string): Promise<{
   const qcApi = getQuickConnectApi(api);
   try {
     const response = await qcApi.getQuickConnectState({ secret });
-    const data = response.data;
+    const data = response.data as { Authenticated?: boolean };
     return { authenticated: data?.Authenticated ?? false };
-  } catch {
+  } catch (err: unknown) {
+    if (QC_DEBUG) {
+      const ax = err as { response?: { status?: number }; message?: string };
+      console.log("[QC] getQuickConnectState error", ax.response?.status ?? ax.message);
+    }
     return { authenticated: false };
   }
 }
 
-/** Exchange QuickConnect secret for token (call after getQuickConnectState returns authenticated). */
+/** Exchange QuickConnect secret for token (call after getQuickConnectState returns authenticated).
+ * Pass the same device used at Initiate so Jellyfin ties the token to that device. */
 export async function authenticateWithQuickConnect(
-  secret: string
+  secret: string,
+  device?: { id: string; name: string }
 ): Promise<{ userId: string; accessToken: string } | null> {
-  const api = getApi("");
+  const api = device
+    ? getApi({ accessToken: "", deviceId: device.id, deviceName: device.name })
+    : getApi("");
   const userApi = getUserApi(api);
   try {
     const response = await userApi.authenticateWithQuickConnect({
@@ -1767,7 +1861,11 @@ export async function authenticateWithQuickConnect(
       return { userId, accessToken };
     }
     return null;
-  } catch {
+  } catch (err: unknown) {
+    if (QC_DEBUG) {
+      const ax = err as { response?: { status?: number; data?: unknown }; message?: string };
+      console.log("[QC] authenticateWithQuickConnect error", ax.response?.status ?? ax.message, ax.response?.data ?? "");
+    }
     return null;
   }
 }
@@ -1785,12 +1883,31 @@ export async function getCurrentUserName(ctxOrToken: JellyfinContext | string): 
   }
 }
 
-/** Authenticate by username and password (for web UI when server supports password). */
+/** Authenticate by username and password (for web UI when server supports password).
+ * Uses unauthenticated API (empty token). Jellyfin 10.8 had a bug where AuthenticateByName
+ * with a bad/invalid Authorization header could wipe the server's Devices table; fixed in 10.9.
+ * See .local-testing/auth-and-device-investigation.md. */
 export async function authenticateByName(
   username: string,
   password: string
 ): Promise<{ userId: string; accessToken: string } | null> {
-  const api = getApi("");
+  return authenticateByNameWithDevice(username, password, jf.deviceId, jf.deviceName);
+}
+
+/** Authenticate by username and password with a specific device id/name.
+ * Jellyfin creates a new session (and token) per device. Use this when linking a new
+ * Subfin device so each linked device has its own long-lived Jellyfin token. */
+export async function authenticateByNameWithDevice(
+  username: string,
+  password: string,
+  deviceId: string,
+  deviceName: string
+): Promise<{ userId: string; accessToken: string } | null> {
+  const api = getApi({
+    accessToken: "",
+    deviceId,
+    deviceName,
+  });
   const userApi = getUserApi(api);
   try {
     const response = await userApi.authenticateUserByName({
@@ -1805,5 +1922,17 @@ export async function authenticateByName(
     return null;
   } catch {
     return null;
+  }
+}
+
+/** Report that the session for the given token has ended (POST /Sessions/Logout).
+ * Call this when unlinking a device so Jellyfin revokes that device's token. */
+export async function reportSessionEnded(accessToken: string): Promise<void> {
+  const api = getApi(accessToken);
+  const sessionApi = getSessionApi(api);
+  try {
+    await sessionApi.reportSessionEnded();
+  } catch {
+    // Session may already be gone or token invalid; ignore.
   }
 }

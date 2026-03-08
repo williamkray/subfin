@@ -4,7 +4,9 @@
 import { type Request, type Response } from "express";
 import http from "node:http";
 import https from "node:https";
-import { resolveAuth, resolveAuthFromBasicHeader } from "./auth.js";
+import type { AuthParams } from "./auth.js";
+import { resolveAuth, resolveAuthFromBasicHeader, resolveAuthFromBasicHeaderWithToken } from "./auth.js";
+import { getClientIp } from "../request-context.js";
 import { resolveAuthFromShareCookie } from "../web/share-session.js";
 import { subsonicEnvelope, subsonicError, ErrorCode, VERSION } from "./response.js";
 import * as handlers from "./handlers.js";
@@ -76,6 +78,20 @@ function getParams(req: Request): Record<string, string> {
       params[k] = Array.isArray(v) ? v[0] ?? "" : String(v);
   }
   return params;
+}
+
+/** Build auth params with case-insensitive keys (some clients send U, P, T, S). */
+function getAuthParams(params: Record<string, string>): AuthParams {
+  const one = (a: string, b: string) =>
+    (params[a] ?? params[b])?.trim() || undefined;
+  return {
+    u: one("u", "U"),
+    p: params.p ?? params.P,
+    t: params.t ?? params.T,
+    s: params.s ?? params.S,
+    apiKey: params.apiKey ?? params.ApiKey,
+    token: params.token ?? params.Token,
+  };
 }
 
 /** Normalize a param value to a string id; avoid sending "[object Object]" when client sends an object. */
@@ -252,29 +268,57 @@ function getDeviceForProxy(auth: { jellyfinDeviceId?: string; jellyfinDeviceName
     : undefined;
 }
 
-export function subsonicRouter(req: Request, res: Response): void {
+export async function subsonicRouter(req: Request, res: Response): Promise<void> {
   const rawParam = req.params.method ?? "";
   const raw = (typeof rawParam === "string" ? rawParam : rawParam[0] ?? "").replace(/\.view$/i, "").trim();
   const method = (raw || "ping").toLowerCase();
 
   const params = getParams(req);
   const format = getFormat(params);
+  const authParams = getAuthParams(params);
+  const clientInfo = {
+    userAgent: req.get("user-agent") || "",
+    clientIp: getClientIp() || "unknown",
+  };
 
   // Auth
-  let authResult = resolveAuth(params);
+  let authResult: Awaited<ReturnType<typeof resolveAuth>>;
+  // getCoverArt: try Authorization: Basic first when present (some clients send creds only in header)
+  if (method === "getcoverart" && req.get("authorization")?.startsWith("Basic ")) {
+    const headerAuth = resolveAuthFromBasicHeader(req.get("authorization"));
+    authResult = headerAuth ?? (await resolveAuth(authParams, clientInfo));
+  } else {
+    authResult = await resolveAuth(authParams, clientInfo);
+  }
   // When u/p not sent (e.g. share page player with cookie), try share cookie
   if ("code" in authResult && authResult.code === 10) {
     const shareAuth = resolveAuthFromShareCookie(req);
     if (shareAuth) authResult = shareAuth;
   }
-  // getCoverArt: some clients (e.g. Musly image loader) send credentials only in Authorization header
+  // getCoverArt: fallbacks when params auth failed (e.g. image loader sends t in header, u+s in URL)
   if ("code" in authResult && method === "getcoverart") {
     const headerAuth = resolveAuthFromBasicHeader(req.get("authorization"));
     if (headerAuth) authResult = headerAuth;
+    if ("code" in authResult) {
+      const tokenHeaderAuth = resolveAuthFromBasicHeaderWithToken(
+        req.get("authorization"),
+        authParams.u,
+        authParams.s
+      );
+      if (tokenHeaderAuth) authResult = tokenHeaderAuth;
+    }
   }
   if (config.logRest) {
     const authLog = "code" in authResult ? `auth failed ${authResult.code}` : "auth ok";
     console.log(`[REST] ${req.method} ${req.path} method=${method} ${authLog}`);
+    // Debug getCoverArt auth 40 to see what client sent (no secret values)
+    if (method === "getcoverart" && "code" in authResult && authResult.code === 40) {
+      const ah = req.get("authorization");
+      const authType = !ah ? "none" : ah.startsWith("Basic ") ? "Basic" : ah.startsWith("Bearer ") ? "Bearer" : "other";
+      console.log(
+        `[REST_DEBUG] getCoverArt auth 40: id=${params.id ? "1" : "0"} u=${authParams.u ? "1" : "0"} p=${authParams.p ? "1" : "0"} t=${authParams.t ? "1" : "0"} s=${authParams.s ? "1" : "0"} authHeader=${authType}`
+      );
+    }
   }
   if ("code" in authResult) {
     const httpStatus = authResult.code === 40 ? 401 : 200;

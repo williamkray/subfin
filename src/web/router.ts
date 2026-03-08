@@ -9,6 +9,8 @@ import { config } from "../config.js";
 import {
   addLinkedDevice,
   getJellyfinCredentialsForUser,
+  getJellyfinCredentialsForLinking,
+  getDeviceJellyfinToken,
   listLinkedDevices,
   unlinkDevice,
   resetAppPassword,
@@ -19,6 +21,9 @@ import {
   getShareByUid,
   getShareAuthByUid,
   incrementShareVisitCount,
+  getSharesForUser,
+  deleteShare,
+  updateShare,
 } from "../store/index.js";
 import { toJellyfinContext, type AuthResult } from "../subsonic/auth.js";
 import { handleCreateShare, handleSearch3 } from "../subsonic/handlers.js";
@@ -529,6 +534,35 @@ const baseStyles = `
   .list-item-label {
     font-weight: 500;
   }
+  .editable-label {
+    cursor: pointer;
+    border-bottom: 1px dotted var(--text-muted);
+    padding: 2px 0;
+  }
+  .editable-label:hover {
+    border-bottom-color: var(--accent);
+    color: var(--accent);
+  }
+  .label-edit-inline {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .label-edit-inline.editing {
+    display: flex;
+  }
+  .label-edit-inline input[type="text"] {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: 240px;
+  }
+  .label-display-wrap.editing .label-display {
+    display: none;
+  }
+  .label-display-wrap.editing .label-edit-inline {
+    display: flex;
+  }
   .list-item-meta {
     font-size: 0.74rem;
     color: var(--text-muted);
@@ -620,9 +654,22 @@ router.get("/", (req: Request, res: Response) => {
     </section>
   `;
 
+  const err = (req.query.error as string) || "";
+  const loginFlash =
+    !sessionUser && err
+      ? (err === "auth"
+          ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Quick Connect failed or was denied. Try again.</p>'
+          : err === "missing"
+            ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Session expired or invalid. Start again from the overview.</p>'
+            : err === "no-device"
+              ? '<p class="card card-muted" style="margin-bottom: 14px;">Link a device first from the overview, then you can add more from here.</p>'
+              : "")
+      : "";
+
+  const shares = sessionUser ? getSharesForUser(sessionUser) : [];
   const dashboard =
     sessionUser && devices
-      ? renderAuthenticatedDashboard(sessionUser, devices)
+      ? renderAuthenticatedDashboard(sessionUser, devices, shares)
       : renderLoginPanels();
 
   res.send(
@@ -632,6 +679,7 @@ router.get("/", (req: Request, res: Response) => {
         ${renderDashboardHeader(sessionUser)}
         <main class="shell-main">
           <div class="shell-main-full">
+            ${loginFlash}
             ${hero}
             ${dashboard}
           </div>
@@ -641,51 +689,49 @@ router.get("/", (req: Request, res: Response) => {
   );
 });
 
+const LINK_DEVICE_CARD_BODY = `
+  Use Jellyfin Quick Connect on a device where you are already logged in. You'll
+  get one app password for this device — each link is a unique token from Jellyfin.`;
+
 function renderLoginPanels(): string {
   return `
     <section class="auth-grid">
       <div class="card">
         <div class="card-header">
           <div>
-            <div class="card-kicker">Jellyfin sign-in</div>
-            <div class="card-title">Quick Connect (recommended)</div>
+            <div class="card-kicker">New client</div>
+            <div class="card-title">Link device</div>
           </div>
         </div>
         <div class="card-body">
-          Use Jellyfin Quick Connect on a device where you are already logged in. Subfin
-          will never see your Jellyfin password — only a scoped access token.
+          ${LINK_DEVICE_CARD_BODY}
         </div>
-        <div class="actions-row">
-          <a href="/auth/quickconnect"><button type="button">Continue</button></a>
-          <span class="tiny">In Jellyfin: Settings → Quick Connect</span>
-        </div>
+        <form method="get" action="/auth/quickconnect" class="stack">
+          <input type="hidden" name="intent" value="link">
+          <label>
+            Device label (optional)
+            <input type="text" name="deviceLabel" placeholder="e.g. Work laptop, Car, Living room">
+          </label>
+          <div class="actions-row">
+            <button type="submit">Continue</button>
+            <span class="tiny">In Jellyfin: Settings → Quick Connect</span>
+          </div>
+        </form>
       </div>
       <div class="card card-muted">
         <div class="card-header">
           <div>
-            <div class="card-kicker">Alternative</div>
-            <div class="card-title">Username & password</div>
+            <div class="card-kicker">Existing clients</div>
+            <div class="card-title">Manage devices</div>
           </div>
         </div>
         <div class="card-body">
-          Sign in with your Jellyfin username and password, then manage or link Subsonic/OpenSubsonic clients.
+          Sign in with Quick Connect to view linked devices, rename them, reset app passwords, or unlink.
         </div>
-        <form method="post" action="/web/link/password" class="stack">
-          <div class="stack">
-            <label>
-              Jellyfin username
-              <input name="username" autocomplete="username" required>
-            </label>
-            <label>
-              Password
-              <input type="password" name="password" autocomplete="current-password" required>
-            </label>
-          </div>
-          <div class="actions-row">
-            <button type="submit">Continue</button>
-            <span class="tiny">You’ll see device management and app passwords after signing in.</span>
-          </div>
-        </form>
+        <div class="actions-row">
+          <a href="/auth/quickconnect?intent=manage"><button type="button">Continue</button></a>
+          <span class="tiny">You'll be asked to approve the login in Jellyfin.</span>
+        </div>
       </div>
     </section>
   `;
@@ -693,18 +739,29 @@ function renderLoginPanels(): string {
 
 function renderAuthenticatedDashboard(
   sessionUser: string,
-  devices: ReturnType<typeof listLinkedDevices>
+  devices: ReturnType<typeof listLinkedDevices>,
+  shares: ReturnType<typeof getSharesForUser>
 ): string {
+  const shareDeviceIds = new Set(shares.map((s) => s.linked_device_id));
+  const regularDevices = devices.filter((d) => !shareDeviceIds.has(d.id));
   const listItems =
-    devices.length === 0
+    regularDevices.length === 0
       ? `<div class="tiny">No devices linked yet. Generate your first app password below.</div>`
-      : devices
+      : regularDevices
           .map(
-            (d) => `
+            (d) => {
+              const label = d.device_label ? escapeHtml(d.device_label) : "Unnamed device";
+              const labelValue = d.device_label ? escapeHtml(d.device_label) : "";
+              return `
       <li class="list-item">
         <div class="list-item-main">
-          <div class="list-item-label">
-            ${d.device_label ? escapeHtml(d.device_label) : "Unnamed device"}
+          <div class="list-item-label label-display-wrap">
+            <span class="label-display editable-label" tabindex="0" role="button" title="Click to rename">${label}</span>
+            <form method="post" action="/web/devices/rename" class="label-edit-inline">
+              <input type="hidden" name="deviceId" value="${d.id}">
+              <input type="text" name="deviceLabel" value="${labelValue}" placeholder="Device name" data-initial="${escapeHtml(labelValue)}">
+              <button type="submit" class="btn-secondary btn-small label-save-btn" style="display:none;">Save</button>
+            </form>
           </div>
           <div class="pill">
             <span class="pill-dot"></span>
@@ -713,19 +770,6 @@ function renderAuthenticatedDashboard(
         </div>
         <div class="list-item-meta">Linked ${escapeHtml(d.created_at)}</div>
         <div class="list-item-actions">
-          <form method="post" action="/web/devices/rename">
-            <div class="list-item-fields">
-              <input type="hidden" name="deviceId" value="${d.id}">
-              <input
-                type="text"
-                name="deviceLabel"
-                value="${d.device_label ? escapeHtml(d.device_label) : ""}"
-                placeholder="Rename device (optional)"
-                style="flex: 1 1 auto; min-width: 0;"
-              >
-              <button type="submit" class="btn-secondary btn-small" style="flex: 0 0 auto; white-space: nowrap;">Save label</button>
-            </div>
-          </form>
           <form method="post" action="/web/devices/reset">
             <input type="hidden" name="deviceId" value="${d.id}">
             <button type="submit" class="btn-secondary btn-small">Reset app password</button>
@@ -735,7 +779,51 @@ function renderAuthenticatedDashboard(
             <button type="submit" class="btn-danger btn-small">Unlink</button>
           </form>
         </div>
-      </li>`
+      </li>`;
+            }
+          )
+          .join("");
+
+  const shareItems =
+    shares.length === 0
+      ? `<div class="tiny">No shares yet. Create one from <a href="/create-share">Create share</a> or from a Subsonic client.</div>`
+      : shares
+          .map(
+            (s) => {
+              const desc = s.description || `Share ${s.share_uid.slice(0, 8)}`;
+              const descValue = s.description ? escapeHtml(s.description) : "";
+              return `
+      <li class="list-item">
+        <div class="list-item-main">
+          <div class="list-item-label label-display-wrap">
+            <span class="label-display editable-label" tabindex="0" role="button" title="Click to rename">${escapeHtml(desc)}</span>
+            <form method="post" action="/web/shares/update" class="label-edit-inline">
+              <input type="hidden" name="share_uid" value="${escapeHtml(s.share_uid)}">
+              <input type="text" name="description" value="${descValue}" placeholder="Share name" data-initial="${escapeHtml(descValue)}">
+              <button type="submit" class="btn-secondary btn-small label-save-btn" style="display:none;">Save</button>
+            </form>
+          </div>
+        </div>
+        <div class="list-item-meta">Created ${escapeHtml(s.created_at)}</div>
+        <div class="list-item-actions">
+          ${
+            s.fullUrl
+              ? `<div class="list-item-fields" style="margin-bottom:8px;">
+              <label class="tiny">Share link (copy and send)</label>
+              <div class="actions-row" style="margin-top:4px;">
+                <input type="text" readonly value="${escapeHtml(s.fullUrl)}" style="flex:1 1 auto; min-width:0; font-size:0.75rem;">
+                <button type="button" class="btn-secondary btn-small copy-share-url" data-url="${escapeHtml(s.fullUrl)}">Copy</button>
+              </div>
+            </div>`
+              : `<p class="tiny">Full link was shown when the share was created.</p>`
+          }
+          <form method="post" action="/web/shares/delete" style="margin-top:6px;">
+            <input type="hidden" name="share_uid" value="${escapeHtml(s.share_uid)}">
+            <button type="submit" class="btn-danger btn-small">Unshare</button>
+          </form>
+        </div>
+      </li>`;
+            }
           )
           .join("");
 
@@ -745,12 +833,11 @@ function renderAuthenticatedDashboard(
         <div class="card-header">
           <div>
             <div class="card-kicker">New client</div>
-            <div class="card-title">Generate app password</div>
+            <div class="card-title">Link device</div>
           </div>
         </div>
         <div class="card-body">
-          Create a new app-specific password for another Subsonic/OpenSubsonic client while
-          staying signed in as <strong>${escapeHtml(sessionUser)}</strong>.
+          ${LINK_DEVICE_CARD_BODY}
         </div>
         <form method="post" action="/web/link/new-device" class="stack">
           <label>
@@ -762,8 +849,8 @@ function renderAuthenticatedDashboard(
             >
           </label>
           <div class="actions-row">
-            <button type="submit">Generate app password</button>
-            <span class="tiny">You’ll see the new password once — copy it into your client.</span>
+            <button type="submit">Continue</button>
+            <span class="tiny">You'll be asked to approve in Jellyfin (Settings → Quick Connect). Then you'll see the new app password — copy it into your client.</span>
           </div>
         </form>
       </div>
@@ -782,8 +869,117 @@ function renderAuthenticatedDashboard(
           ${listItems}
         </ul>
       </div>
+      <div class="card card-muted" style="grid-column: 1 / -1;">
+        <div class="card-header">
+          <div>
+            <div class="card-kicker">Shares</div>
+            <div class="card-title">Share links</div>
+          </div>
+        </div>
+        <div class="card-body">
+          Public links you created (playlist, album, etc.). Copy the link to send; use Unshare to revoke.
+        </div>
+        <ul class="list">
+          ${shareItems}
+        </ul>
+        ${
+          shares.some((s) => s.fullUrl)
+            ? `<script>document.querySelectorAll('.copy-share-url').forEach(function(b){b.addEventListener('click',function(){navigator.clipboard.writeText(b.getAttribute('data-url'));b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1500);});});</script>`
+            : ""
+        }
+      </div>
     </section>
+    <script>
+(function() {
+  function initEditableLabels() {
+    document.querySelectorAll('.label-display-wrap').forEach(function(wrap) {
+      var display = wrap.querySelector('.label-display');
+      var form = wrap.querySelector('.label-edit-inline');
+      var input = form && form.querySelector('input[type="text"]');
+      var saveBtn = form && form.querySelector('.label-save-btn');
+      if (!display || !form || !input) return;
+      function toEdit() {
+        wrap.classList.add('editing');
+        input.value = input.getAttribute('data-initial') || '';
+        input.focus();
+        if (saveBtn) saveBtn.style.display = (input.value !== (input.getAttribute('data-initial') || '')) ? '' : 'none';
+      }
+      function fromEdit() {
+        if (input.value === (input.getAttribute('data-initial') || '')) wrap.classList.remove('editing');
+      }
+      display.addEventListener('click', toEdit);
+      display.addEventListener('keydown', function(e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toEdit(); } });
+      input.addEventListener('input', function() { saveBtn.style.display = (input.value !== (input.getAttribute('data-initial') || '')) ? '' : 'none'; });
+      input.addEventListener('blur', fromEdit);
+    });
+  }
+  initEditableLabels();
+})();
+    </script>
   `;
+}
+
+function renderDeviceLinkedPage(
+  sessionUser: string,
+  appPassword: string,
+  deviceLabel?: string
+): string {
+  return renderLayout(
+    "Device linked - Subfin",
+    `
+    ${renderDashboardHeader(sessionUser)}
+    <main class="shell-main">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-kicker">New app password</div>
+            <div class="card-title">Device linked</div>
+          </div>
+        </div>
+        <div class="card-body">
+          <p>Use these credentials in your Subsonic/OpenSubsonic client:</p>
+          <ul style="padding-left: 18px; margin: 8px 0;">
+            <li><strong>Username:</strong> ${escapeHtml(sessionUser)}</li>
+            <li>
+              <strong>Password (app password):</strong>
+              <span class="actions-row" style="display:inline-flex; align-items:center; gap:8px;">
+                <code id="device-password-value">${escapeHtml(appPassword)}</code>
+                <button type="button" id="device-password-copy" class="btn-secondary btn-small">Copy</button>
+              </span>
+            </li>
+            ${deviceLabel ? `<li><strong>Device label:</strong> ${escapeHtml(deviceLabel)}</li>` : ""}
+          </ul>
+          <p class="tiny">Copy the password now; it will not be shown again.</p>
+        </div>
+        <script>
+          document.getElementById('device-password-copy').addEventListener('click', function() {
+            var el = document.getElementById('device-password-value');
+            var t = el && el.textContent ? el.textContent.trim() : '';
+            if (t) navigator.clipboard.writeText(t).then(function() {
+              var btn = document.getElementById('device-password-copy');
+              if (btn) { btn.textContent = 'Copied'; setTimeout(function() { btn.textContent = 'Copy'; }, 1500); }
+            });
+          });
+        </script>
+        <div class="actions-row">
+          <a href="/"><button type="button">Back to overview</button></a>
+          <a href="/devices"><button type="button" class="btn-secondary">Manage linked devices</button></a>
+          <a href="/devices"><button type="button" class="btn-secondary">Link another device</button></a>
+        </div>
+      </div>
+      <aside>
+        <div class="card card-muted">
+          <div class="card-header">
+            <div class="card-title">Tip</div>
+          </div>
+          <div class="card-body">
+            Each linked device has its own token. Use "Link another device" on the main page for each new client.
+          </div>
+        </div>
+      </aside>
+    </main>
+  `
+  );
 }
 
 // Legacy entry point; keep for compatibility but send users to the main overview.
@@ -791,15 +987,21 @@ router.get("/link", (_req: Request, res: Response) => {
   res.redirect("/");
 });
 
-router.get("/auth/quickconnect", async (_req: Request, res: Response) => {
+router.get("/auth/quickconnect", async (req: Request, res: Response) => {
+  const intent = (req.query.intent as string) === "link" ? "link" : "manage";
+  const deviceLabel = (req.query.deviceLabel as string)?.trim() || undefined;
   const result = await jf.initiateQuickConnect();
   if (!result) {
     res.status(500).send("Quick Connect not available. Is Jellyfin reachable and Quick Connect enabled?");
     return;
   }
+  const whatNext =
+    intent === "link"
+      ? "<li>Create one linked device with a unique token.</li><li>Show you an app password to use in your Subsonic client.</li>"
+      : "<li>Sign you into the Subfin web UI.</li><li>Take you to device management (rename, reset, unlink).</li>";
   res.send(`
 ${renderLayout(
-  "Quick Connect - Subfin",
+  intent === "link" ? "Link device - Subfin" : "Manage devices - Subfin",
   `
     ${renderDashboardHeader(null)}
     <main class="shell-main">
@@ -831,9 +1033,7 @@ ${renderLayout(
           <div class="card-body">
             Once Jellyfin confirms this Quick Connect request, Subfin will:
             <ul style="padding-left: 18px; margin: 8px 0 0;">
-              <li>Link your Jellyfin account to Subfin.</li>
-              <li>Sign you into the Subfin web UI.</li>
-              <li>Send you to device management where you can create app passwords.</li>
+              ${whatNext}
             </ul>
           </div>
         </div>
@@ -841,11 +1041,17 @@ ${renderLayout(
     </main>
     <script>
       const secret = ${JSON.stringify(result.secret)};
+      const intent = ${JSON.stringify(intent)};
+      const deviceId = ${JSON.stringify(result.deviceId)};
+      const deviceName = ${JSON.stringify(result.deviceName)};
+      const deviceLabel = ${JSON.stringify(deviceLabel ?? "")};
       const poll = async () => {
         const r = await fetch('/web/quickconnect/poll?secret=' + encodeURIComponent(secret));
         const d = await r.json();
         if (d.authenticated) {
-          window.location = '/web/quickconnect/done?secret=' + encodeURIComponent(secret);
+          const params = new URLSearchParams({ secret, intent, deviceId, deviceName });
+          if (deviceLabel) params.set('deviceLabel', deviceLabel);
+          window.location = '/web/quickconnect/done?' + params.toString();
           return;
         }
         const statusEl = document.getElementById('status');
@@ -875,20 +1081,34 @@ router.get("/web/quickconnect/poll", async (req: Request, res: Response) => {
 
 router.get("/web/quickconnect/done", async (req: Request, res: Response) => {
   const secret = (req.query.secret as string)?.trim();
+  const intent = (req.query.intent as string) === "link" ? "link" : "manage";
+  const deviceId = (req.query.deviceId as string)?.trim();
+  const deviceName = (req.query.deviceName as string)?.trim();
   if (!secret) {
-    res.redirect("/link?error=missing");
+    res.redirect("/?error=missing");
     return;
   }
-  const auth = await jf.authenticateWithQuickConnect(secret);
+  const deviceLabel = (req.query.deviceLabel as string)?.trim() || undefined;
+  const device = deviceId && deviceName ? { id: deviceId, name: deviceName } : undefined;
+  const auth = await jf.authenticateWithQuickConnect(secret, device);
   if (!auth) {
-    res.redirect("/link?error=auth");
+    res.redirect("/?error=auth");
     return;
   }
   const username = (await jf.getCurrentUserName(auth.accessToken)) ?? auth.userId;
-  // Auth-only step: remember Jellyfin credentials for this Subsonic username.
+
+  if (intent === "link") {
+    // Create one linked device with this token and show app password.
+    const appPassword = addLinkedDevice(username, auth.userId, auth.accessToken, deviceLabel);
+    setJellyfinSession(username, auth.userId, auth.accessToken);
+    setSessionUser(res, username);
+    res.send(renderDeviceLinkedPage(username, appPassword, deviceLabel));
+    return;
+  }
+
+  // Manage devices: remember session and go to device management.
   setJellyfinSession(username, auth.userId, auth.accessToken);
   setSessionUser(res, username);
-  // After auth, take the user to device management where they can link devices.
   res.redirect("/devices");
 });
 
@@ -965,137 +1185,72 @@ router.post("/web/link/password", async (req: Request, res: Response) => {
   res.redirect("/devices");
 });
 
-router.post("/web/link/new-device", (req: Request, res: Response) => {
+router.post("/web/link/new-device", async (req: Request, res: Response) => {
   const sessionUser = getSessionUser(req);
   if (!sessionUser) {
     res.redirect("/link");
     return;
   }
-  const creds = getJellyfinCredentialsForUser(sessionUser);
+  const deviceLabel = (req.body?.deviceLabel as string | undefined)?.trim() || undefined;
+
+  const creds = getJellyfinCredentialsForLinking(sessionUser);
   if (!creds) {
-    res.redirect("/link?error=no-device");
+    res.redirect("/?error=no-device");
     return;
   }
-  const deviceLabel = (req.body?.deviceLabel as string | undefined)?.trim() || undefined;
+  const newAuth = await jf.getNewTokenViaQuickConnect(
+    creds.jellyfinAccessToken,
+    creds.jellyfinUserId
+  );
+  if (!newAuth) {
+    res.redirect("/devices?error=qc-failed");
+    return;
+  }
+
   const appPassword = addLinkedDevice(
     sessionUser,
-    creds.jellyfinUserId,
-    creds.jellyfinAccessToken,
+    newAuth.userId,
+    newAuth.accessToken,
     deviceLabel
   );
-  res.send(`
-${renderLayout(
-  "Device linked - Subfin",
-  `
-    ${renderDashboardHeader(sessionUser)}
-    <main class="shell-main">
-      <div class="card">
-        <div class="card-header">
-          <div>
-            <div class="card-kicker">New app password</div>
-            <div class="card-title">Another device linked</div>
-          </div>
-        </div>
-        <div class="card-body">
-          <p>Use these credentials in your Subsonic/OpenSubsonic client:</p>
-          <ul style="padding-left: 18px; margin: 8px 0;">
-            <li><strong>Username:</strong> ${escapeHtml(sessionUser)}</li>
-            <li><strong>Password (app password):</strong> <code>${escapeHtml(appPassword)}</code></li>
-            ${deviceLabel ? `<li><strong>Device label:</strong> ${escapeHtml(deviceLabel)}</li>` : ""}
-          </ul>
-          <p class="tiny">Copy the password now; it will not be shown again.</p>
-        </div>
-        <div class="actions-row">
-          <a href="/"><button type="button">Back to overview</button></a>
-          <a href="/devices"><button type="button" class="btn-secondary">Manage linked devices</button></a>
-          <a href="/link"><button type="button" class="btn-secondary">Link another device</button></a>
-        </div>
-      </div>
-      <aside>
-        <div class="card card-muted">
-          <div class="card-header">
-            <div class="card-title">Tip</div>
-          </div>
-          <div class="card-body">
-            You can generate separate app passwords for each client (phone, desktop, car).
-            This makes it easier to revoke access for a single device later.
-          </div>
-        </div>
-      </aside>
-    </main>
-  `
-)}`);
+  res.send(renderDeviceLinkedPage(sessionUser, appPassword, deviceLabel));
 });
 
 router.get("/devices", (req: Request, res: Response) => {
   const sessionUser = getSessionUser(req);
-  if (sessionUser) {
-    const devices = listLinkedDevices(sessionUser);
-    res.send(
-      renderLayout(
-        "My devices - Subfin",
-        `
+  if (!sessionUser) {
+    res.redirect("/");
+    return;
+  }
+  const err = (req.query.error as string) || "";
+  const ok =
+    (req.query.unlinked as string) === "1" ||
+    (req.query.renamed as string) === "1" ||
+    (req.query.unshared as string) === "1";
+  const devices = listLinkedDevices(sessionUser);
+  const shares = getSharesForUser(sessionUser);
+  const flash =
+    err === "qc-failed"
+      ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Quick Connect failed or was denied. No device was created. Try again (approve in Jellyfin: Settings → Quick Connect).</p>'
+      : err === "unshare"
+            ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Could not unshare (share not found or already removed).</p>'
+            : ok
+              ? '<p class="card card-muted" style="margin-bottom: 14px;">Done.</p>'
+              : "";
+  res.send(
+    renderLayout(
+      "My devices - Subfin",
+      `
           ${renderDashboardHeader(sessionUser)}
           <main class="shell-main">
+            ${flash}
             <div class="shell-main-full">
-              ${renderAuthenticatedDashboard(sessionUser, devices)}
+              ${renderAuthenticatedDashboard(sessionUser, devices, shares)}
             </div>
           </main>
         `
-      )
-    );
-    return;
-  }
-
-  // No session: show login form.
-  res.send(`
-${renderLayout(
-  "Manage devices - Subfin",
-  `
-    ${renderDashboardHeader(null)}
-    <main class="shell-main">
-      <div>
-        <section class="hero">
-          <div class="hero-title">Manage linked devices</div>
-          <p class="hero-subtitle">
-            Sign in with your Subsonic username and app password to review existing devices,
-            reset app passwords, or revoke access.
-          </p>
-        </section>
-        <div class="card" style="margin-top: 14px;">
-          <form method="post" action="/web/devices" class="stack">
-            <label>
-              Subsonic username
-              <input name="username" autocomplete="username" required>
-            </label>
-            <label>
-              App password
-              <input type="password" name="password" autocomplete="current-password" required>
-            </label>
-            <div class="actions-row">
-              <button type="submit">View my devices</button>
-              <a href="/"><button type="button" class="btn-secondary">Back to overview</button></a>
-            </div>
-          </form>
-        </div>
-      </div>
-      <aside>
-        <div class="card card-muted">
-          <div class="card-header">
-            <div class="card-title">Need to create an app password?</div>
-          </div>
-          <div class="card-body">
-            Head back to the main view and link a device with Jellyfin Quick Connect or username
-            & password to get your first app password.
-          </div>
-          <div class="actions-row">
-            <a href="/"><button type="button" class="btn-secondary">Open main view</button></a>
-          </div>
-        </div>
-      </aside>
-    </main>
-  `
-)}`);
+    )
+  );
 });
 
 router.post("/web/devices", async (req: Request, res: Response) => {
@@ -1118,14 +1273,14 @@ router.post("/web/devices", async (req: Request, res: Response) => {
       `
         ${renderDashboardHeader(username)}
         <main class="shell-main">
-          ${renderAuthenticatedDashboard(username, devices)}
+          ${renderAuthenticatedDashboard(username, devices, getSharesForUser(username))}
         </main>
       `
     )
   );
 });
 
-router.post("/web/devices/unlink", (req: Request, res: Response) => {
+router.post("/web/devices/unlink", async (req: Request, res: Response) => {
   const resolved = getUsernameForDeviceAction(req);
   if ("errorRedirect" in resolved) {
     res.redirect(resolved.errorRedirect);
@@ -1135,6 +1290,10 @@ router.post("/web/devices/unlink", (req: Request, res: Response) => {
   if (Number.isNaN(deviceId)) {
     res.redirect("/devices?error=missing");
     return;
+  }
+  const token = getDeviceJellyfinToken(deviceId, resolved.username);
+  if (token) {
+    await jf.reportSessionEnded(token);
   }
   const ok = unlinkDevice(deviceId, resolved.username);
   res.redirect(ok ? "/devices?unlinked=1" : "/devices?error=unlink");
@@ -1184,6 +1343,37 @@ ${renderLayout(
     </main>
   `
 )}`);
+});
+
+router.post("/web/shares/delete", (req: Request, res: Response) => {
+  const sessionUser = getSessionUser(req);
+  if (!sessionUser) {
+    res.redirect("/");
+    return;
+  }
+  const shareUid = (req.body?.share_uid as string)?.trim();
+  if (!shareUid) {
+    res.redirect("/devices?error=missing");
+    return;
+  }
+  const deleted = deleteShare(shareUid, sessionUser);
+  res.redirect(deleted ? "/devices?unshared=1" : "/devices?error=unshare");
+});
+
+router.post("/web/shares/update", (req: Request, res: Response) => {
+  const sessionUser = getSessionUser(req);
+  if (!sessionUser) {
+    res.redirect("/");
+    return;
+  }
+  const shareUid = (req.body?.share_uid as string)?.trim();
+  const description = (req.body?.description as string)?.trim() || null;
+  if (!shareUid) {
+    res.redirect("/devices?error=missing");
+    return;
+  }
+  const updated = updateShare(shareUid, sessionUser, { description });
+  res.redirect(updated ? "/devices?renamed=1" : "/devices?error=rename");
 });
 
 router.post("/web/devices/rename", (req: Request, res: Response) => {

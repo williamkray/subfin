@@ -8,6 +8,7 @@ import {
   getPlayQueue,
   savePlayQueue,
   createShare as storeCreateShare,
+  getJellyfinCredentialsForLinking,
   getSharesForUser,
   updateShare as storeUpdateShare,
   deleteShare as storeDeleteShare,
@@ -1471,11 +1472,33 @@ export async function handleCreateShare(
   const expiresAt = params.expires ? Number.parseInt(params.expires, 10) || null : null;
   if (expiresAt !== null && (Number.isNaN(expiresAt) || expiresAt < 0)) throw new Error("Invalid expires");
 
-  const { shareUid, secret } = storeCreateShare(auth.subsonicUsername, auth.jellyfinUserId, auth.jellyfinAccessToken, {
+  // Use behind-the-scenes Quick Connect so the share has its own token, not tied to the requesting device.
+  const creds = getJellyfinCredentialsForLinking(auth.subsonicUsername);
+  if (!creds) {
+    throw new Error(
+      "Quick Connect required to create shares. Use the web app to link a device with Quick Connect first."
+    );
+  }
+  const shareDeviceName =
+    "Subfin Share: " + (description ? description.slice(0, 80) : "link");
+  const shareAuth = await jf.getNewTokenViaQuickConnect(
+    creds.jellyfinAccessToken,
+    creds.jellyfinUserId,
+    { deviceName: shareDeviceName }
+  );
+  if (!shareAuth) {
+    throw new Error(
+      "Quick Connect failed. Approve in Jellyfin (Settings → Quick Connect) and try again."
+    );
+  }
+
+  const { shareUid, secret } = storeCreateShare(auth.subsonicUsername, shareAuth.userId, shareAuth.accessToken, {
     entryIds,
     entryIdsFlat,
     description,
     expiresAt,
+    jellyfinDeviceId: shareAuth.deviceId,
+    jellyfinDeviceName: shareAuth.deviceName,
   });
 
   const baseUrl = (config.subfinPublicUrl || "http://localhost:4040").replace(/\/$/, "");

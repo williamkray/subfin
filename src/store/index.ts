@@ -44,6 +44,19 @@ function runSchema(database: Database.Database): void {
   const schemaPath = resolve(__dirname, "schema.sql");
   const sql = readFileSync(schemaPath, "utf-8");
   database.exec(sql);
+  // Migration: add Jellyfin device id/name for share (QC) devices so requests use the same device.
+  const info = database.prepare("PRAGMA table_info(linked_devices)").all() as { name: string }[];
+  const hasJellyfinDeviceId = info.some((c) => c.name === "jellyfin_device_id");
+  if (!hasJellyfinDeviceId) {
+    database.exec("ALTER TABLE linked_devices ADD COLUMN jellyfin_device_id TEXT");
+    database.exec("ALTER TABLE linked_devices ADD COLUMN jellyfin_device_name TEXT");
+  }
+  // Migration: store share secret encrypted so we can show full share URL in the web UI.
+  const sharesInfo = database.prepare("PRAGMA table_info(shares)").all() as { name: string }[];
+  const hasShareSecret = sharesInfo.some((c) => c.name === "share_secret_encrypted");
+  if (!hasShareSecret) {
+    database.exec("ALTER TABLE shares ADD COLUMN share_secret_encrypted BLOB");
+  }
 }
 
 interface LegacyLinkedDevice {
@@ -131,12 +144,16 @@ function generateAppPassword(): string {
   return s;
 }
 
-/** Add a linked device; returns the plain app password (show once). */
+/** Add a linked device; returns the plain app password (show once).
+ * When linking via Quick Connect, pass jellyfinDeviceId and jellyfinDeviceName so all Jellyfin
+ * requests use that device and it appears as a distinct device in the Jellyfin dashboard. */
 export function addLinkedDevice(
   subsonicUsername: string,
   jellyfinUserId: string,
   jellyfinAccessToken: string,
-  deviceLabel?: string
+  deviceLabel?: string,
+  jellyfinDeviceId?: string,
+  jellyfinDeviceName?: string
 ): string {
   const cfg = getConfig();
   const database = openDb();
@@ -147,10 +164,20 @@ export function addLinkedDevice(
   const created = new Date().toISOString();
   database
     .prepare(
-      `INSERT INTO linked_devices (subsonic_username, app_password_hash, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, device_label, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO linked_devices (subsonic_username, app_password_hash, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, device_label, jellyfin_device_id, jellyfin_device_name, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(subsonicUsername, hash, appEnc, jellyfinUserId, tokenEnc, deviceLabel ?? null, created);
+    .run(
+      subsonicUsername,
+      hash,
+      appEnc,
+      jellyfinUserId,
+      tokenEnc,
+      deviceLabel ?? null,
+      jellyfinDeviceId ?? null,
+      jellyfinDeviceName ?? null,
+      created
+    );
   return plainPassword;
 }
 
@@ -224,6 +251,39 @@ export function getJellyfinCredentialsForUser(
   return { jellyfinUserId: deviceRow.jellyfin_user_id, jellyfinAccessToken: token };
 }
 
+/** Get Jellyfin credentials best suited for "link another device" (Quick Connect authorize).
+ * Prefers the most recently linked device's token so each token is used for at most one
+ * QC authorize (Jellyfin may reject 401 after a token has authorized once or twice). */
+export function getJellyfinCredentialsForLinking(
+  subsonicUsername: string
+): { jellyfinUserId: string; jellyfinAccessToken: string } | null {
+  const database = openDb();
+  const cfg = getConfig();
+  // Use most recently linked device (fresh token not yet used for QC authorize).
+  const deviceRow = database
+    .prepare(
+      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM linked_devices WHERE subsonic_username = ? ORDER BY created_at DESC LIMIT 1"
+    )
+    .get(subsonicUsername) as
+    | { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer }
+    | undefined;
+  if (deviceRow) {
+    const token = decrypt(deviceRow.jellyfin_access_token_encrypted, cfg);
+    return { jellyfinUserId: deviceRow.jellyfin_user_id, jellyfinAccessToken: token };
+  }
+  // No linked devices yet (first device): use session from initial QC login.
+  const sessionRow = database
+    .prepare(
+      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM jellyfin_sessions WHERE subsonic_username = ?"
+    )
+    .get(subsonicUsername) as
+    | { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer }
+    | undefined;
+  if (!sessionRow) return null;
+  const token = decrypt(sessionRow.jellyfin_access_token_encrypted, cfg);
+  return { jellyfinUserId: sessionRow.jellyfin_user_id, jellyfinAccessToken: token };
+}
+
 /** Return the first linked device's Subsonic username, or null if none. Used by debug scripts to resolve credentials from the DB. */
 export function getFirstSubsonicUsername(): string | null {
   const database = openDb();
@@ -250,6 +310,22 @@ export function listLinkedDevices(
     device_label: r.device_label,
     created_at: r.created_at,
   }));
+}
+
+/** Get the Jellyfin access token for a single device (for logout-on-unlink). */
+export function getDeviceJellyfinToken(
+  deviceId: number,
+  subsonicUsername: string
+): string | null {
+  const database = openDb();
+  const row = database
+    .prepare(
+      "SELECT jellyfin_access_token_encrypted FROM linked_devices WHERE id = ? AND subsonic_username = ?"
+    )
+    .get(deviceId, subsonicUsername) as { jellyfin_access_token_encrypted: Buffer } | undefined;
+  if (!row) return null;
+  const cfg = getConfig();
+  return decrypt(row.jellyfin_access_token_encrypted, cfg);
 }
 
 /** Unlink a device by id. Returns true if deleted. */
@@ -478,7 +554,9 @@ export interface ShareRow {
   created_at: string;
 }
 
-/** Create a share: one linked device + one shares row. Returns shareUid and the app password (secret). */
+/** Create a share: one linked device + one shares row. Returns shareUid and the app password (secret).
+ * Pass jellyfinDeviceId and jellyfinDeviceName when the token was obtained via Quick Connect
+ * so the share's Jellyfin requests use that device (shows as distinct in Jellyfin dashboard). */
 export function createShare(
   subsonicUsername: string,
   jellyfinUserId: string,
@@ -488,13 +566,22 @@ export function createShare(
     entryIdsFlat: string[];
     description?: string | null;
     expiresAt?: number | null;
+    jellyfinDeviceId?: string;
+    jellyfinDeviceName?: string;
   }
 ): { shareUid: string; secret: string; linkedDeviceId: number } {
   const database = openDb();
   const shareUid = randomUUID();
   const description = opts.description?.trim() || null;
   const deviceLabel = description ? `SHARE: ${description}` : "SHARE: Share";
-  const secret = addLinkedDevice(subsonicUsername, jellyfinUserId, jellyfinAccessToken, deviceLabel);
+  const secret = addLinkedDevice(
+    subsonicUsername,
+    jellyfinUserId,
+    jellyfinAccessToken,
+    deviceLabel,
+    opts.jellyfinDeviceId,
+    opts.jellyfinDeviceName
+  );
   const deviceRow = database
     .prepare("SELECT id FROM linked_devices WHERE subsonic_username = ? ORDER BY id DESC LIMIT 1")
     .get(subsonicUsername) as { id: number } | undefined;
@@ -502,10 +589,12 @@ export function createShare(
   const linkedDeviceId = deviceRow.id;
   const expiresAt =
     opts.expiresAt != null && opts.expiresAt > 0 ? new Date(opts.expiresAt).toISOString() : null;
+  const cfg = getConfig();
+  const secretEnc = encrypt(secret, cfg);
   database
     .prepare(
-      `INSERT INTO shares (share_uid, linked_device_id, entry_ids, entry_ids_flat, description, expires_at, visit_count, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, 0, datetime('now'))`
+      `INSERT INTO shares (share_uid, linked_device_id, entry_ids, entry_ids_flat, description, expires_at, visit_count, created_at, share_secret_encrypted)
+       VALUES (?, ?, ?, ?, ?, ?, 0, datetime('now'), ?)`
     )
     .run(
       shareUid,
@@ -513,7 +602,8 @@ export function createShare(
       JSON.stringify(opts.entryIds),
       JSON.stringify(opts.entryIdsFlat),
       description,
-      expiresAt
+      expiresAt,
+      secretEnc
     );
   return { shareUid, secret, linkedDeviceId };
 }
@@ -532,17 +622,35 @@ export function getShareByUid(
   return row ?? null;
 }
 
-/** List shares owned by the given user. */
-export function getSharesForUser(subsonicUsername: string): ShareRow[] {
+export interface ShareWithUrl extends ShareRow {
+  fullUrl: string | null;
+}
+
+/** List shares owned by the given user. fullUrl is set when the share secret was stored (new shares). */
+export function getSharesForUser(subsonicUsername: string): ShareWithUrl[] {
   const database = openDb();
+  const cfg = getConfig();
+  const baseUrl = (cfg.subfinPublicUrl || `http://localhost:${cfg.port}`).replace(/\/$/, "");
   const rows = database
     .prepare(
-      `SELECT s.share_uid, s.linked_device_id, s.entry_ids, s.entry_ids_flat, s.description, s.expires_at, s.visit_count, s.created_at
+      `SELECT s.share_uid, s.linked_device_id, s.entry_ids, s.entry_ids_flat, s.description, s.expires_at, s.visit_count, s.created_at, s.share_secret_encrypted
        FROM shares s JOIN linked_devices d ON d.id = s.linked_device_id WHERE d.subsonic_username = ?
        ORDER BY s.created_at DESC`
     )
-    .all(subsonicUsername) as ShareRow[];
-  return rows;
+    .all(subsonicUsername) as (ShareRow & { share_secret_encrypted: Buffer | null })[];
+  return rows.map((r) => {
+    let fullUrl: string | null = null;
+    if (r.share_secret_encrypted) {
+      try {
+        const secret = decrypt(r.share_secret_encrypted, cfg);
+        fullUrl = `${baseUrl}/share/${r.share_uid}?secret=${encodeURIComponent(secret)}`;
+      } catch {
+        // ignore decryption failure
+      }
+    }
+    const { share_secret_encrypted: _, ...rest } = r;
+    return { ...rest, fullUrl };
+  });
 }
 
 /** Update share description and/or expiry. Returns true if updated. */
@@ -594,6 +702,8 @@ export function resolveShareAuth(
   allowedTrackIds: Set<string>;
   description: string | null;
   expiresAt: string | null;
+  jellyfinDeviceId?: string;
+  jellyfinDeviceName?: string;
 } | null {
   const share = getShareByUid(shareUid);
   if (!share) return null;
@@ -601,7 +711,7 @@ export function resolveShareAuth(
   const database = openDb();
   const deviceRow = database
     .prepare(
-      "SELECT app_password_hash, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted FROM linked_devices WHERE id = ?"
+      "SELECT app_password_hash, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, jellyfin_device_id, jellyfin_device_name FROM linked_devices WHERE id = ?"
     )
     .get(share.linked_device_id) as
     | {
@@ -609,6 +719,8 @@ export function resolveShareAuth(
         app_password_encrypted: Buffer;
         jellyfin_user_id: string;
         jellyfin_access_token_encrypted: Buffer;
+        jellyfin_device_id: string | null;
+        jellyfin_device_name: string | null;
       }
     | undefined;
   if (!deviceRow) return null;
@@ -631,6 +743,8 @@ export function resolveShareAuth(
     allowedTrackIds: new Set(allowedTrackIds),
     description: share.description,
     expiresAt: share.expires_at,
+    jellyfinDeviceId: deviceRow.jellyfin_device_id ?? undefined,
+    jellyfinDeviceName: deviceRow.jellyfin_device_name ?? undefined,
   };
 }
 
@@ -640,14 +754,25 @@ export function getShareAuthByUid(shareUid: string): {
   jellyfinUserId: string;
   jellyfinAccessToken: string;
   allowedTrackIds: Set<string>;
+  jellyfinDeviceId?: string;
+  jellyfinDeviceName?: string;
 } | null {
   const share = getShareByUid(shareUid);
   if (!share) return null;
   if (share.expires_at && new Date(share.expires_at) < new Date()) return null;
   const database = openDb();
   const deviceRow = database
-    .prepare("SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM linked_devices WHERE id = ?")
-    .get(share.linked_device_id) as { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer } | undefined;
+    .prepare(
+      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted, jellyfin_device_id, jellyfin_device_name FROM linked_devices WHERE id = ?"
+    )
+    .get(share.linked_device_id) as
+    | {
+        jellyfin_user_id: string;
+        jellyfin_access_token_encrypted: Buffer;
+        jellyfin_device_id: string | null;
+        jellyfin_device_name: string | null;
+      }
+    | undefined;
   if (!deviceRow) return null;
   const jellyfinAccessToken = decrypt(deviceRow.jellyfin_access_token_encrypted, getConfig());
   let allowedTrackIds: string[] = [];
@@ -662,6 +787,8 @@ export function getShareAuthByUid(shareUid: string): {
     jellyfinUserId: deviceRow.jellyfin_user_id,
     jellyfinAccessToken,
     allowedTrackIds: new Set(allowedTrackIds),
+    jellyfinDeviceId: deviceRow.jellyfin_device_id ?? undefined,
+    jellyfinDeviceName: deviceRow.jellyfin_device_name ?? undefined,
   };
 }
 

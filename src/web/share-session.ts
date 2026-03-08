@@ -80,6 +80,8 @@ export function resolveAuthFromShareCookie(req: Request): AuthResult | null {
     subsonicUsername: auth.subsonicUsername,
     jellyfinUserId: auth.jellyfinUserId,
     jellyfinAccessToken: auth.jellyfinAccessToken,
+    jellyfinDeviceId: auth.jellyfinDeviceId,
+    jellyfinDeviceName: auth.jellyfinDeviceName,
     shareId: session.shareUid,
     shareAllowedIds: auth.allowedTrackIds,
   };

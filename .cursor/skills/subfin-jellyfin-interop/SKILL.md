@@ -60,19 +60,9 @@ This skill records the main lessons learned while making Subfin work with Jellyf
 
 ### 1.3 Token invalidation behavior
 
-- Subfin currently invalidates all app-password mappings for a Jellyfin user when a backend request returns 401:
-
-  ```ts
-  if (err?.response?.status === 401) {
-    invalidateTokensForJellyfinUser(auth.jellyfinUserId);
-  }
-  ```
-
-- Before blaming auth loss on logic bugs, **first look for Jellyfin 401s**:
-  - Missing `Authorization` header on new endpoints (common bug).
-  - Expired / revoked Jellyfin tokens.
-
-When adding new Jellyfin calls, always confirm they are authenticated; otherwise you will trigger unnecessary token invalidation mid-session.
+- **Subfin does NOT invalidate tokens on Jellyfin 401.** The REST router explicitly avoids calling `invalidateTokensForJellyfinUser` on 401, because by the time we call Jellyfin, Subfin auth has already succeeded—a 401 is usually Jellyfin rejecting the request (e.g. forbidden for shared playlist), not “bad credentials”. Invalidating would wipe all linked devices for that user incorrectly. So do **not** add 401-triggered invalidation without an explicit product decision.
+- `invalidateTokensForJellyfinUser` exists in the store but is **never called** from any handler. If you need to revoke access, do it via the web UI (unlink device / reset app password).
+- Before blaming auth loss on logic bugs, **first look for Jellyfin 401s** and expired/revoked Jellyfin tokens. When adding new Jellyfin calls, always send the correct `Authorization` header so we don’t cause unnecessary 401s.
 
 ## 2. Streaming and media URLs
 
@@ -191,7 +181,7 @@ When something breaks (connection failure, crash, missing data):
 1. **Check Subfin logs**:
    - Look for `[REST]` lines to see which endpoint the client called.
    - Look for `[STREAM]`, `[STREAM_PROXY]`, `[STREAM_PROXY_BYTES]`, `[COVER]` for streaming/image issues.
-   - Look for backend 401s and associated `invalidateTokensForJellyfinUser` calls.
+   - Look for backend 401s (Subfin does not invalidate tokens on 401; see §1.3).
 2. **Check Jellyfin logs**:
    - `CustomAuthentication was challenged.` or 401s indicate missing/incorrect auth headers.
 3. **Check the client’s parser**:

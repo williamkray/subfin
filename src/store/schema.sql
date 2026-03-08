@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS linked_devices (
   jellyfin_user_id TEXT NOT NULL,
   jellyfin_access_token_encrypted BLOB NOT NULL,
   device_label TEXT,
+  jellyfin_device_id TEXT,
+  jellyfin_device_name TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
