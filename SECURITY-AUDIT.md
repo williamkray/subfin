@@ -1,8 +1,8 @@
 # Security Audit Report
 
 **Project:** Subfin  
-**Date:** 2026-03-06  
-**Scope:** Full codebase security review (including Web UI, SQLite store, and Subsonic REST)
+**Date:** 2026-03-09  
+**Scope:** Full codebase security review (including Web UI, SQLite store, and Subsonic REST; re-reviewed after recent album/lyrics/Instant Mix changes)
 
 ## Executive summary
 

@@ -712,15 +712,17 @@ export async function getRandomSongs(
     musicFolderId?: string;
     size?: number;
     offset?: number;
+    genre?: string;
   }
 ): Promise<BaseItemDto[]> {
   const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
-  const { musicFolderId, size, offset } = opts;
+  const { musicFolderId, size, offset, genre } = opts;
   const response = await itemsApi.getItems({
     includeItemTypes: [BaseItemKind.Audio],
     recursive: true,
     parentId: musicFolderId || undefined,
+    genres: genre ? [genre] : undefined,
     sortBy: ["Random"],
     sortOrder: ["Ascending"],
     limit: size ?? 50,

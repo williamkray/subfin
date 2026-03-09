@@ -369,6 +369,7 @@ export async function handleGetAlbumList(
           playCount: (a as { PlayCount?: number }).PlayCount ?? 0,
           year: a.ProductionYear ?? undefined,
           created: a.DateCreated ?? new Date(0).toISOString(),
+          genre: (a as { Genres?: string[] }).Genres?.[0] ?? undefined,
         };
       }),
     },
@@ -776,16 +777,18 @@ export async function handleGetRandomSongs(
 ): Promise<Record<string, unknown>> {
   const size = Number.parseInt(params.size ?? "50", 10) || 50;
   const offset = Number.parseInt(params.offset ?? "0", 10) || 0;
+  const genre = params.genre?.trim() || undefined;
 
   const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
   let songs: Awaited<ReturnType<typeof jf.getRandomSongs>>;
   if (folderIds === null) {
-    songs = await jf.getRandomSongs(toJellyfinContext(auth), { size, offset });
+    songs = await jf.getRandomSongs(toJellyfinContext(auth), { size, offset, genre });
   } else if (folderIds.length === 0) {
     songs = [];
   } else if (folderIds.length === 1) {
     songs = await jf.getRandomSongs(toJellyfinContext(auth), {
       musicFolderId: folderIds[0],
+      genre,
       size,
       offset,
     });
@@ -795,6 +798,7 @@ export async function handleGetRandomSongs(
       folderIds.map((musicFolderId) =>
         jf.getRandomSongs(toJellyfinContext(auth), {
           musicFolderId,
+          genre,
           size: needed,
           offset: 0,
         })

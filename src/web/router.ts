@@ -1329,12 +1329,32 @@ ${renderLayout(
           </div>
         </div>
         <div class="card-body">
-          <p>New app password for this device:</p>
-          <p><code>${escapeHtml(newPassword)}</code></p>
+          <p>Use these credentials in your Subsonic/OpenSubsonic client:</p>
+          <ul style="padding-left: 18px; margin: 8px 0;">
+            <li><strong>Username:</strong> ${escapeHtml(resolved.username)}</li>
+            <li>
+              <strong>Password (new app password):</strong>
+              <span class="actions-row" style="display:inline-flex; align-items:center; gap:8px;">
+                <code id="device-password-value">${escapeHtml(newPassword)}</code>
+                <button type="button" id="device-password-copy" class="btn-secondary btn-small">Copy</button>
+              </span>
+            </li>
+          </ul>
           <p class="tiny">
             Update your Subsonic/OpenSubsonic client with this password. The old app password no longer works.
+            Copy the password now; it will not be shown again.
           </p>
         </div>
+        <script>
+          document.getElementById('device-password-copy').addEventListener('click', function() {
+            var el = document.getElementById('device-password-value');
+            var t = el && el.textContent ? el.textContent.trim() : '';
+            if (t) navigator.clipboard.writeText(t).then(function() {
+              var btn = document.getElementById('device-password-copy');
+              if (btn) { btn.textContent = 'Copied'; setTimeout(function() { btn.textContent = 'Copy'; }, 1500); }
+            });
+          });
+        </script>
         <div class="actions-row">
           <a href="/devices"><button type="button" class="btn-secondary">Back to devices</button></a>
           <a href="/"><button type="button">Back to overview</button></a>

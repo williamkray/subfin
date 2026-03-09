@@ -136,13 +136,12 @@ Subfin exposes two lyrics endpoints:
 - **Starring & ratings**
   - `getStarred` / `getStarred2`: return starred artists, albums, and songs from Jellyfin (OpenSubsonic shape: `starred2.artist`, `starred2.album`, `starred2.song`).
   - `star` / `unstar`: mark or clear favorites in Jellyfin (supports id, albumId, artistId, idList).
-  - `setRating`: map Subsonic rating to Jellyfin like (4–5 like, 1–2 unlike, 3 clear).
+  - `setRating`: map Subsonic rating to Jellyfin like (4–5 like, 1–2 unlike, 3 clear). Jellyfin does not support 1–5 star ratings; “highest rated” album lists are based on likes/favorites rather than a continuous rating scale.
 
 ### Not implemented / TODO
 
 - Richer **artist/album metadata** (e.g. Last.fm links; biographies and similar artists already come from Jellyfin).
 - Playlist CRUD is implemented; remaining work is client testing and any Jellyfin permission edge cases.
-- **Album list types** for home screens: `getAlbumList` supports `random`, `newest`, **recent** (recently played), **frequent** (most played), **starred** (favorite albums), **highest** (highest rated, via Jellyfin Likes/IsFavoriteOrLikes), `alphabeticalByName`/`ByArtist`, `byGenre`, `byYear`.
 - Further **search / discovery** refinements (e.g. full filter semantics for `getRandomSongs`, multi-genre/year for `getSongsByGenre`).
 - **Scrobbling** refinement (e.g. pause/resume precision) and other write APIs (play queue save).
 - More complete **error handling and diagnostics** around Jellyfin failures and network issues.
@@ -194,15 +193,15 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 
 | Endpoint | Status | Jellyfin mapping | Notes |
 |---------|--------|------------------|-------|
-| `getAlbumList` | **Partially implemented** | `ItemsApi.getItems(MusicAlbum)` + Audio for recent/frequent; `/Users/{id}/Items` with Filters=IsFavoriteOrLikes for highest | Supports types: random, newest, **recent**, **frequent**, **starred**, **highest** (highest rated, via Jellyfin Likes/IsFavoriteOrLikes), alphabeticalByName/ByArtist, byGenre, byYear. |
-| `getAlbumList2` | **Partially implemented** | `ItemsApi.getItems(MusicAlbum)` | Reuses the same data as `getAlbumList` but returns it as `<albumList2>`; does not yet support full ID3-based semantics. |
-| `getRandomSongs` | **Partially implemented** | `ItemsApi.getItems(sortBy=Random, includeItemTypes=Audio)` | Returns random audio tracks via Jellyfin’s random sort; currently supports `size`, `offset`, and optional `musicFolderId` but ignores other filters (year, genre, etc.). |
+| `getAlbumList` | **Fully implemented** | `ItemsApi.getItems(MusicAlbum)` + Audio for recent/frequent; `/Users/{id}/Items` with Filters=IsFavoriteOrLikes for highest | Album/ID3-based album lists over Jellyfin libraries; supports types: random, newest, **recent**, **frequent**, **starred**, **highest** (based on likes/favorites), alphabeticalByName/ByArtist, byGenre, byYear. Jellyfin has no folder-based album lists or 1–5 star ratings, so legacy Subsonic folder semantics and rating-based ordering do not apply. |
+| `getAlbumList2` | **Fully implemented** | `ItemsApi.getItems(MusicAlbum)` | Same data as `getAlbumList`, exposed as both `<albumList>` and `<albumList2>` for compatibility. Additional folder-vs-ID3 distinctions from legacy Subsonic servers are out of scope because Jellyfin only exposes album/ID3-based libraries. |
+| `getRandomSongs` | **Partially implemented** | `ItemsApi.getItems(sortBy=Random, includeItemTypes=Audio)` | Returns random audio tracks via Jellyfin’s random sort; supports `size`, `offset`, optional `musicFolderId`, and `genre` (mapped to Jellyfin text genres); currently ignores year and other advanced filters. |
 | `getSongsByGenre` | **Partially implemented** | `ItemsApi.getItems(Audio, genres=...)` | Filters audio items by a single genre with paging; currently uses Jellyfin text genres and doesn’t yet implement multi-genre or year/artist scoping. |
 | `getNowPlaying` | **Partially implemented** | Jellyfin `SessionApi.getSessions` | Reads active Jellyfin sessions for the current user and exposes audio `NowPlayingItem`s as Subsonic `nowPlaying` entries; does not yet aggregate across all users or support rich player state, and play/pause is inferred from sparse Subsonic scrobbles so Jellyfin’s dashboard may slightly overestimate play time when clients are paused. |
 | `getStarred` / `getStarred2` | **Fully implemented** | `ItemsApi.getItems(isFavorite=true)` for MusicArtist, MusicAlbum, Audio | Returns starred artists, albums, and songs; response shape matches OpenSubsonic. Safe fallbacks for id/name/artist/created and album field (Youamp); full song fields (Musly). XML includes coverArt, albumCount, created, songCount. |
 | `star` / `unstar` / `setRating` | **Fully implemented** | Jellyfin `UserLibraryApi.markFavorite`, `unmarkFavorite`, `setUserLikeForItem` | Star/unstar mark items as favorite in Jellyfin (supports id, albumId, artistId, idList). setRating maps rating to Jellyfin like (4–5 like, 1–2 unlike, 3 clear). |
 | `getTopSongs` | **Partially implemented** | `ItemsApi.getItems(Audio, artistIds=..., sortBy=PlayCount)` | Returns top songs for a given artist by mapping the artist name to a Jellyfin `MusicArtist` and fetching that artist’s audio items sorted by play count; uses Jellyfin’s play statistics instead of external Last.fm data and may differ from Subsonic’s Last.fm-based rankings. |
-| `getSimilarSongs` / `getSimilarSongs2` | **Partially implemented** | Jellyfin `InstantMixApi.getInstantMixFromItem` | Instant mix / artist radio: accepts artist (`ar-*`), album (`al-*`), or song id and returns Jellyfin’s recommended similar songs (instant mix). |
+| `getSimilarSongs` / `getSimilarSongs2` | **Fully implemented** | Jellyfin `InstantMixApi` (artist/album/item instant mix) | Instant mix / artist radio backed by Jellyfin’s instant mix APIs (and any installed plugins). Accepts artist (`ar-*` or raw artist id), album (`al-*`), or song id and returns Jellyfin’s recommended similar songs. Subfin does not add extra recommendation logic beyond Jellyfin/Instant Mix; further behavior changes should be made in Jellyfin or its plugins, not in Subfin. |
 
 ### Search
 
