@@ -2,9 +2,12 @@
 
 OpenSubsonic-to-Jellyfin compatibility layer. Use Subsonic/Navidrome clients (DSub, substreamer, etc.) with your existing Jellyfin music library.
 
+>![NOTE]
+>This was written with AI in Cursor. If you don't like the future, don't use this. If you're ok with "AI Slop", give it a whirl. I am using it happily myself and have made every attempt to have it produce reasonably clean code without significant security issues. I did this because after all these years, nobody else did it, I have limited time and resources, and I just wanted something that would work. If you find something that can or should be fixed, PRs are very much welcome!
+
 ## How it works
 
-- **Subsonic clients** point at Subfin using **host and port** (e.g. `http://your-server:4040`). Clients know the Subsonic API path and add `/rest/` themselves.
+- **Subsonic clients** point at Subfin using **host and port** (e.g. `http://your-server:4040`).
 - You **link your Jellyfin account** via the Subfin web UI (Quick Connect). Subfin gives you an **app password** to use in the Subsonic client with your Jellyfin username. You can manage devices (rename, reset, unlink) and create or manage shared media (share links) from the web UI.
 - Subfin translates OpenSubsonic API calls into Jellyfin API calls and returns Subsonic-shaped responses; stream, download, cover art, and avatar are proxied from Jellyfin.
 
@@ -41,7 +44,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 | `SUBFIN_DB_PATH` | `./subfin.db` | Path for the SQLite database (tokens and app passwords, encrypted at rest). If a legacy `subfin.json` exists at the same path with `.json` extension, it is migrated once to SQLite and renamed to `subfin.json.migrated`. |
 | `SUBFIN_SALT` | *(required)* | Secret for DB encryption (see above). In config file: `"salt": "<base64 or hex>"`. |
 | `SUBFIN_LOG_REST` | (off) | Set to `true` or `1` to log each REST request (method and auth) for debugging clients. Do not enable in production; logs may contain tokens. |
-| `SUBFIN_PUBLIC_URL` | (empty) | Optional public URL of Subfin (e.g. `https://subfin.example.com`) for absolute image URLs in `getArtistInfo` / `getArtistInfo2` |
+| `SUBFIN_PUBLIC_URL` | (empty) | Optional public URL of Subfin (e.g. `https://subfin.example.com`) for absolute image URLs in `getArtistInfo` / `getArtistInfo2` and used when generating Share links. |
 | `SUBFIN_CONFIG` | `subfin.config.json` | Path to JSON config file (optional). All settings above can be in this file; env overrides. |
 
 ## Run
@@ -69,10 +72,6 @@ The container runs as a non-root user and expects writable `/data` for the store
 
 - **Subsonic clients:** Configure with base URL only, e.g. `http://localhost:4040` (no `/rest` path).
 - **Web UI:** `http://localhost:4040/` (link device, manage devices). REST API is at `/rest/` (e.g. `/rest/ping.view`).
-
-## Development and validation
-
-For any change to the API or Jellyfin integration, use the **development validation workflow**: (1) rebuild and run the local container with correct volumes/vars, (2) capture credentials from `data/`, (3) run client-mimic calls to local Subfin and capture responses, (4) verify against Jellyfin directly for content parity, (5) remediate and repeat until known clients would succeed and Subfin data matches Jellyfin. If credential validation fails, re-create credentials for the test account (e.g. re-link device in the web UI). Full commands and scripts: **`.local-testing/README.md`**. Canonical process: **`.cursor/skills/subfin-development-validation/SKILL.md`**.
 
 ## Web UI
 
