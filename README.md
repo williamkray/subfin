@@ -2,7 +2,7 @@
 
 OpenSubsonic-to-Jellyfin compatibility layer. Use Subsonic/Navidrome clients (DSub, substreamer, etc.) with your existing Jellyfin music library.
 
->![NOTE]
+>[!NOTE]
 >This was written with AI in Cursor. If you don't like the future, don't use this. If you're ok with "AI Slop", give it a whirl. I am using it happily myself and have made every attempt to have it produce reasonably clean code without significant security issues. I did this because after all these years, nobody else did it, I have limited time and resources, and I just wanted something that would work. If you find something that can or should be fixed, PRs are very much welcome!
 
 ## How it works
