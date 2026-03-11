@@ -1,12 +1,13 @@
 /**
  * OpenSubsonic response envelope and helpers.
  *
- * Note: We intentionally report a REST version below 1.14.0 so that
- * older Subsonic clients like DSub do not enable token (t/s) auth,
- * which we don't currently support.
+ * We report the latest recommended Subsonic REST version so that
+ * modern clients enable full OpenSubsonic features (including token
+ * (t/s) authentication) while still remaining compatible with older
+ * Subsonic-only clients.
  */
 
-export const VERSION = "1.13.0";
+export const VERSION = "1.16.1";
 
 export interface SubsonicError {
   code: number;
