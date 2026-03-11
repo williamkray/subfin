@@ -576,6 +576,27 @@ export async function getAlbumsForLibrary(
   return response.data?.Items ?? [];
 }
 
+/** Get the newest album's DateCreated (if any) for a library. Used as a coarse "last modified" signal for derived caches. */
+export async function getNewestAlbumDateCreated(
+  ctx: JellyfinContext,
+  opts: { musicFolderId?: string }
+): Promise<string | null> {
+  const api = getApi(ctx);
+  const itemsApi = getItemsApi(api);
+  const { musicFolderId } = opts;
+  const response = await itemsApi.getItems({
+    includeItemTypes: [BaseItemKind.MusicAlbum],
+    recursive: true,
+    parentId: musicFolderId || undefined,
+    sortBy: ["DateCreated"],
+    sortOrder: ["Descending"],
+    limit: 1,
+    startIndex: 0,
+  });
+  const item = response.data?.Items?.[0];
+  return (item as { DateCreated?: string } | undefined)?.DateCreated ?? null;
+}
+
 /** Get a single album by id. */
 export async function getAlbum(
   ctx: JellyfinContext,

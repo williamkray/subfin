@@ -59,3 +59,14 @@ CREATE TABLE IF NOT EXISTS shares (
   FOREIGN KEY (linked_device_id) REFERENCES linked_devices(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_shares_linked_device ON shares(linked_device_id);
+
+-- Cached derived views for performance (e.g. artist index built from Jellyfin albums).
+-- cache_key is an opaque string that encodes the parameters (user, folder set, view type).
+-- last_source_change_at tracks the backend library's last-modified signal (e.g. newest album date)
+-- observed when the cache was built; it can be used alongside TTL to decide when to refresh.
+CREATE TABLE IF NOT EXISTS derived_cache (
+  cache_key TEXT PRIMARY KEY,
+  value_json TEXT NOT NULL,
+  cached_at TEXT NOT NULL,
+  last_source_change_at TEXT
+);

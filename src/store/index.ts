@@ -57,6 +57,21 @@ function runSchema(database: Database.Database): void {
   if (!hasShareSecret) {
     database.exec("ALTER TABLE shares ADD COLUMN share_secret_encrypted BLOB");
   }
+
+  // Migration: add derived_cache table for cached artist indexes and other derived views.
+  const derivedInfo = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'derived_cache'").get() as
+    | { name: string }
+    | undefined;
+  if (!derivedInfo) {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS derived_cache (
+        cache_key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        cached_at TEXT NOT NULL,
+        last_source_change_at TEXT
+      );
+    `);
+  }
 }
 
 interface LegacyLinkedDevice {
@@ -133,6 +148,60 @@ export interface LinkedDevice {
   jellyfin_user_id: string;
   device_label: string | null;
   created_at: string;
+}
+
+export interface DerivedCacheEntry<T = unknown> {
+  cacheKey: string;
+  value: T;
+  cachedAt: string;
+  lastSourceChangeAt: string | null;
+}
+
+/** Read a derived cache entry by key. Returns parsed JSON or null on miss. */
+export function getDerivedCache<T = unknown>(cacheKey: string): DerivedCacheEntry<T> | null {
+  const database = openDb();
+  const row = database
+    .prepare(
+      "SELECT cache_key as cacheKey, value_json as valueJson, cached_at as cachedAt, last_source_change_at as lastSourceChangeAt FROM derived_cache WHERE cache_key = ?"
+    )
+    .get(cacheKey) as
+    | { cacheKey: string; valueJson: string; cachedAt: string; lastSourceChangeAt: string | null }
+    | undefined;
+  if (!row) return null;
+  let parsed: T;
+  try {
+    parsed = JSON.parse(row.valueJson) as T;
+  } catch {
+    // On parse failure, treat as cache miss so we can overwrite with a fresh value.
+    return null;
+  }
+  return {
+    cacheKey: row.cacheKey,
+    value: parsed,
+    cachedAt: row.cachedAt,
+    lastSourceChangeAt: row.lastSourceChangeAt,
+  };
+}
+
+/** Upsert a derived cache entry. value is JSON-serialized. */
+export function setDerivedCache<T = unknown>(
+  cacheKey: string,
+  value: T,
+  lastSourceChangeAt: string | null
+): void {
+  const database = openDb();
+  const now = new Date().toISOString();
+  const valueJson = JSON.stringify(value);
+  database
+    .prepare(
+      `INSERT INTO derived_cache (cache_key, value_json, cached_at, last_source_change_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(cache_key) DO UPDATE SET
+         value_json = excluded.value_json,
+         cached_at = excluded.cached_at,
+         last_source_change_at = excluded.last_source_change_at`
+    )
+    .run(cacheKey, valueJson, now, lastSourceChangeAt);
 }
 
 function generateAppPassword(): string {

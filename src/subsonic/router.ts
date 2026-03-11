@@ -57,6 +57,8 @@ const HANDLERS: Record<
   deleteplaylist: async (auth, params) => handlers.handleDeletePlaylist(auth, params),
   getartistinfo: async (auth, params) => handlers.handleGetArtistInfo(auth, params),
   getartistinfo2: async (auth, params) => handlers.handleGetArtistInfo2(auth, params),
+  getalbuminfo: async (auth, params) => handlers.handleGetAlbumInfo(auth, params),
+  getalbuminfo2: async (auth, params) => handlers.handleGetAlbumInfo2(auth, params),
   getstarred: async (auth, params) => handlers.handleGetStarred(auth, params),
   getstarred2: async (auth, params) => handlers.handleGetStarred2(auth, params),
   scrobble: async (auth, params) => handlers.handleScrobble(auth, params),

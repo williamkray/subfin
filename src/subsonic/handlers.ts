@@ -1,6 +1,7 @@
 /**
  * OpenSubsonic method handlers. Each receives auth result and query params, returns Subsonic-shaped payload or throws.
  */
+import type { BaseItemDto } from "@jellyfin/sdk/lib/generated-client/models/base-item-dto.js";
 import * as jf from "../jellyfin/client.js";
 import { config } from "../config.js";
 import {
@@ -12,6 +13,8 @@ import {
   getSharesForUser,
   updateShare as storeUpdateShare,
   deleteShare as storeDeleteShare,
+  getDerivedCache,
+  setDerivedCache,
 } from "../store/index.js";
 import {
   stripSubsonicIdPrefix,
@@ -32,6 +35,78 @@ async function getEffectiveMusicFolderIds(
   const trimmed = clientMusicFolderId?.trim();
   if (trimmed) return [trimmed];
   return jf.getAllowedMusicFolderIds(toJellyfinContext(auth), auth.jellyfinUserId);
+}
+
+/** Build a de-duplicated list of album artists for the given music folders using album-level primary artist ids. */
+async function getAlbumArtistsForFolders(
+  auth: AuthResult,
+  folderIds: string[] | null
+): Promise<BaseItemDto[]> {
+  // When there are no allowed folders, return an empty list immediately.
+  if (Array.isArray(folderIds) && folderIds.length === 0) {
+    return [];
+  }
+
+  const ctx = toJellyfinContext(auth);
+  const byArtist = new Map<string, { Id: string; Name: string; AlbumCount: number }>();
+  const pageSize = 200;
+
+  const accumulateFromFolder = async (musicFolderId: string | undefined) => {
+    let offset = 0;
+    for (;;) {
+      const page = await jf.getAlbumsForLibrary(ctx, {
+        userId: auth.jellyfinUserId,
+        musicFolderId,
+        type: "alphabeticalByArtist",
+        size: pageSize,
+        offset,
+      });
+      if (page.length === 0) break;
+      for (const album of page) {
+        const primaryArtistId = resolvePrimaryArtistIdForAlbum(album);
+        if (!primaryArtistId) continue;
+        const artistName =
+          (album as Record<string, string | undefined>).AlbumArtist ??
+          (album.Artists && album.Artists[0]) ??
+          "";
+        if (!artistName) continue;
+        const key = artistName.trim().toLowerCase();
+        const existing = byArtist.get(key);
+        if (existing) {
+          existing.AlbumCount += 1;
+        } else {
+          byArtist.set(key, {
+            Id: primaryArtistId,
+            Name: artistName,
+            AlbumCount: 1,
+          });
+        }
+      }
+      if (page.length < pageSize) break;
+      offset += pageSize;
+    }
+  };
+
+  if (folderIds === null) {
+    await accumulateFromFolder(undefined);
+  } else {
+    for (const id of folderIds) {
+      await accumulateFromFolder(id);
+    }
+  }
+
+  return Array.from(byArtist.values()).map(
+    (a) =>
+      ({
+        Id: a.Id,
+        Name: a.Name,
+        AlbumCount: a.AlbumCount,
+      } as BaseItemDto)
+  );
+}
+
+interface CachedArtistIndexPayload {
+  artists: { Id?: string; Name?: string; AlbumCount?: number }[];
 }
 
 export async function handlePing(): Promise<Record<string, unknown>> {
@@ -74,21 +149,61 @@ export async function handleGetArtists(
   params: Record<string, string>
 ): Promise<Record<string, unknown>> {
   const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
-  let artists: Awaited<ReturnType<typeof jf.getArtists>>;
+  const ctx = toJellyfinContext(auth);
+
+  // Build a stable cache key from user + effective folder set.
+  const folderPart =
+    folderIds === null ? "all" : folderIds.length === 0 ? "none" : folderIds.slice().sort().join(",");
+  const cacheKey = `artistIndex:${auth.jellyfinUserId}:${folderPart}`;
+  const ttlMs = 15 * 60 * 1000; // 15 minutes
+
+  // Cheap probe: newest album timestamp used as a coarse "library changed" signal.
+  const newestPerFolder: (string | null)[] = [];
   if (folderIds === null) {
-    artists = await jf.getArtists(toJellyfinContext(auth), undefined);
-  } else if (folderIds.length === 0) {
-    artists = [];
-  } else if (folderIds.length === 1) {
-    artists = await jf.getArtists(toJellyfinContext(auth), folderIds[0]);
-  } else {
-    const results = await Promise.all(
-      folderIds.map((id) => jf.getArtists(toJellyfinContext(auth), id))
-    );
-    const byId = new Map<string, Awaited<ReturnType<typeof jf.getArtists>>[number]>();
-    for (const list of results) for (const a of list) if (a.Id) byId.set(a.Id, a);
-    artists = Array.from(byId.values());
+    newestPerFolder.push(await jf.getNewestAlbumDateCreated(ctx, { musicFolderId: undefined }));
+  } else if (folderIds.length > 0) {
+    for (const id of folderIds) {
+      newestPerFolder.push(await jf.getNewestAlbumDateCreated(ctx, { musicFolderId: id }));
+    }
   }
+  const latestAlbumDate =
+    newestPerFolder
+      .filter((d): d is string => !!d)
+      .sort()
+      .slice(-1)[0] ?? null;
+
+  const existing = getDerivedCache<CachedArtistIndexPayload>(cacheKey);
+  if (existing && existing.value && existing.cachedAt) {
+    const ageMs = Date.now() - new Date(existing.cachedAt).getTime();
+    const sourceUnchanged =
+      !latestAlbumDate || existing.lastSourceChangeAt === latestAlbumDate || !existing.lastSourceChangeAt;
+    if (ageMs < ttlMs && sourceUnchanged) {
+      const cachedArtists = (existing.value.artists ?? []).map((a) => {
+        const name = a.Name ?? "";
+        return {
+          Id: a.Id,
+          Name: name,
+          AlbumCount: a.AlbumCount ?? 0,
+        } as BaseItemDto;
+      });
+      return {
+        artists: toSubsonicArtistsIndex(cachedArtists),
+      };
+    }
+  }
+
+  const artists = await getAlbumArtistsForFolders(auth, folderIds);
+  setDerivedCache<CachedArtistIndexPayload>(
+    cacheKey,
+    {
+      artists: artists.map((a) => ({
+        Id: a.Id,
+        Name: a.Name ?? "",
+        AlbumCount: (a as any).AlbumCount ?? 0,
+      })),
+    },
+    latestAlbumDate
+  );
   return {
     artists: toSubsonicArtistsIndex(artists),
   };
@@ -100,21 +215,7 @@ export async function handleGetIndexes(
   params: Record<string, string>
 ): Promise<Record<string, unknown>> {
   const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
-  let artists: Awaited<ReturnType<typeof jf.getArtists>>;
-  if (folderIds === null) {
-    artists = await jf.getArtists(toJellyfinContext(auth), undefined);
-  } else if (folderIds.length === 0) {
-    artists = [];
-  } else if (folderIds.length === 1) {
-    artists = await jf.getArtists(toJellyfinContext(auth), folderIds[0]);
-  } else {
-    const results = await Promise.all(
-      folderIds.map((id) => jf.getArtists(toJellyfinContext(auth), id))
-    );
-    const byId = new Map<string, Awaited<ReturnType<typeof jf.getArtists>>[number]>();
-    for (const list of results) for (const a of list) if (a.Id) byId.set(a.Id, a);
-    artists = Array.from(byId.values());
-  }
+  const artists = await getAlbumArtistsForFolders(auth, folderIds);
   const idx = toSubsonicArtistsIndex(artists);
   return {
     indexes: {
@@ -703,6 +804,68 @@ export async function handleGetArtistInfo2(
 ): Promise<Record<string, unknown>> {
   const res = await handleGetArtistInfo(auth, params);
   return { artistInfo2: res.artistInfo };
+}
+
+/** getAlbumInfo: album notes and artwork from Jellyfin. id can be album (al-*), or song; we resolve to album. */
+export async function handleGetAlbumInfo(
+  auth: AuthResult,
+  params: Record<string, string>
+): Promise<Record<string, unknown>> {
+  const id = params.id?.trim();
+  if (!id) throw new Error("Missing id");
+  const cleanId = stripSubsonicIdPrefix(id);
+  const ctx = toJellyfinContext(auth);
+
+  // Resolve to album id if id is song or other item.
+  let albumId: string | null = /^al-/i.test(id) ? cleanId : null;
+  if (!albumId) {
+    const item = await jf.getItemById(ctx, cleanId);
+    const type = (item as { Type?: string } | null)?.Type;
+    if (type === "MusicAlbum") {
+      albumId = cleanId;
+    } else if (type === "Audio") {
+      const anyItem = item as { AlbumId?: string; ParentId?: string } | null;
+      albumId = anyItem?.AlbumId ?? anyItem?.ParentId ?? cleanId;
+    } else {
+      albumId = cleanId;
+    }
+  }
+
+  const album = await jf.getAlbum(ctx, albumId);
+  if (!album) throw new Error("NotFound");
+
+  const baseUrl = config.subfinPublicUrl;
+  const coverId = "al-" + (album.Id ?? albumId);
+  const imageUrl = (size?: number) =>
+    baseUrl ? `${baseUrl}/rest/getCoverArt?id=${encodeURIComponent(coverId)}${size ? `&size=${size}` : ""}` : undefined;
+
+  const anyAlbum = album as {
+    Overview?: string;
+    ProviderIds?: { MusicBrainzReleaseGroup?: string; MusicBrainzAlbum?: string; MusicBrainz?: string };
+  } | null;
+  const notes = anyAlbum?.Overview?.trim() ?? "";
+  const providerIds = anyAlbum?.ProviderIds;
+  const musicBrainzId =
+    providerIds?.MusicBrainzReleaseGroup ?? providerIds?.MusicBrainzAlbum ?? providerIds?.MusicBrainz ?? "";
+
+  return {
+    albumInfo: {
+      notes,
+      musicBrainzId,
+      lastFmUrl: "",
+      smallImageUrl: imageUrl(34),
+      mediumImageUrl: imageUrl(64),
+      largeImageUrl: imageUrl(174) ?? imageUrl(300),
+    },
+  };
+}
+
+/** getAlbumInfo2: ID3-based album info; for Jellyfin we treat it the same as getAlbumInfo and return albumInfo per spec. */
+export async function handleGetAlbumInfo2(
+  auth: AuthResult,
+  params: Record<string, string>
+): Promise<Record<string, unknown>> {
+  return handleGetAlbumInfo(auth, params);
 }
 
 /** getStarred / getStarred2: favorites backed by Jellyfin user favorites (artists, albums, songs). */
