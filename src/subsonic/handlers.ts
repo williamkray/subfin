@@ -1,3 +1,63 @@
+/** Get or build the album-derived artist index for the given effective folder ids, using derived_cache to avoid
+ * repeatedly walking Jellyfin libraries. */
+async function getOrBuildArtistIndex(
+  auth: AuthResult,
+  folderIds: string[] | null
+): Promise<BaseItemDto[]> {
+  const ctx = toJellyfinContext(auth);
+
+  // Build a stable cache key from user + effective folder set.
+  const folderPart =
+    folderIds === null ? "all" : folderIds.length === 0 ? "none" : folderIds.slice().sort().join(",");
+  const cacheKey = `artistIndex:${auth.jellyfinUserId}:${folderPart}`;
+  const ttlMs = 15 * 60 * 1000; // 15 minutes
+
+  // Cheap probe: newest album timestamp used as a coarse "library changed" signal.
+  const newestPerFolder: (string | null)[] = [];
+  if (folderIds === null) {
+    newestPerFolder.push(await jf.getNewestAlbumDateCreated(ctx, { musicFolderId: undefined }));
+  } else if (folderIds.length > 0) {
+    for (const id of folderIds) {
+      newestPerFolder.push(await jf.getNewestAlbumDateCreated(ctx, { musicFolderId: id }));
+    }
+  }
+  const latestAlbumDate =
+    newestPerFolder
+      .filter((d): d is string => !!d)
+      .sort()
+      .slice(-1)[0] ?? null;
+
+  const existing = getDerivedCache<CachedArtistIndexPayload>(cacheKey);
+  if (existing && existing.value && existing.cachedAt) {
+    const ageMs = Date.now() - new Date(existing.cachedAt).getTime();
+    const sourceUnchanged =
+      !latestAlbumDate || existing.lastSourceChangeAt === latestAlbumDate || !existing.lastSourceChangeAt;
+    if (ageMs < ttlMs && sourceUnchanged) {
+      return (existing.value.artists ?? []).map((a) => {
+        const name = a.Name ?? "";
+        return {
+          Id: a.Id,
+          Name: name,
+          AlbumCount: a.AlbumCount ?? 0,
+        } as BaseItemDto;
+      });
+    }
+  }
+
+  const artists = await getAlbumArtistsForFolders(auth, folderIds);
+  setDerivedCache<CachedArtistIndexPayload>(
+    cacheKey,
+    {
+      artists: artists.map((a) => ({
+        Id: a.Id,
+        Name: a.Name ?? "",
+        AlbumCount: (a as any).AlbumCount ?? 0,
+      })),
+    },
+    latestAlbumDate
+  );
+  return artists;
+}
 /**
  * OpenSubsonic method handlers. Each receives auth result and query params, returns Subsonic-shaped payload or throws.
  */
@@ -38,6 +98,15 @@ async function getEffectiveMusicFolderIds(
   return jf.getAllowedMusicFolderIds(toJellyfinContext(auth), auth.jellyfinUserId);
 }
 
+/** Normalize artist name for deduplication/lookup: lowercase + strip spaces and common punctuation. */
+function canonicalArtistKey(name: string | null | undefined): string {
+  if (!name) return "";
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/[\s._/*'"-]+/g, "");
+}
+
 /** Build a de-duplicated list of album artists for the given music folders using album-level primary artist ids. */
 async function getAlbumArtistsForFolders(
   auth: AuthResult,
@@ -71,7 +140,8 @@ async function getAlbumArtistsForFolders(
           (album.Artists && album.Artists[0]) ??
           "";
         if (!artistName) continue;
-        const key = artistName.trim().toLowerCase();
+        const key = canonicalArtistKey(artistName);
+        if (!key) continue;
         const existing = byArtist.get(key);
         if (existing) {
           existing.AlbumCount += 1;
@@ -150,61 +220,7 @@ export async function handleGetArtists(
   params: Record<string, string>
 ): Promise<Record<string, unknown>> {
   const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
-  const ctx = toJellyfinContext(auth);
-
-  // Build a stable cache key from user + effective folder set.
-  const folderPart =
-    folderIds === null ? "all" : folderIds.length === 0 ? "none" : folderIds.slice().sort().join(",");
-  const cacheKey = `artistIndex:${auth.jellyfinUserId}:${folderPart}`;
-  const ttlMs = 15 * 60 * 1000; // 15 minutes
-
-  // Cheap probe: newest album timestamp used as a coarse "library changed" signal.
-  const newestPerFolder: (string | null)[] = [];
-  if (folderIds === null) {
-    newestPerFolder.push(await jf.getNewestAlbumDateCreated(ctx, { musicFolderId: undefined }));
-  } else if (folderIds.length > 0) {
-    for (const id of folderIds) {
-      newestPerFolder.push(await jf.getNewestAlbumDateCreated(ctx, { musicFolderId: id }));
-    }
-  }
-  const latestAlbumDate =
-    newestPerFolder
-      .filter((d): d is string => !!d)
-      .sort()
-      .slice(-1)[0] ?? null;
-
-  const existing = getDerivedCache<CachedArtistIndexPayload>(cacheKey);
-  if (existing && existing.value && existing.cachedAt) {
-    const ageMs = Date.now() - new Date(existing.cachedAt).getTime();
-    const sourceUnchanged =
-      !latestAlbumDate || existing.lastSourceChangeAt === latestAlbumDate || !existing.lastSourceChangeAt;
-    if (ageMs < ttlMs && sourceUnchanged) {
-      const cachedArtists = (existing.value.artists ?? []).map((a) => {
-        const name = a.Name ?? "";
-        return {
-          Id: a.Id,
-          Name: name,
-          AlbumCount: a.AlbumCount ?? 0,
-        } as BaseItemDto;
-      });
-      return {
-        artists: toSubsonicArtistsIndex(cachedArtists),
-      };
-    }
-  }
-
-  const artists = await getAlbumArtistsForFolders(auth, folderIds);
-  setDerivedCache<CachedArtistIndexPayload>(
-    cacheKey,
-    {
-      artists: artists.map((a) => ({
-        Id: a.Id,
-        Name: a.Name ?? "",
-        AlbumCount: (a as any).AlbumCount ?? 0,
-      })),
-    },
-    latestAlbumDate
-  );
+  const artists = await getOrBuildArtistIndex(auth, folderIds);
   return {
     artists: toSubsonicArtistsIndex(artists),
   };
@@ -237,10 +253,24 @@ export async function handleGetArtist(
   if (config.logRest) {
     console.log("[ARTIST] getArtist params: id=%s cleanId=%s", id, cleanId);
   }
-  const [artist, albums] = await Promise.all([
-    jf.getArtist(toJellyfinContext(auth), cleanId),
-    jf.getAlbumsByArtist(toJellyfinContext(auth), cleanId),
-  ]);
+  const ctx = toJellyfinContext(auth);
+  const folderIds = await jf.getAllowedMusicFolderIds(ctx, auth.jellyfinUserId);
+  let albums: Awaited<ReturnType<typeof jf.getAlbumsByArtist>> = [];
+  if (folderIds === null) {
+    albums = await jf.getAlbumsByArtist(ctx, cleanId, undefined);
+  } else if (folderIds.length === 0) {
+    albums = [];
+  } else if (folderIds.length === 1) {
+    albums = await jf.getAlbumsByArtist(ctx, cleanId, folderIds[0]);
+  } else {
+    const results = await Promise.all(
+      folderIds.map((musicFolderId) => jf.getAlbumsByArtist(ctx, cleanId, musicFolderId))
+    );
+    const byId = new Map<string, Awaited<ReturnType<typeof jf.getAlbumsByArtist>>[number]>();
+    for (const list of results) for (const a of list) if (a.Id) byId.set(a.Id, a);
+    albums = Array.from(byId.values());
+  }
+  const artist = await jf.getArtist(ctx, cleanId);
   if (!artist) throw new Error("NotFound");
   const payload = {
     artist: toSubsonicArtistWithAlbums(artist, albums),
@@ -807,6 +837,25 @@ export async function handleGetArtistInfo(
   if (!biography) {
     biography = "No biography is available for this artist.";
   }
+
+  // Normalize similar artist display names using the same album-derived artist index used by getArtists/search3,
+  // so clients see consistent names (including special characters) across views. Reuse cached index where possible.
+  const folderIdsForIndex = await getEffectiveMusicFolderIds(auth, undefined);
+  const albumArtists = await getOrBuildArtistIndex(auth, folderIdsForIndex);
+  const canonicalById = new Map<string, string>();
+  const canonicalByKey = new Map<string, string>();
+  for (const a of albumArtists) {
+    if (a.Id && a.Name) {
+      const id = String(a.Id);
+      const name = a.Name;
+      canonicalById.set(id, name);
+      const key = canonicalArtistKey(name);
+      if (key && !canonicalByKey.has(key)) {
+        canonicalByKey.set(key, name);
+      }
+    }
+  }
+
   return {
     artistInfo: {
       name: artistName,
@@ -818,7 +867,14 @@ export async function handleGetArtistInfo(
       largeImageUrl: imageUrl(174) ?? imageUrl(300),
       similarArtist: similar.map((a) => ({
         id: a.Id ? "ar-" + a.Id : undefined,
-        name: a.Name ?? "",
+        name: (() => {
+          const rawName = a.Name ?? "";
+          const fromId = a.Id ? canonicalById.get(a.Id) : undefined;
+          if (fromId) return fromId;
+          const key = canonicalArtistKey(rawName);
+          const fromKey = key ? canonicalByKey.get(key) : undefined;
+          return fromKey ?? rawName;
+        })(),
         coverArt: a.Id ? "ar-" + a.Id : undefined,
       })),
     },
@@ -1500,25 +1556,113 @@ export async function handleSearch3(
   const albumOffset = Number.parseInt(params.albumOffset ?? "0", 10) || 0;
   const songCount = Number.parseInt(params.songCount ?? "50", 10) || 50;
   const songOffset = Number.parseInt(params.songOffset ?? "0", 10) || 0;
-  const musicFolderId = params.musicFolderId?.trim() || undefined;
+  const ctx = toJellyfinContext(auth);
+  const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
 
-  const [artists, albums, songs] = await Promise.all([
-    jf.searchArtists(toJellyfinContext(auth), query, {
-      size: artistCount,
-      offset: artistOffset,
-      musicFolderId,
-    }),
-    jf.searchAlbums(toJellyfinContext(auth), query, {
-      size: albumCount,
-      offset: albumOffset,
-      musicFolderId,
-    }),
-    jf.searchSongs(toJellyfinContext(auth), query, {
-      size: songCount,
-      offset: songOffset,
-      musicFolderId,
-    }),
+  async function searchArtistsScoped(): Promise<Awaited<ReturnType<typeof jf.searchArtists>>> {
+    if (folderIds === null) {
+      return jf.searchArtists(ctx, query, {
+        size: artistCount,
+        offset: artistOffset,
+        musicFolderId: undefined,
+      });
+    }
+    if (folderIds.length === 0) return [];
+    if (folderIds.length === 1) {
+      return jf.searchArtists(ctx, query, {
+        size: artistCount,
+        offset: artistOffset,
+        musicFolderId: folderIds[0],
+      });
+    }
+    const needed = artistOffset + artistCount;
+    const results = await Promise.all(
+      folderIds.map((musicFolderId) =>
+        jf.searchArtists(ctx, query, {
+          size: needed,
+          offset: 0,
+          musicFolderId,
+        })
+      )
+    );
+    const byId = new Map<string, Awaited<ReturnType<typeof jf.searchArtists>>[number]>();
+    for (const list of results) for (const a of list) if (a.Id) byId.set(a.Id, a);
+    return Array.from(byId.values()).slice(artistOffset, artistOffset + artistCount);
+  }
+
+  async function searchAlbumsScoped(): Promise<Awaited<ReturnType<typeof jf.searchAlbums>>> {
+    if (folderIds === null) {
+      return jf.searchAlbums(ctx, query, {
+        size: albumCount,
+        offset: albumOffset,
+        musicFolderId: undefined,
+      });
+    }
+    if (folderIds.length === 0) return [];
+    if (folderIds.length === 1) {
+      return jf.searchAlbums(ctx, query, {
+        size: albumCount,
+        offset: albumOffset,
+        musicFolderId: folderIds[0],
+      });
+    }
+    const needed = albumOffset + albumCount;
+    const results = await Promise.all(
+      folderIds.map((musicFolderId) =>
+        jf.searchAlbums(ctx, query, {
+          size: needed,
+          offset: 0,
+          musicFolderId,
+        })
+      )
+    );
+    const byId = new Map<string, Awaited<ReturnType<typeof jf.searchAlbums>>[number]>();
+    for (const list of results) for (const a of list) if (a.Id) byId.set(a.Id, a);
+    return Array.from(byId.values()).slice(albumOffset, albumOffset + albumCount);
+  }
+
+  async function searchSongsScoped(): Promise<Awaited<ReturnType<typeof jf.searchSongs>>> {
+    if (folderIds === null) {
+      return jf.searchSongs(ctx, query, {
+        size: songCount,
+        offset: songOffset,
+        musicFolderId: undefined,
+      });
+    }
+    if (folderIds.length === 0) return [];
+    if (folderIds.length === 1) {
+      return jf.searchSongs(ctx, query, {
+        size: songCount,
+        offset: songOffset,
+        musicFolderId: folderIds[0],
+      });
+    }
+    const needed = songOffset + songCount;
+    const results = await Promise.all(
+      folderIds.map((musicFolderId) =>
+        jf.searchSongs(ctx, query, {
+          size: needed,
+          offset: 0,
+          musicFolderId,
+        })
+      )
+    );
+    const byId = new Map<string, Awaited<ReturnType<typeof jf.searchSongs>>[number]>();
+    for (const list of results) for (const s of list) if (s.Id) byId.set(s.Id, s);
+    return Array.from(byId.values()).slice(songOffset, songOffset + songCount);
+  }
+
+  const [albums, songs] = await Promise.all([
+    searchAlbumsScoped(),
+    searchSongsScoped(),
   ]);
+
+  // For artists, reuse the same album-derived artist index we use in getArtists so
+  // names and ids are consistent (including special characters) and respect library scoping.
+  const allArtists = await getOrBuildArtistIndex(auth, folderIds);
+  const qLower = query.toLowerCase();
+  const matchingArtists = allArtists.filter((a) => (a.Name ?? "").toLowerCase().includes(qLower));
+  const artists = matchingArtists.slice(artistOffset, artistOffset + artistCount);
 
   return {
     searchResult3: {

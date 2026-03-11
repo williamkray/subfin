@@ -292,20 +292,25 @@ export async function getSimilarArtists(
   }
 }
 
-/** Get albums for an artist (parentId = artist id). */
+/** Get albums for an artist. Prefer explicit artist/albumArtist filters over parentId so it works across different library layouts. Optionally scope to a single music library (parentId). */
 export async function getAlbumsByArtist(
   ctx: JellyfinContext,
-  artistId: string
+  artistId: string,
+  musicFolderId?: string
 ): Promise<BaseItemDto[]> {
   const api = getApi(ctx);
   const itemsApi = getItemsApi(api);
   if (config.logRest) {
-    console.log("[JF] getAlbumsByArtist request parentId=%s", artistId);
+    console.log("[JF] getAlbumsByArtist request artistId=%s musicFolderId=%s", artistId, musicFolderId ?? "");
   }
   const response = await itemsApi.getItems({
-    parentId: artistId,
     includeItemTypes: [BaseItemKind.MusicAlbum],
-    recursive: false,
+    recursive: true,
+    // Filter by artist/albumArtist so we find albums even when they are not direct children
+    // of the artist item in the library hierarchy.
+    artistIds: [artistId],
+    albumArtistIds: [artistId],
+    parentId: musicFolderId || undefined,
     sortBy: ["SortName"],
     sortOrder: ["Ascending"],
   });

@@ -491,6 +491,31 @@ export function setPendingQuickConnect(
   const database = openDb();
   const enc = encrypt(jellyfinAccessToken, cfg);
   const created = new Date().toISOString();
+  // Enforce TTL and a maximum number of pending entries per Jellyfin user to avoid unbounded growth.
+  const ttlMs = 10 * 60 * 1000; // 10 minutes
+  const cutoff = new Date(Date.now() - ttlMs).toISOString();
+  // Delete all expired entries for this user.
+  database
+    .prepare(
+      "DELETE FROM pending_quickconnect WHERE jellyfin_user_id = ? AND created_at < ?"
+    )
+    .run(jellyfinUserId, cutoff);
+  // If still too many non-expired entries, delete oldest until under limit.
+  const maxPendingPerUser = 50;
+  const rows = database
+    .prepare(
+      "SELECT secret FROM pending_quickconnect WHERE jellyfin_user_id = ? ORDER BY created_at ASC"
+    )
+    .all(jellyfinUserId) as { secret: string }[];
+  if (rows.length >= maxPendingPerUser) {
+    const toDelete = rows.length - maxPendingPerUser + 1;
+    const secretsToDelete = rows.slice(0, toDelete).map((r) => r.secret);
+    const stmt = database.prepare("DELETE FROM pending_quickconnect WHERE secret = ?");
+    const tx = database.transaction((list: string[]) => {
+      for (const s of list) stmt.run(s);
+    });
+    tx(secretsToDelete);
+  }
   database
     .prepare(
       "INSERT OR REPLACE INTO pending_quickconnect (secret, jellyfin_user_id, jellyfin_access_token_encrypted, created_at) VALUES (?, ?, ?, ?)"
@@ -503,10 +528,18 @@ export function consumePendingQuickConnect(
   secret: string
 ): { jellyfinUserId: string; jellyfinAccessToken: string } | null {
   const database = openDb();
+  const ttlMs = 10 * 60 * 1000; // 10 minutes
+  const cutoff = new Date(Date.now() - ttlMs).toISOString();
   const row = database
-    .prepare("SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM pending_quickconnect WHERE secret = ?")
-    .get(secret) as { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer } | undefined;
-  if (!row) return null;
+    .prepare(
+      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted, created_at FROM pending_quickconnect WHERE secret = ?"
+    )
+    .get(secret) as { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer; created_at: string } | undefined;
+  if (!row || row.created_at < cutoff) {
+    // Expired or missing: ensure it's removed and treat as not found.
+    database.prepare("DELETE FROM pending_quickconnect WHERE secret = ?").run(secret);
+    return null;
+  }
   database.prepare("DELETE FROM pending_quickconnect WHERE secret = ?").run(secret);
   const cfg = getConfig();
   const token = decrypt(row.jellyfin_access_token_encrypted, cfg);
@@ -700,6 +733,21 @@ export function getSharesForUser(subsonicUsername: string): ShareWithUrl[] {
   const database = openDb();
   const cfg = getConfig();
   const baseUrl = (cfg.subfinPublicUrl || `http://localhost:${cfg.port}`).replace(/\/$/, "");
+  // Automatically drop expired shares (older than their explicit expires_at or older than 1 year by default)
+  // so they do not linger indefinitely.
+  const oneYearMs = 365 * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const defaultCutoffIso = new Date(now - oneYearMs).toISOString();
+  database
+    .prepare(
+      "DELETE FROM shares WHERE expires_at IS NOT NULL AND expires_at < datetime('now')"
+    )
+    .run();
+  database
+    .prepare(
+      "DELETE FROM shares WHERE expires_at IS NULL AND created_at < ?"
+    )
+    .run(defaultCutoffIso);
   const rows = database
     .prepare(
       `SELECT s.share_uid, s.linked_device_id, s.entry_ids, s.entry_ids_flat, s.description, s.expires_at, s.visit_count, s.created_at, s.share_secret_encrypted

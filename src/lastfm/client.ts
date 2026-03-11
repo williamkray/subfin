@@ -39,7 +39,10 @@ async function fetchFromLastFm(params: URLSearchParams): Promise<LastFmArtistInf
 
   const url = `https://ws.audioscrobbler.com/2.0/?${params.toString()}`;
   try {
-    const res = await fetch(url, { method: "GET" });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 800);
+    const res = await fetch(url, { method: "GET", signal: controller.signal });
+    clearTimeout(timeout);
     if (!res.ok) return null;
     const data = (await res.json()) as LastFmArtistGetInfoResponse;
     if (!data.artist || data.error) return null;
