@@ -49,14 +49,14 @@ export async function handleGetLicense(): Promise<Record<string, unknown>> {
 /** OpenSubsonic: advertise supported extensions (static list). */
 export async function handleGetOpenSubsonicExtensions(): Promise<Record<string, unknown>> {
   return {
-    openSubsonicExtensions: {
-      extension: [
-        { name: "transcoders", versions: ["1.0.0"] },
-        { name: "formats", versions: ["1.0.0"] },
-        { name: "lyrics", versions: ["1.0.0"] },
-        { name: "songLyrics", versions: ["1.0.0"] },
-      ],
-    },
+    // Per OpenSubsonic spec, this must be an array of { name, versions }
+    // directly under subsonic-response.openSubsonicExtensions.
+    openSubsonicExtensions: [
+      {
+        name: "songLyrics",
+        versions: [1],
+      },
+    ],
   };
 }
 
