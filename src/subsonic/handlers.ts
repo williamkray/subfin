@@ -843,15 +843,15 @@ export async function handleGetArtistInfo(
   const folderIdsForIndex = await getEffectiveMusicFolderIds(auth, undefined);
   const albumArtists = await getOrBuildArtistIndex(auth, folderIdsForIndex);
   const canonicalById = new Map<string, string>();
-  const canonicalByKey = new Map<string, string>();
+  const canonicalKeyToCanonical = new Map<string, { id: string; name: string }>();
   for (const a of albumArtists) {
     if (a.Id && a.Name) {
       const id = String(a.Id);
       const name = a.Name;
       canonicalById.set(id, name);
       const key = canonicalArtistKey(name);
-      if (key && !canonicalByKey.has(key)) {
-        canonicalByKey.set(key, name);
+      if (key && !canonicalKeyToCanonical.has(key)) {
+        canonicalKeyToCanonical.set(key, { id, name });
       }
     }
   }
@@ -865,18 +865,41 @@ export async function handleGetArtistInfo(
       smallImageUrl: imageUrl(34),
       mediumImageUrl: imageUrl(64),
       largeImageUrl: imageUrl(174) ?? imageUrl(300),
-      similarArtist: similar.map((a) => ({
-        id: a.Id ? "ar-" + a.Id : undefined,
-        name: (() => {
+      // Build similar artists from canonical ids/names so that:
+      // - Only artists present in the scoped album index are returned
+      // - Multiple Jellyfin ids that normalize to the same artist collapse to a single entry
+      similarArtist: (() => {
+        const byCanonicalId = new Map<string, { id: string; name: string; coverArt?: string }>();
+        for (const a of similar) {
           const rawName = a.Name ?? "";
-          const fromId = a.Id ? canonicalById.get(a.Id) : undefined;
-          if (fromId) return fromId;
-          const key = canonicalArtistKey(rawName);
-          const fromKey = key ? canonicalByKey.get(key) : undefined;
-          return fromKey ?? rawName;
-        })(),
-        coverArt: a.Id ? "ar-" + a.Id : undefined,
-      })),
+          const rawId = a.Id ?? "";
+          let canonicalId: string | null = null;
+          let canonicalName: string | null = null;
+
+          if (rawId && canonicalById.has(rawId)) {
+            canonicalId = rawId;
+            canonicalName = canonicalById.get(rawId) ?? rawName;
+          } else {
+            const key = canonicalArtistKey(rawName);
+            const fromKey = key ? canonicalKeyToCanonical.get(key) : undefined;
+            if (fromKey) {
+              canonicalId = fromKey.id;
+              canonicalName = fromKey.name;
+            }
+          }
+
+          // Skip artists that don't exist in the scoped album index.
+          if (!canonicalId || !canonicalName) continue;
+          if (byCanonicalId.has(canonicalId)) continue;
+
+          byCanonicalId.set(canonicalId, {
+            id: "ar-" + canonicalId,
+            name: canonicalName,
+            coverArt: "ar-" + canonicalId,
+          });
+        }
+        return Array.from(byCanonicalId.values());
+      })(),
     },
   };
 }
