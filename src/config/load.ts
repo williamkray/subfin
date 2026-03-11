@@ -24,6 +24,8 @@ export interface Config {
   musicLibraryIds: string[];
   dbPath: string;
   logRest: boolean;
+  /** Optional Last.fm API key for enriching artist info (biography, last.fm URL). */
+  lastFmApiKey?: string;
   /** Secret used to derive encryption key for sensitive DB fields. Required. From SUBFIN_SALT or config file. */
   salt: Buffer;
 }
@@ -93,6 +95,7 @@ export function loadConfig(): Config {
   const dbPath = getFromEnvOrFile(file, "SUBFIN_DB_PATH", "dbPath") ?? "./subfin.db";
   const logRestRaw = getFromEnvOrFile(file, "SUBFIN_LOG_REST", "logRest");
   const logRest = logRestRaw === "true" || logRestRaw === "1" || file.logRest === true;
+  const lastFmApiKey = getFromEnvOrFile(file, "LASTFM_API_KEY", "lastFmApiKey");
 
   const saltRaw = getFromEnvOrFile(file, "SUBFIN_SALT", "salt");
   if (!saltRaw || saltRaw.trim() === "") {
@@ -114,6 +117,7 @@ export function loadConfig(): Config {
     musicLibraryIds: Array.isArray(musicLibraryIds) ? musicLibraryIds : [],
     dbPath,
     logRest,
+    lastFmApiKey,
     salt,
   };
 }

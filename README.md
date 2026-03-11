@@ -45,6 +45,7 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 | `SUBFIN_SALT` | *(required)* | Secret for DB encryption (see above). In config file: `"salt": "<base64 or hex>"`. |
 | `SUBFIN_LOG_REST` | (off) | Set to `true` or `1` to log each REST request (method and auth) for debugging clients. Do not enable in production; logs may contain tokens. |
 | `SUBFIN_PUBLIC_URL` | (empty) | Optional public URL of Subfin (e.g. `https://subfin.example.com`) for absolute image URLs in `getArtistInfo` / `getArtistInfo2` and used when generating Share links. |
+| `LASTFM_API_KEY` | (unset) | Optional Last.fm API key for enriching artist info (`getArtistInfo` / `getArtistInfo2`) with biography and Last.fm URLs. In the config file, use `"lastFmApiKey": "..."`. When unset, Subfin does **not** call Last.fm and relies only on Jellyfin data and placeholders. |
 | `SUBFIN_CONFIG` | `subfin.config.json` | Path to JSON config file (optional). All settings above can be in this file; env overrides. |
 
 ## Run
@@ -139,7 +140,7 @@ Subfin exposes two lyrics endpoints:
 
 ### Not implemented / TODO
 
-- Richer **artist/album metadata** (e.g. Last.fm links; biographies and similar artists already come from Jellyfin).
+- Richer **artist/album metadata** (e.g. additional provider links); artist biographies and similar artists already come from Jellyfin and can be **optionally** enriched via Last.fm when `LASTFM_API_KEY` / `lastFmApiKey` is configured.
 - Playlist CRUD is implemented; remaining work is client testing and any Jellyfin permission edge cases.
 - Further **search / discovery** refinements (e.g. full filter semantics for `getRandomSongs`, multi-genre/year for `getSongsByGenre`).
 - **Scrobbling** refinement (e.g. pause/resume precision) and other write APIs (play queue save).

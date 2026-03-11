@@ -16,6 +16,7 @@ import {
   getDerivedCache,
   setDerivedCache,
 } from "../store/index.js";
+import { getLastFmArtistInfo } from "../lastfm/client.js";
 import {
   stripSubsonicIdPrefix,
   toSubsonicArtistsIndex,
@@ -552,13 +553,18 @@ export async function handleGetPlaylist(
     throw new Error("Missing id");
   }
 
-  const items = await jf.getPlaylistItems(
-    toJellyfinContext(auth),
-    id,
-    auth.jellyfinUserId
-  );
-  const name = params.name?.trim() || "";
-  const songCount = items.length;
+  const ctx = toJellyfinContext(auth);
+  const items = await jf.getPlaylistItems(ctx, id, auth.jellyfinUserId);
+  const allPlaylists = await jf.getPlaylists(ctx, auth.jellyfinUserId);
+  const meta = allPlaylists.find((p) => String(p.id) === id);
+
+  const name = meta?.name ?? params.name?.trim() ?? "";
+  const comment = meta?.comment ?? "";
+  const songCount = meta?.songCount ?? items.length;
+  const created = meta?.created ?? meta?.changed ?? new Date(0).toISOString();
+  const changed = meta?.changed;
+  const duration =
+    meta?.duration != null ? Math.floor(meta.duration / 10_000_000) : 0;
 
   return {
     playlist: {
@@ -566,9 +572,10 @@ export async function handleGetPlaylist(
       name,
       owner: auth.subsonicUsername,
       public: false,
-      created: new Date(0).toISOString(),
-      changed: undefined,
-      duration: 0,
+      comment,
+      created,
+      changed,
+      duration,
       songCount,
       // Match getPlaylists: advertise a playlist-level coverArt id.
       coverArt: `pl-${id}`,
@@ -775,16 +782,37 @@ export async function handleGetArtistInfo(
     baseUrl ? `${baseUrl}/rest/getCoverArt?id=${encodeURIComponent(coverId)}${size ? `&size=${size}` : ""}` : undefined;
 
   const artistName = (artist as { Name?: string } | null)?.Name ?? "";
+  const rawBio = (artist as { Overview?: string } | null)?.Overview?.trim() ?? "";
+  const providerIds = (artist as { ProviderIds?: { MusicBrainzArtist?: string; MusicBrainz?: string } } | null)
+    ?.ProviderIds;
+  const jellyfinMusicBrainzId =
+    providerIds?.MusicBrainzArtist ?? providerIds?.MusicBrainz ?? "";
+
+  let biography = rawBio;
+  let lastFmUrl = "";
+
+  const lastFm = await getLastFmArtistInfo({
+    name: artistName,
+    musicBrainzId: jellyfinMusicBrainzId || undefined,
+  });
+  if (lastFm) {
+    if (!biography && lastFm.biography) {
+      biography = lastFm.biography;
+    }
+    if (lastFm.lastFmUrl) {
+      lastFmUrl = lastFm.lastFmUrl;
+    }
+  }
+
+  if (!biography) {
+    biography = "No biography is available for this artist.";
+  }
   return {
     artistInfo: {
       name: artistName,
-      biography: (artist as { Overview?: string } | null)?.Overview?.trim() ?? "",
-      musicBrainzId:
-        (artist as { ProviderIds?: { MusicBrainzArtist?: string; MusicBrainz?: string } } | null)?.ProviderIds
-          ?.MusicBrainzArtist ??
-        (artist as { ProviderIds?: { MusicBrainz?: string } } | null)?.ProviderIds?.MusicBrainz ??
-        "",
-      lastFmUrl: "",
+      biography,
+      musicBrainzId: jellyfinMusicBrainzId,
+      lastFmUrl,
       smallImageUrl: imageUrl(34),
       mediumImageUrl: imageUrl(64),
       largeImageUrl: imageUrl(174) ?? imageUrl(300),
