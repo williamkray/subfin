@@ -11,3 +11,4 @@ subfin.config.json
 .local-testing/
 .*-analysis/
 .cursor/
+CLAUDE.md
