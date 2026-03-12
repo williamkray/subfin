@@ -858,7 +858,7 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
           parts.push("</nowPlaying>", "</subsonic-response>");
           xml = parts.join("");
         } else if (method === "getmusicdirectory") {
-          const md = (payload as any).musicDirectory ?? {};
+          const md = (payload as any).directory ?? {};
           const children = (md.child ?? []) as any[];
           const parts: string[] = [
             '<?xml version="1.0" encoding="UTF-8"?>',

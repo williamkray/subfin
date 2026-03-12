@@ -311,7 +311,7 @@ export async function handleGetMusicDirectory(
       );
     }
     return {
-      musicDirectory: {
+      directory: {
         id: album.Id,
         name: album.Name ?? "",
         parent: album.ParentId,
@@ -340,7 +340,7 @@ export async function handleGetMusicDirectory(
     );
   }
   return {
-    musicDirectory: {
+    directory: {
       id: artist.Id,
       name: artistName,
       parent: artist.ParentId,
