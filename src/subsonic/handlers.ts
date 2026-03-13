@@ -164,10 +164,13 @@ async function getAlbumArtistsForFolders(
   const ctx = toJellyfinContext(auth);
   const byArtist = new Map<string, { Id: string; Name: string; AlbumCount: number }>();
   const pageSize = 200;
+  const MAX_ALBUMS = 50_000;
+  let totalAlbumsSeen = 0;
 
   const accumulateFromFolder = async (musicFolderId: string | undefined) => {
     let offset = 0;
     for (;;) {
+      if (totalAlbumsSeen >= MAX_ALBUMS) break;
       const page = await jf.getAlbumsForLibrary(ctx, {
         userId: auth.jellyfinUserId,
         musicFolderId,
@@ -177,6 +180,8 @@ async function getAlbumArtistsForFolders(
       });
       if (page.length === 0) break;
       for (const album of page) {
+        if (totalAlbumsSeen >= MAX_ALBUMS) break;
+        totalAlbumsSeen++;
         const primaryArtistId = resolvePrimaryArtistIdForAlbum(album);
         if (!primaryArtistId) continue;
         const artistName =

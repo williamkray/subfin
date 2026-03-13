@@ -20,7 +20,10 @@ const app = express();
 const trustProxy = process.env.SUBFIN_TRUST_PROXY === "true" || process.env.SUBFIN_TRUST_PROXY === "1";
 if (trustProxy) app.set("trust proxy", 1);
 
-app.use(cors());
+// Restrict CORS to the configured public URL when available; otherwise allow all origins
+// (native Subsonic clients don't send Origin, so this only affects browser-initiated cross-origin requests).
+const corsOrigin = config.subfinPublicUrl || "*";
+app.use(cors({ origin: corsOrigin }));
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
