@@ -73,7 +73,7 @@ export async function getLastFmArtistInfo(opts: {
   const cacheKey = mbid
     ? `lastfm:artist:mbid:${mbid}`
     : `lastfm:artist:name:${normalizedName.toLowerCase()}`;
-  const ttlMs = 24 * 60 * 60 * 1000; // 24 hours
+  const ttlMs = 30 * 24 * 60 * 60 * 1000; // 30 days
 
   const existing = getDerivedCache<LastFmArtistInfo>(cacheKey);
   if (existing && existing.value && existing.cachedAt) {
