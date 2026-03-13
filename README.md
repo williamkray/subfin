@@ -267,7 +267,7 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 
 | Endpoint | Status | Jellyfin mapping | Notes |
 |---------|--------|------------------|-------|
-| `createShare` | **Fully implemented** | Subfin SQLite store | Creates a public share link for a playlist or album; returns a Subfin-hosted URL. Requires `SUBFIN_PUBLIC_URL` to be set for absolute URLs. |
+| `createShare` | **Fully implemented** | Subfin SQLite store | Creates a public share link for a playlist or album; returns a Subfin-hosted URL. Requires `SUBFIN_PUBLIC_URL` to be set for absolute URLs. Disabled in open mode (`ALLOWED_JELLYFIN_HOSTS` empty). |
 | `getShares` | **Fully implemented** | Subfin SQLite store | Lists all shares for the current user. |
 | `updateShare` | **Fully implemented** | Subfin SQLite store | Updates share description or expiry. |
 | `deleteShare` | **Fully implemented** | Subfin SQLite store | Deletes a share. |

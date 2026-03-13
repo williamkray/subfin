@@ -25,12 +25,23 @@ import {
   deleteShare,
   updateShare,
 } from "../store/index.js";
-import { getConfig } from "../config/load.js";
+import { doubleCsrf } from "csrf-csrf";
+import { getConfig, isOpenMode } from "../config/load.js";
+import {
+  getUserLibrarySettings,
+  setUserLibrarySettings,
+} from "../store/index.js";
 import { toJellyfinContext, type AuthResult } from "../subsonic/auth.js";
 import { handleCreateShare, handleSearch3 } from "../subsonic/handlers.js";
 import { shareEndpointRateLimit, recordShareAuthFailure } from "./share-rate-limit.js";
 import { setShareCookie, getShareSessionFromCookie, clearShareCookie } from "./share-session.js";
 import { createShareToken } from "./share-tokens.js";
+
+const { generateToken, doubleCsrfProtection } = doubleCsrf({
+  getSecret: () => config.salt.toString("hex"),
+  cookieName: "subfin_csrf",
+  cookieOptions: { httpOnly: true, sameSite: "strict" as const },
+});
 
 const router = Router();
 
@@ -614,19 +625,28 @@ const baseStyles = `
   }
 `;
 
-function renderLayout(title: string, innerHtml: string): string {
+function renderLayout(title: string, innerHtml: string, csrfToken?: string): string {
+  const csrfMeta = csrfToken
+    ? `<meta name="csrf-token" content="${escapeHtml(csrfToken)}">`
+    : "";
+  // Inject CSRF token into all POST forms and expose it for fetch() calls as window._csrfToken.
+  const csrfScript = csrfToken
+    ? `<script>(function(){var m=document.querySelector('meta[name="csrf-token"]');if(!m)return;var t=m.content;window._csrfToken=t;document.querySelectorAll('form').forEach(function(f){if(f.method.toLowerCase()==='post'){var i=document.createElement('input');i.type='hidden';i.name='_csrf';i.value=t;f.appendChild(i);}});})();</script>`
+    : "";
   return `<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <title>${escapeHtml(title)}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  ${csrfMeta}
   <style>${baseStyles}</style>
 </head>
 <body>
   <div class="shell">
     ${innerHtml}
   </div>
+  ${csrfScript}
 </body>
 </html>`;
 }
@@ -698,9 +718,10 @@ router.get("/", (req: Request, res: Response) => {
   const shares = sessionUser ? getSharesForUser(sessionUser) : [];
   const dashboard =
     sessionUser && devices
-      ? renderAuthenticatedDashboard(sessionUser, devices, shares)
-      : renderLoginPanels();
+      ? renderAuthenticatedDashboard(sessionUser, devices, shares, isOpenMode())
+      : renderLoginPanels(getConfig().allowedJellyfinHosts);
 
+  const csrfToken = generateToken(req, res);
   res.send(
     renderLayout(
       "Subfin",
@@ -713,7 +734,8 @@ router.get("/", (req: Request, res: Response) => {
             ${dashboard}
           </div>
         </main>
-      `
+      `,
+      csrfToken
     )
   );
 });
@@ -722,7 +744,22 @@ const LINK_DEVICE_CARD_BODY = `
   Use Jellyfin Quick Connect on a device where you are already logged in. You'll
   get one app password for this device — each link is a unique token from Jellyfin.`;
 
-function renderLoginPanels(): string {
+function renderJellyfinUrlField(allowedHosts: string[], fieldName = "jfUrl"): string {
+  if (allowedHosts.length === 0) {
+    return `<label>Jellyfin server URL<input type="url" name="${fieldName}" placeholder="https://jellyfin.example.com" required autocomplete="url"></label>`;
+  }
+  if (allowedHosts.length === 1) {
+    return `<input type="hidden" name="${fieldName}" value="${escapeHtml(allowedHosts[0]!)}">`;
+  }
+  const options = allowedHosts.map((h) => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join("");
+  return `<label>Jellyfin server<select name="${fieldName}">${options}</select></label>`;
+}
+
+function renderLoginPanels(allowedHosts: string[]): string {
+  const urlField = renderJellyfinUrlField(allowedHosts);
+  const manageHref = allowedHosts.length === 1
+    ? `/auth/quickconnect?intent=manage&jfUrl=${encodeURIComponent(allowedHosts[0]!)}`
+    : `/auth/quickconnect?intent=manage`;
   return `
     <section class="auth-grid">
       <div class="card">
@@ -737,6 +774,7 @@ function renderLoginPanels(): string {
         </div>
         <form method="get" action="/auth/quickconnect" class="stack">
           <input type="hidden" name="intent" value="link">
+          ${urlField}
           <label>
             Device label (optional)
             <input type="text" name="deviceLabel" placeholder="e.g. Work laptop, Car, Living room">
@@ -757,10 +795,7 @@ function renderLoginPanels(): string {
         <div class="card-body">
           Sign in with Quick Connect to view linked devices, rename them, reset app passwords, or unlink.
         </div>
-        <div class="actions-row">
-          <a href="/auth/quickconnect?intent=manage"><button type="button">Continue</button></a>
-          <span class="tiny">You'll be asked to approve the login in Jellyfin.</span>
-        </div>
+        ${allowedHosts.length > 1 ? `<form method="get" action="/auth/quickconnect" class="stack"><input type="hidden" name="intent" value="manage">${renderJellyfinUrlField(allowedHosts)}<div class="actions-row"><button type="submit">Continue</button></div></form>` : `<div class="actions-row"><a href="${manageHref}"><button type="button">Continue</button></a><span class="tiny">You'll be asked to approve the login in Jellyfin.</span></div>`}
       </div>
     </section>
   `;
@@ -769,7 +804,8 @@ function renderLoginPanels(): string {
 function renderAuthenticatedDashboard(
   sessionUser: string,
   devices: ReturnType<typeof listLinkedDevices>,
-  shares: ReturnType<typeof getSharesForUser>
+  shares: ReturnType<typeof getSharesForUser>,
+  openMode = false
 ): string {
   const shareDeviceIds = new Set(shares.map((s) => s.linked_device_id));
   const regularDevices = devices.filter((d) => !shareDeviceIds.has(d.id));
@@ -898,7 +934,7 @@ function renderAuthenticatedDashboard(
           ${listItems}
         </ul>
       </div>
-      <div class="card card-muted" style="grid-column: 1 / -1;">
+      ${!openMode ? `<div class="card card-muted" style="grid-column: 1 / -1;">
         <div class="card-header">
           <div>
             <div class="card-kicker">Shares</div>
@@ -916,6 +952,56 @@ function renderAuthenticatedDashboard(
             ? `<script>document.querySelectorAll('.copy-share-url').forEach(function(b){b.addEventListener('click',function(){navigator.clipboard.writeText(b.getAttribute('data-url'));b.textContent='Copied';setTimeout(function(){b.textContent='Copy';},1500);});});</script>`
             : ""
         }
+      </div>` : ""}
+      <div class="card card-muted" style="grid-column: 1 / -1;" id="library-settings">
+        <div class="card-header">
+          <div>
+            <div class="card-kicker">Music libraries</div>
+            <div class="card-title">Library access</div>
+          </div>
+        </div>
+        <div class="card-body">
+          Choose which Jellyfin music libraries your Subsonic clients can see. Leave all checked to expose everything.
+        </div>
+        <div id="library-list" style="padding: 0 20px 12px;">
+          <span class="tiny">Loading…</span>
+        </div>
+        <div class="actions-row" style="padding: 0 20px 20px;">
+          <button type="button" id="save-libraries" class="btn-secondary btn-small">Save</button>
+          <span class="tiny" id="library-status"></span>
+        </div>
+        <script>
+(function() {
+  var list = document.getElementById('library-list');
+  var saveBtn = document.getElementById('save-libraries');
+  var status = document.getElementById('library-status');
+  fetch('/api/user/libraries').then(function(r) { return r.json(); }).then(function(data) {
+    if (!data.libraries || data.libraries.length === 0) {
+      list.innerHTML = '<span class="tiny">No music libraries found.</span>';
+      return;
+    }
+    list.innerHTML = data.libraries.map(function(lib) {
+      var checked = lib.selected ? 'checked' : '';
+      return '<label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;"><input type="checkbox" name="libId" value="' + lib.id + '" ' + checked + '> ' + lib.name + '</label>';
+    }).join('');
+  }).catch(function() {
+    list.innerHTML = '<span class="tiny">Could not load libraries.</span>';
+  });
+  saveBtn && saveBtn.addEventListener('click', function() {
+    var checked = Array.from(document.querySelectorAll('input[name="libId"]:checked')).map(function(el) { return el.value; });
+    fetch('/api/user/libraries', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-csrf-token': window._csrfToken || '' },
+      body: JSON.stringify({ ids: checked })
+    }).then(function(r) { return r.json(); }).then(function() {
+      status.textContent = 'Saved.';
+      setTimeout(function() { status.textContent = ''; }, 2000);
+    }).catch(function() {
+      status.textContent = 'Save failed.';
+    });
+  });
+})();
+        </script>
       </div>
     </section>
     <script>
@@ -1019,7 +1105,20 @@ router.get("/link", (_req: Request, res: Response) => {
 router.get("/auth/quickconnect", async (req: Request, res: Response) => {
   const intent = (req.query.intent as string) === "link" ? "link" : "manage";
   const deviceLabel = (req.query.deviceLabel as string)?.trim() || undefined;
-  const jellyfinUrl = getConfig().allowedJellyfinHosts[0] ?? "";
+  const allowedHosts = getConfig().allowedJellyfinHosts;
+  const jellyfinUrl = ((req.query.jfUrl as string)?.trim() || allowedHosts[0] || "").replace(/\/$/, "");
+  if (!jellyfinUrl) {
+    res.status(400).send("No Jellyfin server URL provided.");
+    return;
+  }
+  if (isOpenMode()) {
+    try {
+      await jf.validateJellyfinUrl(jellyfinUrl);
+    } catch (err) {
+      res.status(400).send(`Invalid Jellyfin URL: ${(err as Error).message}`);
+      return;
+    }
+  }
   const result = await jf.initiateQuickConnect(jellyfinUrl);
   if (!result) {
     res.status(500).send("Quick Connect not available. Is Jellyfin reachable and Quick Connect enabled?");
@@ -1147,11 +1246,10 @@ router.get("/web/quickconnect/done", async (req: Request, res: Response) => {
   res.redirect("/devices");
 });
 
-router.get("/auth/password", (_req: Request, res: Response) => {
-  res.send(`
-${renderLayout(
-  "Sign in with password - Subfin",
-  `
+router.get("/auth/password", (req: Request, res: Response) => {
+  const urlField = renderJellyfinUrlField(getConfig().allowedJellyfinHosts, "jfUrl");
+  const csrfToken = generateToken(req, res);
+  const body = `
     ${renderDashboardHeader(null)}
     <main class="shell-main">
       <div>
@@ -1164,6 +1262,7 @@ ${renderLayout(
         <div class="card" style="margin-top: 14px;">
           <form method="post" action="/web/link/password" class="stack">
             <div class="stack">
+              ${urlField}
               <label>
                 Jellyfin username
                 <input name="username" autocomplete="username" required>
@@ -1192,8 +1291,8 @@ ${renderLayout(
         </div>
       </aside>
     </main>
-  `
-)}`);
+  `;
+  res.send(renderLayout("Sign in with password - Subfin", body, csrfToken));
 });
 
 // Legacy path; keep for compatibility but prefer /auth/password.
@@ -1201,14 +1300,26 @@ router.get("/link/password", (_req: Request, res: Response) => {
   res.redirect("/auth/password");
 });
 
-router.post("/web/link/password", async (req: Request, res: Response) => {
+router.post("/web/link/password", doubleCsrfProtection, async (req: Request, res: Response) => {
   const username = (req.body?.username as string)?.trim();
   const password = req.body?.password as string;
   if (!username || !password) {
     res.redirect("/link/password?error=missing");
     return;
   }
-  const jellyfinUrl = getConfig().allowedJellyfinHosts[0] ?? "";
+  const jellyfinUrl = ((req.body?.jfUrl as string)?.trim() || getConfig().allowedJellyfinHosts[0] || "").replace(/\/$/, "");
+  if (!jellyfinUrl) {
+    res.redirect("/auth/password?error=missing");
+    return;
+  }
+  if (isOpenMode()) {
+    try {
+      await jf.validateJellyfinUrl(jellyfinUrl);
+    } catch (err) {
+      res.status(400).send(`Invalid Jellyfin URL: ${(err as Error).message}`);
+      return;
+    }
+  }
   const auth = await jf.authenticateByName(jellyfinUrl, username, password);
   if (!auth) {
     res.redirect("/link/password?error=wrong");
@@ -1222,7 +1333,7 @@ router.post("/web/link/password", async (req: Request, res: Response) => {
   res.redirect("/devices");
 });
 
-router.post("/web/link/new-device", async (req: Request, res: Response) => {
+router.post("/web/link/new-device", doubleCsrfProtection, async (req: Request, res: Response) => {
   const sessionUser = getSessionUser(req);
   if (!sessionUser) {
     res.redirect("/link");
@@ -1278,6 +1389,7 @@ router.get("/devices", (req: Request, res: Response) => {
             : ok
               ? '<p class="card card-muted" style="margin-bottom: 14px;">Done.</p>'
               : "";
+  const csrfToken = generateToken(req, res);
   res.send(
     renderLayout(
       "My devices - Subfin",
@@ -1286,15 +1398,16 @@ router.get("/devices", (req: Request, res: Response) => {
           <main class="shell-main">
             ${flash}
             <div class="shell-main-full">
-              ${renderAuthenticatedDashboard(sessionUser, devices, shares)}
+              ${renderAuthenticatedDashboard(sessionUser, devices, shares, isOpenMode())}
             </div>
           </main>
-        `
+        `,
+      csrfToken
     )
   );
 });
 
-router.post("/web/devices", async (req: Request, res: Response) => {
+router.post("/web/devices", doubleCsrfProtection, async (req: Request, res: Response) => {
   const username = (req.body?.username as string)?.trim();
   const password = req.body?.password as string;
   if (!username || !password) {
@@ -1310,20 +1423,22 @@ router.post("/web/devices", async (req: Request, res: Response) => {
   setSessionUser(res, username);
   setSessionJellyfinUrl(res, jellyfinUrl);
   const devices = listLinkedDevices({ subsonicUsername: username, jellyfinUrl });
+  const csrfToken = generateToken(req, res);
   res.send(
     renderLayout(
       "My devices - Subfin",
       `
         ${renderDashboardHeader(username)}
         <main class="shell-main">
-          ${renderAuthenticatedDashboard(username, devices, getSharesForUser(username))}
+          ${renderAuthenticatedDashboard(username, devices, getSharesForUser(username), isOpenMode())}
         </main>
-      `
+      `,
+      csrfToken
     )
   );
 });
 
-router.post("/web/devices/unlink", async (req: Request, res: Response) => {
+router.post("/web/devices/unlink", doubleCsrfProtection, async (req: Request, res: Response) => {
   const resolved = getUsernameForDeviceAction(req);
   if ("errorRedirect" in resolved) {
     res.redirect(resolved.errorRedirect);
@@ -1342,7 +1457,7 @@ router.post("/web/devices/unlink", async (req: Request, res: Response) => {
   res.redirect(ok ? "/devices?unlinked=1" : "/devices?error=unlink");
 });
 
-router.post("/web/devices/reset", (req: Request, res: Response) => {
+router.post("/web/devices/reset", doubleCsrfProtection, (req: Request, res: Response) => {
   const resolved = getUsernameForDeviceAction(req);
   if ("errorRedirect" in resolved) {
     res.redirect(resolved.errorRedirect);
@@ -1408,7 +1523,7 @@ ${renderLayout(
 )}`);
 });
 
-router.post("/web/shares/delete", (req: Request, res: Response) => {
+router.post("/web/shares/delete", doubleCsrfProtection, (req: Request, res: Response) => {
   const sessionUser = getSessionUser(req);
   if (!sessionUser) {
     res.redirect("/");
@@ -1423,7 +1538,7 @@ router.post("/web/shares/delete", (req: Request, res: Response) => {
   res.redirect(deleted ? "/devices?unshared=1" : "/devices?error=unshare");
 });
 
-router.post("/web/shares/update", (req: Request, res: Response) => {
+router.post("/web/shares/update", doubleCsrfProtection, (req: Request, res: Response) => {
   const sessionUser = getSessionUser(req);
   if (!sessionUser) {
     res.redirect("/");
@@ -1439,7 +1554,7 @@ router.post("/web/shares/update", (req: Request, res: Response) => {
   res.redirect(updated ? "/devices?renamed=1" : "/devices?error=rename");
 });
 
-router.post("/web/devices/rename", (req: Request, res: Response) => {
+router.post("/web/devices/rename", doubleCsrfProtection, (req: Request, res: Response) => {
   const resolved = getUsernameForDeviceAction(req);
   if ("errorRedirect" in resolved) {
     res.redirect(resolved.errorRedirect);
@@ -1458,14 +1573,57 @@ router.post("/web/devices/rename", (req: Request, res: Response) => {
   res.redirect(ok ? "/devices?renamed=1" : "/devices?error=rename");
 });
 
-router.post("/web/logout", (req: Request, res: Response) => {
+router.post("/web/logout", doubleCsrfProtection, (req: Request, res: Response) => {
   clearSessionUser(res);
   res.redirect("/");
 });
 
+// --- Per-user library settings ---
+
+router.get("/api/user/libraries", async (req: Request, res: Response) => {
+  const sessionUser = getSessionUser(req);
+  if (!sessionUser) {
+    res.status(401).json({ error: "Not signed in." });
+    return;
+  }
+  const jellyfinUrl = getSessionJellyfinUrl(req);
+  const userKey = { subsonicUsername: sessionUser, jellyfinUrl };
+  const auth = getAuthFromSession(req);
+  if (!auth) {
+    res.status(401).json({ error: "Not signed in." });
+    return;
+  }
+  const ctx = toJellyfinContext(auth);
+  const allLibs = await jf.getMusicLibraries(ctx, auth.jellyfinUserId);
+  const savedIds = getUserLibrarySettings(userKey) ?? [];
+  const libs = allLibs.map((lib) => ({
+    id: lib.id,
+    name: lib.name,
+    selected: savedIds.length === 0 || savedIds.includes(lib.id),
+  }));
+  res.json({ libraries: libs });
+});
+
+router.post("/api/user/libraries", doubleCsrfProtection, (req: Request, res: Response) => {
+  const sessionUser = getSessionUser(req);
+  if (!sessionUser) {
+    res.status(401).json({ error: "Not signed in." });
+    return;
+  }
+  const jellyfinUrl = getSessionJellyfinUrl(req);
+  const userKey = { subsonicUsername: sessionUser, jellyfinUrl };
+  const body = (req.body as Record<string, unknown>) ?? {};
+  let ids: string[] = [];
+  if (Array.isArray(body.ids)) {
+    ids = (body.ids as unknown[]).filter((x): x is string => typeof x === "string");
+  }
+  setUserLibrarySettings(userKey, ids);
+  res.json({ ok: true });
+});
+
 // --- Create share (session-authenticated JSON API) ---
 
-router.post("/web/api/create-share", async (req: Request, res: Response) => {
+router.post("/web/api/create-share", doubleCsrfProtection, async (req: Request, res: Response) => {
   const auth = getAuthFromSession(req);
   if (!auth) {
     res.status(401).json({ error: "Not signed in." });
@@ -1533,6 +1691,7 @@ router.get("/create-share", (req: Request, res: Response) => {
     res.redirect("/");
     return;
   }
+  const csrfToken = generateToken(req, res);
   res.send(
     renderLayout(
       "Create share - Subfin",
@@ -1620,7 +1779,7 @@ router.get("/create-share", (req: Request, res: Response) => {
     resultDiv.style.display = 'none';
     fetch(base + '/web/api/create-share', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-csrf-token': window._csrfToken || '' },
       credentials: 'same-origin',
       body: JSON.stringify({ url: (input && input.value) ? input.value.trim() : '' })
     }).then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
@@ -1713,7 +1872,8 @@ router.get("/create-share", (req: Request, res: Response) => {
   });
 })();
         </script>
-      `
+      `,
+      csrfToken
     )
   );
 });

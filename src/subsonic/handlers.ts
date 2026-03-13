@@ -105,6 +105,7 @@ function mapCachedArtists(payload: CachedArtistIndexPayload): BaseItemDto[] {
 import type { BaseItemDto } from "@jellyfin/sdk/lib/generated-client/models/base-item-dto.js";
 import * as jf from "../jellyfin/client.js";
 import { config } from "../config.js";
+import { isOpenMode } from "../config/load.js";
 import {
   clearPlayQueue,
   getPlayQueue,
@@ -1787,6 +1788,9 @@ export async function handleCreateShare(
   auth: AuthResult,
   params: { ids: string[]; description?: string; expires?: string }
 ): Promise<Record<string, unknown>> {
+  if (isOpenMode()) {
+    throw new Error("Sharing is not available on this server.");
+  }
   const ids = params.ids?.filter((id) => typeof id === "string" && id.trim()) ?? [];
   if (ids.length === 0) throw new Error("At least one id is required");
 

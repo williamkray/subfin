@@ -3,6 +3,8 @@
  * (obtained via web UI linking). All methods are for a single user context.
  */
 import { randomUUID } from "node:crypto";
+import { resolve4 } from "node:dns/promises";
+import { isIP, BlockList } from "node:net";
 import axios from "axios";
 import { Jellyfin } from "@jellyfin/sdk/lib/jellyfin.js";
 import { getAuthorizationHeader } from "@jellyfin/sdk/lib/utils/authentication.js";
@@ -1976,6 +1978,78 @@ export async function authenticateByNameWithDevice(
 
 /** Report that the session for the given token has ended (POST /Sessions/Logout).
  * Call this when unlinking a device so Jellyfin revokes that device's token. */
+/** Blocked IP ranges for SSRF protection. Used by validateJellyfinUrl in open mode. */
+const BLOCKED_RANGES = new BlockList();
+BLOCKED_RANGES.addSubnet("10.0.0.0", 8, "ipv4");
+BLOCKED_RANGES.addSubnet("172.16.0.0", 12, "ipv4");
+BLOCKED_RANGES.addSubnet("192.168.0.0", 16, "ipv4");
+BLOCKED_RANGES.addSubnet("127.0.0.0", 8, "ipv4");
+BLOCKED_RANGES.addSubnet("169.254.0.0", 16, "ipv4");
+BLOCKED_RANGES.addAddress("::1", "ipv6");
+BLOCKED_RANGES.addSubnet("fe80::", 10, "ipv6");
+BLOCKED_RANGES.addSubnet("fc00::", 7, "ipv6"); // ULA
+
+/**
+ * Validate a user-supplied Jellyfin URL in open mode.
+ * Throws with a user-readable message on failure.
+ *
+ * Checks (in order):
+ *  1. Must be a valid http/https URL
+ *  2. Must resolve to a public IP (no RFC1918, loopback, link-local, or ULA)
+ *     — NOTE: string-based hostname checks are bypassable via DNS rebinding or
+ *       encoded IPs (0x7f000001, 127.1, etc.). Always resolve, then check the IP.
+ *  3. Must respond with ProductName === "Jellyfin Server" on /System/Info/Public
+ */
+export async function validateJellyfinUrl(rawUrl: string): Promise<void> {
+  let url: URL;
+  try {
+    url = new URL(rawUrl.trim());
+  } catch {
+    throw new Error("Invalid URL.");
+  }
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("Only http/https URLs are allowed.");
+  }
+  const hostname = url.hostname;
+  let addrs: string[];
+  if (isIP(hostname)) {
+    addrs = [hostname];
+  } else {
+    try {
+      addrs = await resolve4(hostname);
+    } catch {
+      addrs = [];
+    }
+  }
+  if (addrs.length === 0) {
+    throw new Error("Could not resolve hostname.");
+  }
+  for (const addr of addrs) {
+    if (BLOCKED_RANGES.check(addr, "ipv4")) {
+      throw new Error("URL resolves to a private or reserved address range.");
+    }
+  }
+  const infoUrl = new URL("/System/Info/Public", url).toString();
+  let res: Response;
+  try {
+    res = await fetch(infoUrl, { signal: AbortSignal.timeout(5000) });
+  } catch {
+    throw new Error("Could not reach a Jellyfin server at that URL.");
+  }
+  if (!res.ok) {
+    throw new Error("No Jellyfin server found at that URL.");
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = (await res.json()) as Record<string, unknown>;
+  } catch {
+    throw new Error("Unexpected response from that URL.");
+  }
+  if (body.ProductName !== "Jellyfin Server") {
+    throw new Error("URL does not appear to be a Jellyfin server.");
+  }
+}
+
 export async function reportSessionEnded(accessToken: string): Promise<void> {
   const api = getApi(accessToken);
   const sessionApi = getSessionApi(api);
