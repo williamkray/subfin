@@ -11,7 +11,8 @@
     "db:init": "node -e \"import('./dist/store/index.js').then(m => m.initDb())\"",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck:tests": "tsc --project tsconfig.test.json --noEmit"
+    "typecheck:tests": "tsc --project tsconfig.test.json --noEmit",
+    "check:composite-keys": "npx ts-node scripts/check-composite-keys.ts"
   },
   "engines": {
     "node": ">=20"
@@ -23,8 +24,11 @@
     "bcrypt": "^6.0.0",
     "better-sqlite3": "^12.6.0",
     "cors": "^2.8.6",
+    "csrf-csrf": "^3.0.0",
     "dotenv": "^17.0.0",
-    "express": "^5.0.0"
+    "express": "^5.0.0",
+    "express-rate-limit": "^7.5.1",
+    "helmet": "^8.1.0"
   },
   "devDependencies": {
     "@types/archiver": "^7.0.0",

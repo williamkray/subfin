@@ -25,6 +25,7 @@ import {
   deleteShare,
   updateShare,
 } from "../store/index.js";
+import { getConfig } from "../config/load.js";
 import { toJellyfinContext, type AuthResult } from "../subsonic/auth.js";
 import { handleCreateShare, handleSearch3 } from "../subsonic/handlers.js";
 import { shareEndpointRateLimit, recordShareAuthFailure } from "./share-rate-limit.js";
@@ -66,6 +67,31 @@ function clearSessionUser(res: Response): void {
   );
 }
 
+function getSessionJellyfinUrl(req: Request): string {
+  const cookieHeader = req.headers.cookie;
+  if (cookieHeader) {
+    const cookies = cookieHeader.split(";").map((c) => c.trim());
+    for (const c of cookies) {
+      if (c.startsWith("subfin_jf_url=")) {
+        try {
+          return decodeURIComponent(c.substring("subfin_jf_url=".length)) || "";
+        } catch {
+          return "";
+        }
+      }
+    }
+  }
+  return getConfig().allowedJellyfinHosts[0] ?? "";
+}
+
+function setSessionJellyfinUrl(res: Response, jellyfinUrl: string): void {
+  const encoded = encodeURIComponent(jellyfinUrl);
+  res.setHeader(
+    "Set-Cookie",
+    `subfin_jf_url=${encoded}; Path=/; HttpOnly; SameSite=Lax`
+  );
+}
+
 /** Parse Jellyfin web UI URL and return the item id (e.g. from #/details?id=xxx or ?id=xxx). */
 function parseJellyfinItemIdFromUrl(input: string): string | null {
   const raw = (input || "").trim();
@@ -86,10 +112,12 @@ function parseJellyfinItemIdFromUrl(input: string): string | null {
 function getAuthFromSession(req: Request): AuthResult | null {
   const user = getSessionUser(req);
   if (!user) return null;
-  const creds = getJellyfinCredentialsForUser(user);
+  const jellyfinUrl = getSessionJellyfinUrl(req);
+  const creds = getJellyfinCredentialsForUser({ subsonicUsername: user, jellyfinUrl });
   if (!creds) return null;
   return {
     subsonicUsername: user,
+    jellyfinBaseUrl: jellyfinUrl,
     jellyfinUserId: creds.jellyfinUserId,
     jellyfinAccessToken: creds.jellyfinAccessToken,
   };
@@ -637,7 +665,8 @@ function renderDashboardHeader(sessionUser: string | null, opts?: { backToDevice
 
 router.get("/", (req: Request, res: Response) => {
   const sessionUser = getSessionUser(req);
-  const devices = sessionUser ? listLinkedDevices(sessionUser) : [];
+  const sessionJfUrl = getSessionJellyfinUrl(req);
+  const devices = sessionUser ? listLinkedDevices({ subsonicUsername: sessionUser, jellyfinUrl: sessionJfUrl }) : [];
 
   const hero = `
     <section class="hero">
@@ -990,7 +1019,8 @@ router.get("/link", (_req: Request, res: Response) => {
 router.get("/auth/quickconnect", async (req: Request, res: Response) => {
   const intent = (req.query.intent as string) === "link" ? "link" : "manage";
   const deviceLabel = (req.query.deviceLabel as string)?.trim() || undefined;
-  const result = await jf.initiateQuickConnect();
+  const jellyfinUrl = getConfig().allowedJellyfinHosts[0] ?? "";
+  const result = await jf.initiateQuickConnect(jellyfinUrl);
   if (!result) {
     res.status(500).send("Quick Connect not available. Is Jellyfin reachable and Quick Connect enabled?");
     return;
@@ -1045,11 +1075,12 @@ ${renderLayout(
       const deviceId = ${JSON.stringify(result.deviceId)};
       const deviceName = ${JSON.stringify(result.deviceName)};
       const deviceLabel = ${JSON.stringify(deviceLabel ?? "")};
+      const jfUrl = ${JSON.stringify(jellyfinUrl)};
       const poll = async () => {
         const r = await fetch('/web/quickconnect/poll?secret=' + encodeURIComponent(secret));
         const d = await r.json();
         if (d.authenticated) {
-          const params = new URLSearchParams({ secret, intent, deviceId, deviceName });
+          const params = new URLSearchParams({ secret, intent, deviceId, deviceName, jfUrl });
           if (deviceLabel) params.set('deviceLabel', deviceLabel);
           window.location = '/web/quickconnect/done?' + params.toString();
           return;
@@ -1084,31 +1115,35 @@ router.get("/web/quickconnect/done", async (req: Request, res: Response) => {
   const intent = (req.query.intent as string) === "link" ? "link" : "manage";
   const deviceId = (req.query.deviceId as string)?.trim();
   const deviceName = (req.query.deviceName as string)?.trim();
+  const jellyfinUrl = (req.query.jfUrl as string)?.trim() || getConfig().allowedJellyfinHosts[0] || "";
   if (!secret) {
     res.redirect("/?error=missing");
     return;
   }
   const deviceLabel = (req.query.deviceLabel as string)?.trim() || undefined;
   const device = deviceId && deviceName ? { id: deviceId, name: deviceName } : undefined;
-  const auth = await jf.authenticateWithQuickConnect(secret, device);
+  const auth = await jf.authenticateWithQuickConnect(secret, jellyfinUrl, device);
   if (!auth) {
     res.redirect("/?error=auth");
     return;
   }
   const username = (await jf.getCurrentUserName(auth.accessToken)) ?? auth.userId;
+  const userKey = { subsonicUsername: username, jellyfinUrl };
 
   if (intent === "link") {
     // Create one linked device with this token and show app password.
-    const appPassword = addLinkedDevice(username, auth.userId, auth.accessToken, deviceLabel);
-    setJellyfinSession(username, auth.userId, auth.accessToken);
+    const appPassword = addLinkedDevice(userKey, auth.userId, auth.accessToken, deviceLabel);
+    setJellyfinSession(userKey, auth.userId, auth.accessToken);
     setSessionUser(res, username);
+    setSessionJellyfinUrl(res, jellyfinUrl);
     res.send(renderDeviceLinkedPage(username, appPassword, deviceLabel));
     return;
   }
 
   // Manage devices: remember session and go to device management.
-  setJellyfinSession(username, auth.userId, auth.accessToken);
+  setJellyfinSession(userKey, auth.userId, auth.accessToken);
   setSessionUser(res, username);
+  setSessionJellyfinUrl(res, jellyfinUrl);
   res.redirect("/devices");
 });
 
@@ -1173,14 +1208,16 @@ router.post("/web/link/password", async (req: Request, res: Response) => {
     res.redirect("/link/password?error=missing");
     return;
   }
-  const auth = await jf.authenticateByName(username, password);
+  const jellyfinUrl = getConfig().allowedJellyfinHosts[0] ?? "";
+  const auth = await jf.authenticateByName(jellyfinUrl, username, password);
   if (!auth) {
     res.redirect("/link/password?error=wrong");
     return;
   }
   // Auth-only step: remember Jellyfin credentials for this Subsonic username.
-  setJellyfinSession(username, auth.userId, auth.accessToken);
+  setJellyfinSession({ subsonicUsername: username, jellyfinUrl }, auth.userId, auth.accessToken);
   setSessionUser(res, username);
+  setSessionJellyfinUrl(res, jellyfinUrl);
   // After auth, take the user to device management where they can link devices.
   res.redirect("/devices");
 });
@@ -1191,14 +1228,17 @@ router.post("/web/link/new-device", async (req: Request, res: Response) => {
     res.redirect("/link");
     return;
   }
+  const jellyfinUrl = getSessionJellyfinUrl(req);
+  const userKey = { subsonicUsername: sessionUser, jellyfinUrl };
   const deviceLabel = (req.body?.deviceLabel as string | undefined)?.trim() || undefined;
 
-  const creds = getJellyfinCredentialsForLinking(sessionUser);
+  const creds = getJellyfinCredentialsForLinking(userKey);
   if (!creds) {
     res.redirect("/?error=no-device");
     return;
   }
   const newAuth = await jf.getNewTokenViaQuickConnect(
+    jellyfinUrl,
     creds.jellyfinAccessToken,
     creds.jellyfinUserId
   );
@@ -1208,7 +1248,7 @@ router.post("/web/link/new-device", async (req: Request, res: Response) => {
   }
 
   const appPassword = addLinkedDevice(
-    sessionUser,
+    userKey,
     newAuth.userId,
     newAuth.accessToken,
     deviceLabel
@@ -1227,7 +1267,8 @@ router.get("/devices", (req: Request, res: Response) => {
     (req.query.unlinked as string) === "1" ||
     (req.query.renamed as string) === "1" ||
     (req.query.unshared as string) === "1";
-  const devices = listLinkedDevices(sessionUser);
+  const sessionJfUrl = getSessionJellyfinUrl(req);
+  const devices = listLinkedDevices({ subsonicUsername: sessionUser, jellyfinUrl: sessionJfUrl });
   const shares = getSharesForUser(sessionUser);
   const flash =
     err === "qc-failed"
@@ -1265,8 +1306,10 @@ router.post("/web/devices", async (req: Request, res: Response) => {
     res.redirect("/devices?error=wrong");
     return;
   }
+  const jellyfinUrl = token.jellyfinUrl || getConfig().allowedJellyfinHosts[0] || "";
   setSessionUser(res, username);
-  const devices = listLinkedDevices(username);
+  setSessionJellyfinUrl(res, jellyfinUrl);
+  const devices = listLinkedDevices({ subsonicUsername: username, jellyfinUrl });
   res.send(
     renderLayout(
       "My devices - Subfin",
@@ -1730,6 +1773,7 @@ router.get("/share/:share_uid", shareEndpointRateLimit, async (req: Request, res
 
   const ctx = toJellyfinContext({
     subsonicUsername: auth.subsonicUsername,
+    jellyfinBaseUrl: auth.jellyfinUrl,
     jellyfinUserId: auth.jellyfinUserId,
     jellyfinAccessToken: auth.jellyfinAccessToken,
   });
@@ -1783,7 +1827,7 @@ router.get("/share/:share_uid/m3u", shareEndpointRateLimit, async (req: Request,
   const baseUrl = (config.subfinPublicUrl || "").replace(/\/$/, "") || `http://localhost:${config.port}`;
   const token = createShareToken(shareUid);
   const auth = getShareAuthByUid(shareUid);
-  const ctx = auth ? toJellyfinContext({ subsonicUsername: auth.subsonicUsername, jellyfinUserId: auth.jellyfinUserId, jellyfinAccessToken: auth.jellyfinAccessToken }) : null;
+  const ctx = auth ? toJellyfinContext({ subsonicUsername: auth.subsonicUsername, jellyfinBaseUrl: auth.jellyfinUrl, jellyfinUserId: auth.jellyfinUserId, jellyfinAccessToken: auth.jellyfinAccessToken }) : null;
   const lines = ["#EXTM3U"];
   for (const id of flatIds) {
     if (ctx) {
@@ -1833,6 +1877,7 @@ router.get("/share/:share_uid/zip", shareEndpointRateLimit, async (req: Request,
 
   const ctx = toJellyfinContext({
     subsonicUsername: auth.subsonicUsername,
+    jellyfinBaseUrl: auth.jellyfinUrl,
     jellyfinUserId: auth.jellyfinUserId,
     jellyfinAccessToken: auth.jellyfinAccessToken,
   });

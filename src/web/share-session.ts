@@ -78,6 +78,7 @@ export function resolveAuthFromShareCookie(req: Request): AuthResult | null {
   if (!auth) return null;
   return {
     subsonicUsername: auth.subsonicUsername,
+    jellyfinBaseUrl: auth.jellyfinUrl,
     jellyfinUserId: auth.jellyfinUserId,
     jellyfinAccessToken: auth.jellyfinAccessToken,
     jellyfinDeviceId: auth.jellyfinDeviceId,

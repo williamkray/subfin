@@ -4,7 +4,7 @@
 import { type Request, type Response } from "express";
 import http from "node:http";
 import https from "node:https";
-import type { AuthParams } from "./auth.js";
+import type { AuthParams, AuthResult } from "./auth.js";
 import {
   resolveAuth,
   resolveAuthFromBasicHeader,
@@ -12,6 +12,7 @@ import {
   resolveAuthFromBasicHeaderWithToken,
 } from "./auth.js";
 import { getClientIp } from "../request-context.js";
+import { restRateLimit, recordRestAuthFailure } from "./rate-limit.js";
 import { resolveAuthFromShareCookie } from "../web/share-session.js";
 import { subsonicEnvelope, subsonicError, ErrorCode, VERSION } from "./response.js";
 import * as handlers from "./handlers.js";
@@ -21,7 +22,7 @@ import { buildJellyfinAuthHeader } from "../jellyfin/client.js";
 
 const HANDLERS: Record<
   string,
-  (auth: { subsonicUsername: string; jellyfinUserId: string; jellyfinAccessToken: string }, params: Record<string, string>) => Promise<Record<string, unknown>>
+  (auth: AuthResult, params: Record<string, string>) => Promise<Record<string, unknown>>
 > = {
   ping: async () => handlers.handlePing(),
   getlicense: async () => handlers.handleGetLicense(),
@@ -303,6 +304,11 @@ function getDeviceForProxy(auth: { jellyfinDeviceId?: string; jellyfinDeviceName
 }
 
 export async function subsonicRouter(req: Request, res: Response): Promise<void> {
+  // Per-IP rate limit: applied before any auth or handler work.
+  let rateLimitHandled = false;
+  restRateLimit(req, res, () => { rateLimitHandled = true; });
+  if (!rateLimitHandled) return;
+
   const rawParam = req.params.method ?? "";
   const raw = (typeof rawParam === "string" ? rawParam : rawParam[0] ?? "").replace(/\.view$/i, "").trim();
   const method = (raw || "ping").toLowerCase();
@@ -310,31 +316,24 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
   const params = getParams(req);
   const format = getFormat(params);
   const authParams = getAuthParams(params);
-  const clientInfo = {
-    userAgent: req.get("user-agent") || "",
-    clientIp: getClientIp() || "unknown",
-  };
 
   // Auth
   let authResult: Awaited<ReturnType<typeof resolveAuth>>;
   // getCoverArt: try Authorization: Basic first when present (some clients send creds only in header)
   if (method === "getcoverart" && req.get("authorization")?.startsWith("Basic ")) {
     const headerAuth = resolveAuthFromBasicHeader(req.get("authorization"));
-    authResult = headerAuth ?? (await resolveAuth(authParams, clientInfo));
+    authResult = headerAuth ?? (await resolveAuth(authParams));
   } else {
-    authResult = await resolveAuth(authParams, clientInfo);
+    authResult = await resolveAuth(authParams);
   }
   // When u/p not sent (e.g. share page player with cookie), try share cookie
   if ("code" in authResult && authResult.code === 10) {
     const shareAuth = resolveAuthFromShareCookie(req);
     if (shareAuth) authResult = shareAuth;
   }
-  // When params auth failed, try Authorization: Basic (store + Jellyfin pass-through) for any method
+  // When params auth failed, try Authorization: Basic for any method
   if ("code" in authResult && req.get("authorization")?.startsWith("Basic ")) {
-    const basicAuth = await resolveAuthFromBasicHeaderWithJellyfin(
-      req.get("authorization"),
-      clientInfo
-    );
+    const basicAuth = resolveAuthFromBasicHeaderWithJellyfin(req.get("authorization"));
     if (basicAuth) authResult = basicAuth;
   }
   // getCoverArt: additional fallbacks when params auth failed (image loader sends t in header, u+s in URL)
@@ -363,6 +362,9 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
     }
   }
   if ("code" in authResult) {
+    const ip = getClientIp() ?? req.socket?.remoteAddress ?? "unknown";
+    console.log(`[AUTH_FAIL] method=${method} ip=${ip} code=${authResult.code}`);
+    recordRestAuthFailure(req);
     const httpStatus = authResult.code === 40 ? 401 : 200;
     sendError(res, format, authResult.code, authResult.message, httpStatus);
     return;
@@ -1381,6 +1383,8 @@ function proxyBinary(
       });
     }
 
+    const MAX_PROXY_BYTES = 500 * 1024 * 1024; // 500MB — covers large lossless files
+
     const proxyReq = agent.request(
       {
         method: "GET",
@@ -1405,6 +1409,10 @@ function proxyBinary(
         let bytes = 0;
         proxyRes.on("data", (chunk: Buffer) => {
           bytes += chunk.length;
+          if (bytes > MAX_PROXY_BYTES) {
+            proxyReq.destroy(new Error("upstream response too large"));
+            try { clientRes.destroy(); } catch { /* ignore */ }
+          }
         });
         proxyRes.on("end", () => {
           if (config.logRest) {
@@ -1421,6 +1429,10 @@ function proxyBinary(
         proxyRes.pipe(clientRes);
       }
     );
+
+    proxyReq.setTimeout(30_000, () => {
+      proxyReq.destroy(new Error("upstream timeout"));
+    });
 
     proxyReq.on("error", (err) => {
       console.error("Proxy stream error", err);

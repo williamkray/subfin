@@ -111,6 +111,7 @@ import {
   savePlayQueue,
   createShare as storeCreateShare,
   getJellyfinCredentialsForLinking,
+  getUserLibrarySettings,
   getSharesForUser,
   updateShare as storeUpdateShare,
   deleteShare as storeDeleteShare,
@@ -129,14 +130,15 @@ import {
 } from "./mappers.js";
 import { toJellyfinContext, type AuthResult } from "./auth.js";
 
-/** Resolve effective music folder id(s) for list endpoints: client param wins; else MUSIC_LIBRARY_IDS when set. Returns null = no restriction, [] = no allowed folders, [id...] = use these. */
+/** Resolve effective music folder id(s) for list endpoints: client param wins; else per-user DB settings. Returns null = no restriction, [id...] = use these. */
 async function getEffectiveMusicFolderIds(
   auth: AuthResult,
   clientMusicFolderId?: string
 ): Promise<string[] | null> {
   const trimmed = clientMusicFolderId?.trim();
   if (trimmed) return [trimmed];
-  return jf.getAllowedMusicFolderIds(toJellyfinContext(auth), auth.jellyfinUserId);
+  const savedIds = getUserLibrarySettings({ subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl });
+  return jf.getAllowedMusicFolderIds(toJellyfinContext(auth), auth.jellyfinUserId, savedIds);
 }
 
 /** Normalize artist name for deduplication/lookup: lowercase + strip spaces and common punctuation. */
@@ -1880,7 +1882,8 @@ export async function handleCreateShare(
   if (expiresAt !== null && (Number.isNaN(expiresAt) || expiresAt < 0)) throw new Error("Invalid expires");
 
   // Use behind-the-scenes Quick Connect so the share has its own token, not tied to the requesting device.
-  const creds = getJellyfinCredentialsForLinking(auth.subsonicUsername);
+  const userKey = { subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl };
+  const creds = getJellyfinCredentialsForLinking(userKey);
   if (!creds) {
     throw new Error(
       "Quick Connect required to create shares. Use the web app to link a device with Quick Connect first."
@@ -1889,6 +1892,7 @@ export async function handleCreateShare(
   const shareDeviceName =
     "Subfin Share: " + (description ? description.slice(0, 80) : "link");
   const shareAuth = await jf.getNewTokenViaQuickConnect(
+    auth.jellyfinBaseUrl,
     creds.jellyfinAccessToken,
     creds.jellyfinUserId,
     { deviceName: shareDeviceName }
@@ -1899,7 +1903,7 @@ export async function handleCreateShare(
     );
   }
 
-  const { shareUid, secret } = storeCreateShare(auth.subsonicUsername, shareAuth.userId, shareAuth.accessToken, {
+  const { shareUid, secret } = storeCreateShare(userKey, shareAuth.userId, shareAuth.accessToken, {
     entryIds,
     entryIdsFlat,
     description,
@@ -2055,8 +2059,9 @@ export async function handleSavePlayQueue(
     .filter((id) => id && id !== "[object Object]")
     .map((id) => stripSubsonicIdPrefix(id));
 
+  const userKey = { subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl };
   if (entryIds.length === 0) {
-    clearPlayQueue(auth.subsonicUsername);
+    clearPlayQueue(userKey);
     return {};
   }
 
@@ -2067,7 +2072,7 @@ export async function handleSavePlayQueue(
 
   const resolvedCurrentId = currentId && entryIds.includes(currentId) ? currentId : entryIds[0] ?? null;
   const currentIndex = resolvedCurrentId ? Math.max(0, entryIds.indexOf(resolvedCurrentId)) : 0;
-  savePlayQueue(auth.subsonicUsername, {
+  savePlayQueue(userKey, {
     entryIds,
     currentId: resolvedCurrentId,
     currentIndex,
@@ -2089,8 +2094,9 @@ export async function handleSavePlayQueueByIndex(
     .filter((id) => id && id !== "[object Object]")
     .map((id) => stripSubsonicIdPrefix(id));
 
+  const userKey = { subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl };
   if (entryIds.length === 0) {
-    clearPlayQueue(auth.subsonicUsername);
+    clearPlayQueue(userKey);
     return {};
   }
 
@@ -2104,7 +2110,7 @@ export async function handleSavePlayQueueByIndex(
   const positionMs = Math.max(0, Number.parseInt(params.position ?? "0", 10) || 0);
   const changedBy = (params.changedBy ?? params.c ?? "").trim().slice(0, 255);
 
-  savePlayQueue(auth.subsonicUsername, {
+  savePlayQueue(userKey, {
     entryIds,
     currentId,
     currentIndex,
@@ -2116,7 +2122,7 @@ export async function handleSavePlayQueueByIndex(
 
 /** Return saved play queue for this user with full entry metadata from Jellyfin (OpenSubsonic getPlayQueue). */
 export async function handleGetPlayQueue(auth: AuthResult): Promise<Record<string, unknown>> {
-  const queue = getPlayQueue(auth.subsonicUsername);
+  const queue = getPlayQueue({ subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl });
   if (!queue || queue.entryIds.length === 0) {
     return {
       playQueue: {
@@ -2155,7 +2161,7 @@ export async function handleGetPlayQueue(auth: AuthResult): Promise<Record<strin
 
 /** Return saved play queue by index for this user (OpenSubsonic indexBasedQueue extension). */
 export async function handleGetPlayQueueByIndex(auth: AuthResult): Promise<Record<string, unknown>> {
-  const queue = getPlayQueue(auth.subsonicUsername);
+  const queue = getPlayQueue({ subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl });
   if (!queue || queue.entryIds.length === 0) {
     return {
       playQueueByIndex: {

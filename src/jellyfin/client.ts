@@ -28,23 +28,30 @@ const { jellyfin: jf } = config;
 
 /**
  * Context for Jellyfin API calls. Either a plain access token (legacy / no device) or an object
- * with token and optional per-device identity so Jellyfin shows separate devices in the dashboard.
+ * with token, optional per-device identity, and optional Jellyfin base URL for multi-tenant.
  */
 export type JellyfinContext =
   | string
-  | { accessToken: string; userId?: string; deviceId?: string; deviceName?: string };
+  | { accessToken: string; jellyfinBaseUrl?: string; userId?: string; deviceId?: string; deviceName?: string };
+
+/** Resolve the Jellyfin base URL from context. Falls back to config singleton for backward compat. */
+function resolveBaseUrl(ctx: JellyfinContext): string {
+  if (typeof ctx === "string") return jf.baseUrl;
+  return ctx.jellyfinBaseUrl ?? jf.baseUrl;
+}
 
 function normalizeContext(ctx: JellyfinContext): {
   accessToken: string;
+  jellyfinBaseUrl: string;
   device?: { id: string; name: string };
 } {
   if (typeof ctx === "string") {
-    return { accessToken: ctx };
+    return { accessToken: ctx, jellyfinBaseUrl: jf.baseUrl };
   }
-  const { accessToken, deviceId, deviceName } = ctx;
+  const { accessToken, jellyfinBaseUrl, deviceId, deviceName } = ctx;
   const device =
     deviceId && deviceName ? { id: deviceId, name: deviceName } : undefined;
-  return { accessToken, device };
+  return { accessToken, jellyfinBaseUrl: jellyfinBaseUrl ?? jf.baseUrl, device };
 }
 
 /**
@@ -73,20 +80,20 @@ const jellyfinApiCache = new Map<JellyfinApiCacheKey, JellyfinApiCacheEntry>();
 const ALLOWED_MUSIC_FOLDER_TTL_MS = 5 * 60 * 1000;
 const JELLYFIN_API_CACHE_TTL_MS = 5 * 60 * 1000;
 
-function makeAllowedMusicFolderCacheKey(accessToken: string, userId: string): AllowedMusicFolderCacheKey {
-  // accessToken is already scoped to a Jellyfin server and user; include both
-  // to avoid accidental cross-user reuse if tokens are shared.
-  return `${userId}:${accessToken}`;
+function makeAllowedMusicFolderCacheKey(jellyfinBaseUrl: string, accessToken: string, userId: string): AllowedMusicFolderCacheKey {
+  // Include URL to scope cache per Jellyfin server in multi-tenant deployments.
+  return `${jellyfinBaseUrl}:${userId}:${accessToken}`;
 }
 
-function makeJellyfinApiCacheKey(accessToken: string, deviceId?: string): JellyfinApiCacheKey {
+function makeJellyfinApiCacheKey(jellyfinBaseUrl: string, accessToken: string, deviceId?: string): JellyfinApiCacheKey {
   const base = accessToken || "__no_token__";
-  return deviceId ? `${base}:${deviceId}` : base;
+  const urlPart = jellyfinBaseUrl || jf.baseUrl;
+  return deviceId ? `${urlPart}:${base}:${deviceId}` : `${urlPart}:${base}`;
 }
 
-function createJellyfinApi(accessToken: string, device?: { id: string; name: string }) {
+function createJellyfinApi(jellyfinBaseUrl: string, accessToken: string, device?: { id: string; name: string }) {
   const now = Date.now();
-  const key = makeJellyfinApiCacheKey(accessToken, device?.id);
+  const key = makeJellyfinApiCacheKey(jellyfinBaseUrl, accessToken, device?.id);
   const cached = jellyfinApiCache.get(key);
   if (cached && cached.expiresAt > now) {
     return cached.api;
@@ -110,7 +117,7 @@ function createJellyfinApi(accessToken: string, device?: { id: string; name: str
     }
     return config;
   });
-  const api = jellyfin.createApi(jf.baseUrl, accessToken, axiosInstance);
+  const api = jellyfin.createApi(jellyfinBaseUrl || jf.baseUrl, accessToken, axiosInstance);
   jellyfinApiCache.set(key, {
     api,
     expiresAt: now + JELLYFIN_API_CACHE_TTL_MS,
@@ -118,10 +125,10 @@ function createJellyfinApi(accessToken: string, device?: { id: string; name: str
   return api;
 }
 
-/** Get API instance for the given context (cached per token + device). */
+/** Get API instance for the given context (cached per URL + token + device). */
 function getApi(ctx: JellyfinContext): JellyfinApiInstance {
-  const { accessToken, device } = normalizeContext(ctx);
-  return createJellyfinApi(accessToken, device);
+  const { accessToken, jellyfinBaseUrl, device } = normalizeContext(ctx);
+  return createJellyfinApi(jellyfinBaseUrl, accessToken, device);
 }
 
 /** Device ID to use in URLs (e.g. stream/download); from context when present, else config. */
@@ -163,41 +170,42 @@ export async function getMusicLibraries(
   const music = folders.filter(
     (f: BaseItemDto) => f.CollectionType === CollectionType.Music
   );
-  if (config.musicLibraryIds.length > 0) {
-    return music
-      .filter((m: BaseItemDto) => {
-        if (!m.Id) return false;
-        return config.musicLibraryIds.some((v) => {
-          const t = v.trim();
-          if (isJellyfinViewId(t)) return m.Id === t;
-          return m.Name?.toLowerCase().trim() === t.toLowerCase();
-        });
-      })
-      .map((m: BaseItemDto) => ({ id: m.Id!, name: m.Name ?? "Music" }));
-  }
   return music.map((m: BaseItemDto) => ({ id: m.Id!, name: m.Name ?? "Music" }));
 }
 
-/** When MUSIC_LIBRARY_IDS is set, returns allowed music folder IDs for this user (names resolved to IDs). When not set, returns null (no restriction). Used to default list endpoints to those folders when the client does not send musicFolderId. */
+/** Get allowed music folder IDs for a user. Optionally filtered by allowedIds (from per-user DB settings).
+ * Returns null when no restriction (all libraries). Caches resolved IDs per (server, user). */
 export async function getAllowedMusicFolderIds(
   ctx: JellyfinContext,
-  userId: string
+  userId: string,
+  allowedIds?: string[] | null
 ): Promise<string[] | null> {
-  if (config.musicLibraryIds.length === 0) return null;
-  const { accessToken } = normalizeContext(ctx);
+  // No restriction when no allowedIds configured.
+  if (!allowedIds || allowedIds.length === 0) return null;
+  const { accessToken, jellyfinBaseUrl } = normalizeContext(ctx);
   const now = Date.now();
-  const key = makeAllowedMusicFolderCacheKey(accessToken, userId);
+  // Cache key includes the allowedIds hash to invalidate when settings change.
+  const settingsKey = allowedIds.join(",");
+  const key = makeAllowedMusicFolderCacheKey(jellyfinBaseUrl, accessToken, userId) + ":" + settingsKey;
   const cached = allowedMusicFolderCache.get(key);
   if (cached && cached.expiresAt > now) {
     return cached.ids;
   }
-  const folders = await getMusicLibraries(ctx, userId);
-  const ids = folders.map((f) => f.id);
+  const allFolders = await getMusicLibraries(ctx, userId);
+  // Filter by allowedIds (supports both IDs and names).
+  const filtered = allFolders.filter((f) =>
+    allowedIds.some((v) => {
+      const t = v.trim();
+      if (isJellyfinViewId(t)) return f.id === t;
+      return f.name.toLowerCase().trim() === t.toLowerCase();
+    })
+  );
+  const ids = filtered.map((f) => f.id);
   allowedMusicFolderCache.set(key, {
     ids,
     expiresAt: now + ALLOWED_MUSIC_FOLDER_TTL_MS,
   });
-  return ids;
+  return ids.length > 0 ? ids : null;
 }
 
 
@@ -512,7 +520,7 @@ export async function getAlbumsForLibrary(
     const { accessToken, device } = normalizeContext(ctx);
     const api: any = getApi(ctx);
     const authHeader = buildJellyfinAuthHeader(accessToken, device);
-    const base = jf.baseUrl.replace(/\/$/, "");
+    const base = resolveBaseUrl(ctx).replace(/\/$/, "");
     const url = new URL(`${base}/Users/${opts.userId}/Items`);
     url.searchParams.set("IncludeItemTypes", BaseItemKind.MusicAlbum);
     url.searchParams.set("Recursive", "true");
@@ -979,7 +987,7 @@ export async function getFavoriteArtists(
   const authHeader = buildJellyfinAuthHeader(accessToken, device);
 
   if (userId) {
-    const base = jf.baseUrl.replace(/\/$/, "");
+    const base = resolveBaseUrl(ctx).replace(/\/$/, "");
     const url = new URL(`${base}/Users/${userId}/Items`);
     url.searchParams.set("IncludeItemTypes", BaseItemKind.MusicArtist);
     url.searchParams.set("Recursive", "true");
@@ -1531,7 +1539,7 @@ export async function getLyricsForItem(
     return { value: cached.value, lines: cached.lines };
   }
   const { accessToken, device } = normalizeContext(ctx);
-  const base = jf.baseUrl.replace(/\/$/, "");
+  const base = resolveBaseUrl(ctx).replace(/\/$/, "");
   const url = `${base}/Audio/${itemId}/Lyrics`;
   const authHeader = buildJellyfinAuthHeader(accessToken, device);
   const api: any = getApi(ctx);
@@ -1651,7 +1659,7 @@ export function getStreamUrl(
 ): string {
   const { accessToken } = normalizeContext(ctx);
   const deviceId = getDeviceIdForUrl(ctx);
-  const base = jf.baseUrl.replace(/\/$/, "");
+  const base = resolveBaseUrl(ctx).replace(/\/$/, "");
   const normalized = (format ?? "").toLowerCase().trim();
   const wantTranscode = normalized && normalized !== "raw" && TRANSCODE_FORMATS.has(normalized);
   const audioBitRateBps = maxBitRateKbps && maxBitRateKbps > 0 ? maxBitRateKbps * 1000 : 320000;
@@ -1690,7 +1698,7 @@ export function getDownloadUrl(
 ): string {
   const { accessToken } = normalizeContext(ctx);
   const deviceId = getDeviceIdForUrl(ctx);
-  const base = jf.baseUrl.replace(/\/$/, "");
+  const base = resolveBaseUrl(ctx).replace(/\/$/, "");
   const url = new URL(`${base}/Audio/${itemId}/stream`);
   url.searchParams.set("UserId", userId);
   url.searchParams.set("DeviceId", deviceId);
@@ -1708,7 +1716,7 @@ export function getImageUrl(
   size?: number
 ): string {
   const { accessToken } = normalizeContext(ctx);
-  const base = jf.baseUrl.replace(/\/$/, "");
+  const base = resolveBaseUrl(ctx).replace(/\/$/, "");
   const url = new URL(`${base}/Items/${itemId}/Images/${imageType}`);
   if (size && size > 0) {
     url.searchParams.set("maxHeight", String(size));
@@ -1725,7 +1733,7 @@ export function getUserAvatarUrl(
   size?: number
 ): string {
   const { accessToken } = normalizeContext(ctx);
-  const base = jf.baseUrl.replace(/\/$/, "");
+  const base = resolveBaseUrl(ctx).replace(/\/$/, "");
   const url = new URL(`${base}/Users/${userId}/Images/Primary`);
   if (size && size > 0) {
     url.searchParams.set("maxHeight", String(size));
@@ -1735,9 +1743,9 @@ export function getUserAvatarUrl(
   return url.toString();
 }
 
-/** Check if QuickConnect is enabled (for web UI). */
-export async function getQuickConnectEnabled(): Promise<boolean> {
-  const api = getApi(""); // no token needed for this call
+/** Check if QuickConnect is enabled on a given Jellyfin server. */
+export async function getQuickConnectEnabled(jellyfinUrl?: string): Promise<boolean> {
+  const api = getApi({ accessToken: "", jellyfinBaseUrl: jellyfinUrl });
   const qcApi = getQuickConnectApi(api);
   try {
     const response = await qcApi.getQuickConnectEnabled();
@@ -1750,7 +1758,7 @@ export async function getQuickConnectEnabled(): Promise<boolean> {
 /** Start QuickConnect: returns { secret, code, deviceId, deviceName } for user to authorize in Jellyfin.
  * Uses a unique device id per call so Jellyfin treats each QC flow as a different device (avoids token overwrite).
  * Optional deviceNameOverride: use a custom name (e.g. "Subfin Share: Summer playlist") so the device is identifiable in the Jellyfin dashboard. */
-export async function initiateQuickConnect(deviceNameOverride?: string): Promise<{
+export async function initiateQuickConnect(jellyfinUrl: string, deviceNameOverride?: string): Promise<{
   secret: string;
   code: string;
   deviceId: string;
@@ -1760,7 +1768,7 @@ export async function initiateQuickConnect(deviceNameOverride?: string): Promise
   const deviceName = (deviceNameOverride?.trim() && deviceNameOverride.trim().length <= 128)
     ? deviceNameOverride.trim()
     : "Subfin QC";
-  const api = getApi({ accessToken: "", deviceId, deviceName });
+  const api = getApi({ accessToken: "", jellyfinBaseUrl: jellyfinUrl, deviceId, deviceName });
   const qcApi = getQuickConnectApi(api);
   try {
     const response = await qcApi.initiateQuickConnect();
@@ -1782,9 +1790,10 @@ export async function initiateQuickConnect(deviceNameOverride?: string): Promise
 export async function authorizeQuickConnect(
   code: string,
   userId: string,
-  existingAccessToken: string
+  existingAccessToken: string,
+  jellyfinUrl?: string
 ): Promise<boolean> {
-  const api = getApi(existingAccessToken);
+  const api = getApi({ accessToken: existingAccessToken, jellyfinBaseUrl: jellyfinUrl });
   const qcApi = getQuickConnectApi(api);
   try {
     await qcApi.authorizeQuickConnect({ code, userId });
@@ -1814,18 +1823,19 @@ function qcLog(msg: string, detail?: unknown): void {
  * (so the device appears as a distinct device in the Jellyfin dashboard).
  * Optional options.deviceName: custom name for this device in Jellyfin (e.g. "Subfin Share: My playlist"). */
 export async function getNewTokenViaQuickConnect(
+  jellyfinUrl: string,
   existingAccessToken: string,
   jellyfinUserId: string,
   options?: { deviceName?: string }
 ): Promise<{ userId: string; accessToken: string; deviceId: string; deviceName: string } | null> {
-  const initiated = await initiateQuickConnect(options?.deviceName);
+  const initiated = await initiateQuickConnect(jellyfinUrl, options?.deviceName);
   if (!initiated) {
     console.warn("[QC] Link new device (no password): Quick Connect failed at initiate.");
     return null;
   }
   qcLog("initiate ok", { code: initiated.code });
   const { secret, code, deviceId, deviceName } = initiated;
-  const authorized = await authorizeQuickConnect(code, jellyfinUserId, existingAccessToken);
+  const authorized = await authorizeQuickConnect(code, jellyfinUserId, existingAccessToken, jellyfinUrl);
   if (!authorized) {
     console.warn("[QC] Link new device (no password): Quick Connect failed at authorize (check token validity).");
     return null;
@@ -1833,9 +1843,9 @@ export async function getNewTokenViaQuickConnect(
   qcLog("authorize ok");
   for (let i = 0; i < 10; i++) {
     await new Promise((r) => setTimeout(r, 400));
-    const state = await getQuickConnectState(secret);
+    const state = await getQuickConnectState(secret, jellyfinUrl);
     if (state.authenticated) {
-      const auth = await authenticateWithQuickConnect(secret, { id: deviceId, name: deviceName });
+      const auth = await authenticateWithQuickConnect(secret, jellyfinUrl, { id: deviceId, name: deviceName });
       if (auth) {
         qcLog("token exchange ok");
         return { ...auth, deviceId, deviceName };
@@ -1850,10 +1860,10 @@ export async function getNewTokenViaQuickConnect(
 }
 
 /** Poll QuickConnect state. */
-export async function getQuickConnectState(secret: string): Promise<{
+export async function getQuickConnectState(secret: string, jellyfinUrl?: string): Promise<{
   authenticated: boolean;
 }> {
-  const api = getApi("");
+  const api = getApi({ accessToken: "", jellyfinBaseUrl: jellyfinUrl });
   const qcApi = getQuickConnectApi(api);
   try {
     const response = await qcApi.getQuickConnectState({ secret });
@@ -1872,11 +1882,12 @@ export async function getQuickConnectState(secret: string): Promise<{
  * Pass the same device used at Initiate so Jellyfin ties the token to that device. */
 export async function authenticateWithQuickConnect(
   secret: string,
+  jellyfinUrl?: string,
   device?: { id: string; name: string }
 ): Promise<{ userId: string; accessToken: string } | null> {
   const api = device
-    ? getApi({ accessToken: "", deviceId: device.id, deviceName: device.name })
-    : getApi("");
+    ? getApi({ accessToken: "", jellyfinBaseUrl: jellyfinUrl, deviceId: device.id, deviceName: device.name })
+    : getApi({ accessToken: "", jellyfinBaseUrl: jellyfinUrl });
   const userApi = getUserApi(api);
   try {
     const response = await userApi.authenticateWithQuickConnect({
@@ -1916,16 +1927,18 @@ export async function getCurrentUserName(ctxOrToken: JellyfinContext | string): 
  * with a bad/invalid Authorization header could wipe the server's Devices table; fixed in 10.9.
  * See .local-testing/auth-and-device-investigation.md. */
 export async function authenticateByName(
+  jellyfinUrl: string,
   username: string,
   password: string
 ): Promise<{ userId: string; accessToken: string } | null> {
-  return authenticateByNameWithDevice(username, password, jf.deviceId, jf.deviceName);
+  return authenticateByNameWithDevice(jellyfinUrl, username, password, jf.deviceId, jf.deviceName);
 }
 
 /** Authenticate by username and password with a specific device id/name.
  * Jellyfin creates a new session (and token) per device. Use this when linking a new
  * Subfin device so each linked device has its own long-lived Jellyfin token. */
 export async function authenticateByNameWithDevice(
+  jellyfinUrl: string,
   username: string,
   password: string,
   deviceId: string,
@@ -1933,6 +1946,7 @@ export async function authenticateByNameWithDevice(
 ): Promise<{ userId: string; accessToken: string } | null> {
   const api = getApi({
     accessToken: "",
+    jellyfinBaseUrl: jellyfinUrl,
     deviceId,
     deviceName,
   });

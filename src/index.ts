@@ -5,6 +5,7 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
 import { config } from "./config.js";
 import { clientIpMiddleware } from "./request-context.js";
 import { subsonicRouter } from "./subsonic/router.js";
@@ -16,9 +17,25 @@ getDb();
 
 const app = express();
 
+const trustProxy = process.env.SUBFIN_TRUST_PROXY === "true" || process.env.SUBFIN_TRUST_PROXY === "1";
+if (trustProxy) app.set("trust proxy", 1);
+
 app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:"],
+      mediaSrc: ["'self'"],
+      connectSrc: ["'self'"],
+      frameSrc: ["'none'"],
+    },
+  },
+}));
+app.use(express.json({ limit: "64kb" }));
+app.use(express.urlencoded({ extended: true, limit: "64kb" }));
 // Set request-scoped client IP (X-Forwarded-For / X-Real-IP / remoteAddress) for Jellyfin outbound requests.
 app.use(clientIpMiddleware);
 

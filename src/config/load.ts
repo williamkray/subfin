@@ -21,7 +21,8 @@ export interface Config {
   port: number;
   subfinPublicUrl: string;
   jellyfin: JellyfinConfig;
-  musicLibraryIds: string[];
+  /** Allowed Jellyfin backend URLs. Non-empty = restricted mode; empty = open mode (SSRF mitigation required). */
+  allowedJellyfinHosts: string[];
   dbPath: string;
   logRest: boolean;
   /** Optional Last.fm API key for enriching artist info (biography, last.fm URL). */
@@ -86,12 +87,20 @@ export function loadConfig(): Config {
   const jellyfinClient = getFromEnvOrFile(file, "JELLYFIN_CLIENT", "clientName", "jellyfin") ?? "Subfin";
   const jellyfinDeviceId = getFromEnvOrFile(file, "JELLYFIN_DEVICE_ID", "deviceId", "jellyfin") ?? "subfin-device-1";
   const jellyfinDeviceName = getFromEnvOrFile(file, "JELLYFIN_DEVICE_NAME", "deviceName", "jellyfin") ?? "Subfin Middleware";
-  const musicLibraryIdsRaw = getFromEnvOrFile(file, "MUSIC_LIBRARY_IDS", "musicLibraryIds");
-  const musicLibraryIds: string[] = musicLibraryIdsRaw
-    ? musicLibraryIdsRaw.split(",").map((s) => s.trim()).filter(Boolean)
-    : Array.isArray(file.musicLibraryIds)
-      ? file.musicLibraryIds.filter((x): x is string => typeof x === "string")
-      : [];
+  // ALLOWED_JELLYFIN_HOSTS: comma-separated URLs. If not set, defaults to [jellyfinBaseUrl] for backward compat.
+  const allowedJellyfinHostsRaw = getFromEnvOrFile(file, "ALLOWED_JELLYFIN_HOSTS", "allowedJellyfinHosts");
+  let allowedJellyfinHosts: string[];
+  if (allowedJellyfinHostsRaw !== undefined) {
+    allowedJellyfinHosts = allowedJellyfinHostsRaw.split(",").map((s) => s.trim().replace(/\/$/, "")).filter(Boolean);
+  } else if (Array.isArray(file.allowedJellyfinHosts)) {
+    allowedJellyfinHosts = (file.allowedJellyfinHosts as unknown[])
+      .filter((x): x is string => typeof x === "string")
+      .map((s) => s.trim().replace(/\/$/, ""))
+      .filter(Boolean);
+  } else {
+    // Backward compat: single-server deployments default to [JELLYFIN_URL] (restricted mode, one host).
+    allowedJellyfinHosts = jellyfinBaseUrl ? [jellyfinBaseUrl] : [];
+  }
   const dbPath = getFromEnvOrFile(file, "SUBFIN_DB_PATH", "dbPath") ?? "./subfin.db";
   const logRestRaw = getFromEnvOrFile(file, "SUBFIN_LOG_REST", "logRest");
   const logRest = logRestRaw === "true" || logRestRaw === "1" || file.logRest === true;
@@ -114,7 +123,7 @@ export function loadConfig(): Config {
       deviceId: jellyfinDeviceId,
       deviceName: jellyfinDeviceName,
     },
-    musicLibraryIds: Array.isArray(musicLibraryIds) ? musicLibraryIds : [],
+    allowedJellyfinHosts,
     dbPath,
     logRest,
     lastFmApiKey,
@@ -127,4 +136,9 @@ let cached: Config | null = null;
 export function getConfig(): Config {
   if (!cached) cached = loadConfig();
   return cached;
+}
+
+/** True when no Jellyfin host allowlist is configured (open mode: any URL accepted, SSRF mitigation required). */
+export function isOpenMode(): boolean {
+  return getConfig().allowedJellyfinHosts.length === 0;
 }
