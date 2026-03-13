@@ -1,5 +1,8 @@
+/** Tracks cache keys for which a background artist index refresh is already in progress. */
+const refreshInProgress = new Set<string>();
+
 /** Get or build the album-derived artist index for the given effective folder ids, using derived_cache to avoid
- * repeatedly walking Jellyfin libraries. */
+ * repeatedly walking Jellyfin libraries. Returns stale data immediately and refreshes in the background when stale. */
 async function getOrBuildArtistIndex(
   auth: AuthResult,
   folderIds: string[] | null
@@ -12,7 +15,69 @@ async function getOrBuildArtistIndex(
   const cacheKey = `artistIndex:${auth.jellyfinUserId}:${folderPart}`;
   const ttlMs = 15 * 60 * 1000; // 15 minutes
 
-  // Cheap probe: newest album timestamp used as a coarse "library changed" signal.
+  const existing = getDerivedCache<CachedArtistIndexPayload>(cacheKey);
+
+  // No cache entry at all — block and build synchronously (first load).
+  if (!existing || !existing.value || !existing.cachedAt) {
+    const latestAlbumDate = await fetchLatestAlbumDate(ctx, folderIds);
+    const artists = await getAlbumArtistsForFolders(auth, folderIds);
+    setDerivedCache<CachedArtistIndexPayload>(
+      cacheKey,
+      {
+        artists: artists.map((a) => ({
+          Id: a.Id,
+          Name: a.Name ?? "",
+          AlbumCount: (a as any).AlbumCount ?? 0,
+        })),
+      },
+      latestAlbumDate
+    );
+    return artists;
+  }
+
+  // Cache entry exists — check validity.
+  const ageMs = Date.now() - new Date(existing.cachedAt).getTime();
+  const latestAlbumDate = await fetchLatestAlbumDate(ctx, folderIds);
+  const sourceUnchanged =
+    !latestAlbumDate || existing.lastSourceChangeAt === latestAlbumDate || !existing.lastSourceChangeAt;
+
+  if (ageMs < ttlMs && sourceUnchanged) {
+    // Cache is fresh — return immediately.
+    return mapCachedArtists(existing.value);
+  }
+
+  // Cache is stale — return existing data immediately and refresh in the background.
+  if (!refreshInProgress.has(cacheKey)) {
+    refreshInProgress.add(cacheKey);
+    getAlbumArtistsForFolders(auth, folderIds)
+      .then((artists) => {
+        setDerivedCache<CachedArtistIndexPayload>(
+          cacheKey,
+          {
+            artists: artists.map((a) => ({
+              Id: a.Id,
+              Name: a.Name ?? "",
+              AlbumCount: (a as any).AlbumCount ?? 0,
+            })),
+          },
+          latestAlbumDate
+        );
+      })
+      .catch(() => {
+        // Background refresh failed — stale cache remains; next request will retry.
+      })
+      .finally(() => {
+        refreshInProgress.delete(cacheKey);
+      });
+  }
+
+  return mapCachedArtists(existing.value);
+}
+
+async function fetchLatestAlbumDate(
+  ctx: ReturnType<typeof toJellyfinContext>,
+  folderIds: string[] | null
+): Promise<string | null> {
   const newestPerFolder: (string | null)[] = [];
   if (folderIds === null) {
     newestPerFolder.push(await jf.getNewestAlbumDateCreated(ctx, { musicFolderId: undefined }));
@@ -21,42 +86,18 @@ async function getOrBuildArtistIndex(
       newestPerFolder.push(await jf.getNewestAlbumDateCreated(ctx, { musicFolderId: id }));
     }
   }
-  const latestAlbumDate =
-    newestPerFolder
-      .filter((d): d is string => !!d)
-      .sort()
-      .slice(-1)[0] ?? null;
+  return newestPerFolder.filter((d): d is string => !!d).sort().slice(-1)[0] ?? null;
+}
 
-  const existing = getDerivedCache<CachedArtistIndexPayload>(cacheKey);
-  if (existing && existing.value && existing.cachedAt) {
-    const ageMs = Date.now() - new Date(existing.cachedAt).getTime();
-    const sourceUnchanged =
-      !latestAlbumDate || existing.lastSourceChangeAt === latestAlbumDate || !existing.lastSourceChangeAt;
-    if (ageMs < ttlMs && sourceUnchanged) {
-      return (existing.value.artists ?? []).map((a) => {
-        const name = a.Name ?? "";
-        return {
-          Id: a.Id,
-          Name: name,
-          AlbumCount: a.AlbumCount ?? 0,
-        } as BaseItemDto;
-      });
-    }
-  }
-
-  const artists = await getAlbumArtistsForFolders(auth, folderIds);
-  setDerivedCache<CachedArtistIndexPayload>(
-    cacheKey,
-    {
-      artists: artists.map((a) => ({
-        Id: a.Id,
-        Name: a.Name ?? "",
-        AlbumCount: (a as any).AlbumCount ?? 0,
-      })),
-    },
-    latestAlbumDate
-  );
-  return artists;
+function mapCachedArtists(payload: CachedArtistIndexPayload): BaseItemDto[] {
+  return (payload.artists ?? []).map((a) => {
+    const name = a.Name ?? "";
+    return {
+      Id: a.Id,
+      Name: name,
+      AlbumCount: a.AlbumCount ?? 0,
+    } as BaseItemDto;
+  });
 }
 /**
  * OpenSubsonic method handlers. Each receives auth result and query params, returns Subsonic-shaped payload or throws.
@@ -311,7 +352,7 @@ export async function handleGetMusicDirectory(
       );
     }
     return {
-      musicDirectory: {
+      directory: {
         id: album.Id,
         name: album.Name ?? "",
         parent: album.ParentId,
@@ -340,7 +381,7 @@ export async function handleGetMusicDirectory(
     );
   }
   return {
-    musicDirectory: {
+    directory: {
       id: artist.Id,
       name: artistName,
       parent: artist.ParentId,
@@ -843,15 +884,15 @@ export async function handleGetArtistInfo(
   const folderIdsForIndex = await getEffectiveMusicFolderIds(auth, undefined);
   const albumArtists = await getOrBuildArtistIndex(auth, folderIdsForIndex);
   const canonicalById = new Map<string, string>();
-  const canonicalByKey = new Map<string, string>();
+  const canonicalKeyToCanonical = new Map<string, { id: string; name: string }>();
   for (const a of albumArtists) {
     if (a.Id && a.Name) {
       const id = String(a.Id);
       const name = a.Name;
       canonicalById.set(id, name);
       const key = canonicalArtistKey(name);
-      if (key && !canonicalByKey.has(key)) {
-        canonicalByKey.set(key, name);
+      if (key && !canonicalKeyToCanonical.has(key)) {
+        canonicalKeyToCanonical.set(key, { id, name });
       }
     }
   }
@@ -865,18 +906,41 @@ export async function handleGetArtistInfo(
       smallImageUrl: imageUrl(34),
       mediumImageUrl: imageUrl(64),
       largeImageUrl: imageUrl(174) ?? imageUrl(300),
-      similarArtist: similar.map((a) => ({
-        id: a.Id ? "ar-" + a.Id : undefined,
-        name: (() => {
+      // Build similar artists from canonical ids/names so that:
+      // - Only artists present in the scoped album index are returned
+      // - Multiple Jellyfin ids that normalize to the same artist collapse to a single entry
+      similarArtist: (() => {
+        const byCanonicalId = new Map<string, { id: string; name: string; coverArt?: string }>();
+        for (const a of similar) {
           const rawName = a.Name ?? "";
-          const fromId = a.Id ? canonicalById.get(a.Id) : undefined;
-          if (fromId) return fromId;
-          const key = canonicalArtistKey(rawName);
-          const fromKey = key ? canonicalByKey.get(key) : undefined;
-          return fromKey ?? rawName;
-        })(),
-        coverArt: a.Id ? "ar-" + a.Id : undefined,
-      })),
+          const rawId = a.Id ?? "";
+          let canonicalId: string | null = null;
+          let canonicalName: string | null = null;
+
+          if (rawId && canonicalById.has(rawId)) {
+            canonicalId = rawId;
+            canonicalName = canonicalById.get(rawId) ?? rawName;
+          } else {
+            const key = canonicalArtistKey(rawName);
+            const fromKey = key ? canonicalKeyToCanonical.get(key) : undefined;
+            if (fromKey) {
+              canonicalId = fromKey.id;
+              canonicalName = fromKey.name;
+            }
+          }
+
+          // Skip artists that don't exist in the scoped album index.
+          if (!canonicalId || !canonicalName) continue;
+          if (byCanonicalId.has(canonicalId)) continue;
+
+          byCanonicalId.set(canonicalId, {
+            id: "ar-" + canonicalId,
+            name: canonicalName,
+            coverArt: "ar-" + canonicalId,
+          });
+        }
+        return Array.from(byCanonicalId.values());
+      })(),
     },
   };
 }
