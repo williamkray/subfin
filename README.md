@@ -168,7 +168,7 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 |---------|--------|------------------|-------|
 | `ping` | **Fully implemented** | N/A (internal health) | Returns a standard Subsonic `subsonic-response` without calling Jellyfin. |
 | `getLicense` | **Fully implemented** | N/A | Always reports a valid license; Jellyfin has no license concept. |
-| `getOpenSubsonicExtensions` | **Partially implemented** | N/A | Returns a static list of supported extensions (transcoders, formats, lyrics). |
+| `getOpenSubsonicExtensions` | **Partially implemented** | N/A | Returns a static list of supported extensions (transcoders, formats, lyrics, `indexBasedQueue`). |
 | `tokenInfo` | **Not planned** | — | Out of scope; no API to expose app-password metadata from Subfin's store. |
 
 ### Browsing (library and metadata)
@@ -257,6 +257,7 @@ Most of the remaining items below are **currently unimplemented** (exceptions: `
 - **Chat** *(not planned)*: `addChatMessage`, `getChatMessages` — no implementation intended.
 - **Playback state**: `savePlayQueue`, `getPlayQueue`, `scrobble`, `setRating`, `star`, `unstar` → Jellyfin play queue, playback reporting, and rating/favorite APIs.
   - **`savePlayQueue`** and **`getPlayQueue`** are **fully implemented**: Subfin stores one play queue per user (in SQLite). Clients save the queue as a list of **entry IDs** (track ids), plus the current track id and position in ms, and restore it on any device for cross-device continuity. Call `savePlayQueue` with no parameters to clear the saved queue.
+  - **`savePlayQueueByIndex`** and **`getPlayQueueByIndex`** are **fully implemented** (OpenSubsonic `indexBasedQueue` extension v1): same storage as above, but the current track is identified by zero-based `currentIndex` instead of song id. This allows duplicate tracks in a queue. Call `savePlayQueueByIndex` with no `id` parameters to clear the queue. Both endpoints are interoperable — saving via one is readable via the other.
   - `scrobble`: the client should send **scrobble with `submission=false`** when a track actually starts so Jellyfin’s “now playing” dashboard updates immediately; `submission=true` at end-of-track is also supported.
   - `setRating`, `star`, and `unstar` are **fully implemented**: they call Jellyfin’s favorite and user-like APIs (`markFavorite`, `unmarkFavorite`, `setUserLikeForItem`), so favorites and likes stay in sync with Jellyfin.
 - **Library scanning / transcoding**: `startScan`, `getScanStatus`, `getTranscodeDecision` → Jellyfin library scan and transcoding APIs (not yet surfaced by Subfin).

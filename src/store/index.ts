@@ -58,6 +58,13 @@ function runSchema(database: Database.Database): void {
     database.exec("ALTER TABLE shares ADD COLUMN share_secret_encrypted BLOB");
   }
 
+  // Migration: add current_index to play_queue for indexBasedQueue OpenSubsonic extension.
+  const playQueueInfo = database.prepare("PRAGMA table_info(play_queue)").all() as { name: string }[];
+  const hasCurrentIndex = playQueueInfo.some((c) => c.name === "current_index");
+  if (!hasCurrentIndex) {
+    database.exec("ALTER TABLE play_queue ADD COLUMN current_index INTEGER NOT NULL DEFAULT 0");
+  }
+
   // Migration: add derived_cache table for cached artist indexes and other derived views.
   const derivedInfo = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'derived_cache'").get() as
     | { name: string }
@@ -578,18 +585,19 @@ export function setJellyfinSession(
 /** Save play queue for a user (OpenSubsonic savePlayQueue). Replaces any existing queue. */
 export function savePlayQueue(
   subsonicUsername: string,
-  data: { entryIds: string[]; currentId: string | null; positionMs: number; changedBy: string }
+  data: { entryIds: string[]; currentId: string | null; currentIndex: number; positionMs: number; changedBy: string }
 ): void {
   const database = openDb();
   const changedAt = new Date().toISOString();
   const entryIdsJson = JSON.stringify(data.entryIds);
   database
     .prepare(
-      `INSERT INTO play_queue (subsonic_username, entry_ids, current_id, position_ms, changed_at, changed_by)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO play_queue (subsonic_username, entry_ids, current_id, current_index, position_ms, changed_at, changed_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(subsonic_username) DO UPDATE SET
          entry_ids = excluded.entry_ids,
          current_id = excluded.current_id,
+         current_index = excluded.current_index,
          position_ms = excluded.position_ms,
          changed_at = excluded.changed_at,
          changed_by = excluded.changed_by`
@@ -598,6 +606,7 @@ export function savePlayQueue(
       subsonicUsername,
       entryIdsJson,
       data.currentId ?? null,
+      Math.max(0, data.currentIndex),
       Math.max(0, data.positionMs),
       changedAt,
       data.changedBy?.trim().slice(0, 255) ?? ""
@@ -608,6 +617,7 @@ export function savePlayQueue(
 export function getPlayQueue(subsonicUsername: string): {
   entryIds: string[];
   currentId: string | null;
+  currentIndex: number;
   positionMs: number;
   changedAt: string;
   changedBy: string;
@@ -615,10 +625,10 @@ export function getPlayQueue(subsonicUsername: string): {
   const database = openDb();
   const row = database
     .prepare(
-      "SELECT entry_ids, current_id, position_ms, changed_at, changed_by FROM play_queue WHERE subsonic_username = ?"
+      "SELECT entry_ids, current_id, current_index, position_ms, changed_at, changed_by FROM play_queue WHERE subsonic_username = ?"
     )
     .get(subsonicUsername) as
-    | { entry_ids: string; current_id: string | null; position_ms: number; changed_at: string; changed_by: string }
+    | { entry_ids: string; current_id: string | null; current_index: number; position_ms: number; changed_at: string; changed_by: string }
     | undefined;
   if (!row) return null;
   let entryIds: string[];
@@ -631,6 +641,7 @@ export function getPlayQueue(subsonicUsername: string): {
   return {
     entryIds,
     currentId: row.current_id ?? null,
+    currentIndex: Math.max(0, row.current_index ?? 0),
     positionMs: Math.max(0, row.position_ms),
     changedAt: row.changed_at,
     changedBy: row.changed_by ?? "",

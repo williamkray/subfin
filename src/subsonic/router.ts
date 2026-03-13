@@ -67,6 +67,8 @@ const HANDLERS: Record<
   unstar: async (auth, params) => handlers.handleUnstar(auth, params),
   saveplayqueue: async (auth, params) => handlers.handleSavePlayQueue(auth, params),
   getplayqueue: async (auth) => handlers.handleGetPlayQueue(auth),
+  saveplayqueuebyindex: async (auth, params) => handlers.handleSavePlayQueueByIndex(auth, params),
+  getplayqueuebyindex: async (auth) => handlers.handleGetPlayQueueByIndex(auth),
   createshare: async (auth, params) => handlers.handleCreateShare(auth, params as unknown as { ids: string[]; description?: string; expires?: string }),
   getshares: async (auth) => handlers.handleGetShares(auth),
   updateshare: async (auth, params) => handlers.handleUpdateShare(auth, params),
@@ -222,6 +224,31 @@ function getPlayQueueSaveParams(req: Request): {
   const position = one(q.position ?? body.position).trim() || "0";
   const changedBy = one(q.c ?? body.c).trim();
   return { playQueueIds: ids, current, position, changedBy };
+}
+
+/** Collect savePlayQueueByIndex params: multiple id, currentIndex, position, client name (c). */
+function getPlayQueueByIndexSaveParams(req: Request): {
+  playQueueIds: string[];
+  currentIndex: string;
+  position: string;
+  changedBy: string;
+} {
+  const q = req.query as Record<string, unknown>;
+  const body = (req.body as Record<string, unknown>) ?? {};
+  const ids: string[] = [];
+  for (const [k, v] of Object.entries(q)) {
+    if (k !== "id" && !k.startsWith("id[")) continue;
+    ids.push(...toIdStrings(v));
+  }
+  for (const [k, v] of Object.entries(body)) {
+    if (k !== "id" && !k.startsWith("id[")) continue;
+    ids.push(...toIdStrings(v));
+  }
+  const one = (v: unknown): string => (v === undefined || v === null ? "" : Array.isArray(v) ? String(v[0] ?? "") : String(v));
+  const currentIndex = one(q.currentIndex ?? body.currentIndex).trim() || "0";
+  const position = one(q.position ?? body.position).trim() || "0";
+  const changedBy = one(q.c ?? body.c).trim();
+  return { playQueueIds: ids, currentIndex, position, changedBy };
 }
 
 /** Collect id[] and optional description/expires for createShare. */
@@ -450,6 +477,9 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
   }
   if (method === "saveplayqueue") {
     Object.assign(params, getPlayQueueSaveParams(req));
+  }
+  if (method === "saveplayqueuebyindex") {
+    Object.assign(params, getPlayQueueByIndexSaveParams(req));
   }
   if (method === "createshare") {
     Object.assign(params, getCreateShareParams(req));
@@ -1281,6 +1311,10 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
           err?.message ?? "Not allowed to modify this playlist.",
           403
         );
+        return;
+      }
+      if ((err as NodeJS.ErrnoException)?.code === "OutOfRange") {
+        sendError(res, format, ErrorCode.Generic, err?.message ?? "Index out of range");
         return;
       }
       console.error(err);

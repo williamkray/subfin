@@ -243,6 +243,10 @@ export async function handleGetOpenSubsonicExtensions(): Promise<Record<string, 
         name: "songLyrics",
         versions: [1],
       },
+      {
+        name: "indexBasedQueue",
+        versions: [1],
+      },
     ],
   };
 }
@@ -2061,9 +2065,49 @@ export async function handleSavePlayQueue(
   const positionMs = Math.max(0, Number.parseInt(params.position ?? "0", 10) || 0);
   const changedBy = (params.changedBy ?? params.c ?? "").trim().slice(0, 255);
 
+  const resolvedCurrentId = currentId && entryIds.includes(currentId) ? currentId : entryIds[0] ?? null;
+  const currentIndex = resolvedCurrentId ? Math.max(0, entryIds.indexOf(resolvedCurrentId)) : 0;
   savePlayQueue(auth.subsonicUsername, {
     entryIds,
-    currentId: currentId && entryIds.includes(currentId) ? currentId : entryIds[0] ?? null,
+    currentId: resolvedCurrentId,
+    currentIndex,
+    positionMs,
+    changedBy,
+  });
+  return {};
+}
+
+/** Save play queue by index for this user (OpenSubsonic indexBasedQueue extension). */
+export async function handleSavePlayQueueByIndex(
+  auth: AuthResult,
+  params: Record<string, string> & { playQueueIds?: string[] }
+): Promise<Record<string, unknown>> {
+  const ids = params.playQueueIds ?? [];
+  const rawIds = Array.isArray(ids) ? ids : [];
+  const entryIds = rawIds
+    .map((id) => (typeof id === "string" ? id : String(id)).trim())
+    .filter((id) => id && id !== "[object Object]")
+    .map((id) => stripSubsonicIdPrefix(id));
+
+  if (entryIds.length === 0) {
+    clearPlayQueue(auth.subsonicUsername);
+    return {};
+  }
+
+  const currentIndex = Math.max(0, Number.parseInt(params.currentIndex ?? "0", 10) || 0);
+  if (currentIndex >= entryIds.length) {
+    const err = new Error(`currentIndex ${currentIndex} is out of range (0–${entryIds.length - 1})`);
+    (err as NodeJS.ErrnoException).code = "OutOfRange";
+    throw err;
+  }
+  const currentId = entryIds[currentIndex] ?? null;
+  const positionMs = Math.max(0, Number.parseInt(params.position ?? "0", 10) || 0);
+  const changedBy = (params.changedBy ?? params.c ?? "").trim().slice(0, 255);
+
+  savePlayQueue(auth.subsonicUsername, {
+    entryIds,
+    currentId,
+    currentIndex,
     positionMs,
     changedBy,
   });
@@ -2100,6 +2144,45 @@ export async function handleGetPlayQueue(auth: AuthResult): Promise<Record<strin
   return {
     playQueue: {
       current: queue.currentId ?? (queue.entryIds[0] ?? ""),
+      position: queue.positionMs,
+      username: auth.subsonicUsername,
+      changed: queue.changedAt,
+      changedBy: queue.changedBy,
+      entry: entries,
+    },
+  };
+}
+
+/** Return saved play queue by index for this user (OpenSubsonic indexBasedQueue extension). */
+export async function handleGetPlayQueueByIndex(auth: AuthResult): Promise<Record<string, unknown>> {
+  const queue = getPlayQueue(auth.subsonicUsername);
+  if (!queue || queue.entryIds.length === 0) {
+    return {
+      playQueueByIndex: {
+        position: 0,
+        username: auth.subsonicUsername,
+        changed: new Date().toISOString(),
+        changedBy: "",
+        entry: [],
+      },
+    };
+  }
+
+  const ctx = toJellyfinContext(auth);
+  const entries: Record<string, unknown>[] = [];
+  for (const id of queue.entryIds) {
+    const song = await jf.getSong(ctx, id);
+    if (song) {
+      const albumId = (song as Record<string, unknown>).AlbumId as string | undefined;
+      const albumName = song.Album ?? undefined;
+      const artistName = song.AlbumArtist ?? song.Artists?.[0] ?? "";
+      entries.push(toSubsonicSong(song, albumId, albumName, artistName));
+    }
+  }
+
+  return {
+    playQueueByIndex: {
+      currentIndex: queue.currentIndex,
       position: queue.positionMs,
       username: auth.subsonicUsername,
       changed: queue.changedAt,

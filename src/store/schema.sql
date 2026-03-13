@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS play_queue (
   subsonic_username TEXT PRIMARY KEY,
   entry_ids TEXT NOT NULL,
   current_id TEXT,
+  current_index INTEGER NOT NULL DEFAULT 0,
   position_ms INTEGER NOT NULL DEFAULT 0,
   changed_at TEXT NOT NULL,
   changed_by TEXT NOT NULL DEFAULT ''
