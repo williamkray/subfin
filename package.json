@@ -19,10 +19,12 @@
   },
   "dependencies": {
     "@jellyfin/sdk": "^0.13.0",
+    "@types/cookie-parser": "^1.4.10",
     "archiver": "^7.0.1",
     "axios": "^1.13.6",
     "bcrypt": "^6.0.0",
     "better-sqlite3": "^12.6.0",
+    "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
     "csrf-csrf": "^3.0.0",
     "dotenv": "^17.0.0",
