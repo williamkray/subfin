@@ -364,7 +364,10 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
   if ("code" in authResult) {
     const ip = getClientIp() ?? req.socket?.remoteAddress ?? "unknown";
     console.log(`[AUTH_FAIL] method=${method} ip=${ip} code=${authResult.code}`);
-    recordRestAuthFailure(req);
+    if (recordRestAuthFailure(req)) {
+      res.status(429).send("Too many requests");
+      return;
+    }
     const httpStatus = authResult.code === 40 ? 401 : 200;
     sendError(res, format, authResult.code, authResult.message, httpStatus);
     return;

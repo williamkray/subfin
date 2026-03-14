@@ -41,6 +41,9 @@ const { generateToken, doubleCsrfProtection } = doubleCsrf({
   getSecret: () => config.salt.toString("hex"),
   cookieName: "subfin_csrf",
   cookieOptions: { httpOnly: true, sameSite: "strict" as const },
+  // Check req.body._csrf (HTML form POSTs) then fall back to the x-csrf-token header (fetch).
+  getTokenFromRequest: (req) =>
+    (req.body?._csrf as string | undefined) ?? (req.headers["x-csrf-token"] as string | undefined),
 });
 
 const router = Router();
@@ -65,14 +68,14 @@ function getSessionUser(req: Request): string | null {
 function setSessionUser(res: Response, username: string): void {
   const encoded = encodeURIComponent(username);
   // Lightweight, HttpOnly session cookie; expires with browser session.
-  res.setHeader(
+  res.append(
     "Set-Cookie",
     `subfin_user=${encoded}; Path=/; HttpOnly; SameSite=Lax`
   );
 }
 
 function clearSessionUser(res: Response): void {
-  res.setHeader(
+  res.append(
     "Set-Cookie",
     "subfin_user=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
   );
@@ -97,7 +100,7 @@ function getSessionJellyfinUrl(req: Request): string {
 
 function setSessionJellyfinUrl(res: Response, jellyfinUrl: string): void {
   const encoded = encodeURIComponent(jellyfinUrl);
-  res.setHeader(
+  res.append(
     "Set-Cookie",
     `subfin_jf_url=${encoded}; Path=/; HttpOnly; SameSite=Lax`
   );
@@ -651,19 +654,22 @@ function renderLayout(title: string, innerHtml: string, csrfToken?: string): str
 </html>`;
 }
 
-function renderDashboardHeader(sessionUser: string | null, opts?: { backToDevices?: boolean }): string {
+function renderDashboardHeader(sessionUser: string | null, opts?: { backToDevices?: boolean; jellyfinUrl?: string }): string {
   const navLink =
     opts?.backToDevices && sessionUser
       ? `<a href="/devices" class="btn-secondary btn-small" style="text-decoration:none;">Devices</a>`
       : sessionUser
         ? `<a href="/create-share" class="btn-secondary btn-small" style="text-decoration:none;">Create share</a>`
         : "";
+  const sessionLabel = (() => {
+    if (!sessionUser) return "";
+    const host = opts?.jellyfinUrl ? (() => { try { return new URL(opts.jellyfinUrl).host; } catch { return ""; } })() : "";
+    return host ? `${escapeHtml(sessionUser)}@${escapeHtml(host)}` : escapeHtml(sessionUser);
+  })();
   const userLabel = sessionUser
     ? `<div style="display:flex; align-items:center; gap:10px;">
          ${navLink}
-         <div class="badge"><span class="badge-dot"></span><span>Signed in as <strong>${escapeHtml(
-           sessionUser
-         )}</strong></span></div>
+         <div class="badge"><span class="badge-dot"></span><span>Signed in as <strong>${sessionLabel}</strong></span></div>
          <form method="post" action="/web/logout" style="margin:0;">
            <button type="submit" class="btn-secondary btn-small">Log out</button>
          </form>
@@ -726,7 +732,7 @@ router.get("/", (req: Request, res: Response) => {
     renderLayout(
       "Subfin",
       `
-        ${renderDashboardHeader(sessionUser)}
+        ${renderDashboardHeader(sessionUser, { jellyfinUrl: getSessionJellyfinUrl(req) })}
         <main class="shell-main">
           <div class="shell-main-full">
             ${loginFlash}
@@ -934,7 +940,7 @@ function renderAuthenticatedDashboard(
           ${listItems}
         </ul>
       </div>
-      ${!openMode ? `<div class="card card-muted" style="grid-column: 1 / -1;">
+      ${!openMode ? `<div class="card card-muted">
         <div class="card-header">
           <div>
             <div class="card-kicker">Shares</div>
@@ -953,7 +959,7 @@ function renderAuthenticatedDashboard(
             : ""
         }
       </div>` : ""}
-      <div class="card card-muted" style="grid-column: 1 / -1;" id="library-settings">
+      <div class="card card-muted" ${openMode ? 'style="grid-column: 1 / -1;"' : ''} id="library-settings">
         <div class="card-header">
           <div>
             <div class="card-kicker">Music libraries</div>
@@ -982,7 +988,7 @@ function renderAuthenticatedDashboard(
     }
     list.innerHTML = data.libraries.map(function(lib) {
       var checked = lib.selected ? 'checked' : '';
-      return '<label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;"><input type="checkbox" name="libId" value="' + lib.id + '" ' + checked + '> ' + lib.name + '</label>';
+      return '<label class="search-result-row"><input type="checkbox" name="libId" value="' + lib.id + '" ' + checked + '> ' + lib.name + '</label>';
     }).join('');
   }).catch(function() {
     list.innerHTML = '<span class="tiny">Could not load libraries.</span>';
@@ -1037,12 +1043,14 @@ function renderAuthenticatedDashboard(
 function renderDeviceLinkedPage(
   sessionUser: string,
   appPassword: string,
-  deviceLabel?: string
+  deviceLabel?: string,
+  csrfToken?: string,
+  jellyfinUrl?: string
 ): string {
   return renderLayout(
     "Device linked - Subfin",
     `
-    ${renderDashboardHeader(sessionUser)}
+    ${renderDashboardHeader(sessionUser, { jellyfinUrl })}
     <main class="shell-main">
       <div class="card">
         <div class="card-header">
@@ -1093,7 +1101,8 @@ function renderDeviceLinkedPage(
         </div>
       </aside>
     </main>
-  `
+  `,
+  csrfToken
   );
 }
 
@@ -1176,7 +1185,7 @@ ${renderLayout(
       const deviceLabel = ${JSON.stringify(deviceLabel ?? "")};
       const jfUrl = ${JSON.stringify(jellyfinUrl)};
       const poll = async () => {
-        const r = await fetch('/web/quickconnect/poll?secret=' + encodeURIComponent(secret));
+        const r = await fetch('/web/quickconnect/poll?secret=' + encodeURIComponent(secret) + '&jfUrl=' + encodeURIComponent(jfUrl));
         const d = await r.json();
         if (d.authenticated) {
           const params = new URLSearchParams({ secret, intent, deviceId, deviceName, jfUrl });
@@ -1205,7 +1214,8 @@ router.get("/web/quickconnect/poll", async (req: Request, res: Response) => {
     res.status(400).json({ authenticated: false });
     return;
   }
-  const state = await jf.getQuickConnectState(secret);
+  const jellyfinUrl = (req.query.jfUrl as string)?.trim() || getConfig().allowedJellyfinHosts[0] || "";
+  const state = await jf.getQuickConnectState(secret, jellyfinUrl);
   res.json({ authenticated: state.authenticated });
 });
 
@@ -1226,7 +1236,7 @@ router.get("/web/quickconnect/done", async (req: Request, res: Response) => {
     res.redirect("/?error=auth");
     return;
   }
-  const username = (await jf.getCurrentUserName(auth.accessToken)) ?? auth.userId;
+  const username = (await jf.getCurrentUserName({ accessToken: auth.accessToken, jellyfinBaseUrl: jellyfinUrl })) ?? auth.userId;
   const userKey = { subsonicUsername: username, jellyfinUrl };
 
   if (intent === "link") {
@@ -1235,7 +1245,8 @@ router.get("/web/quickconnect/done", async (req: Request, res: Response) => {
     setJellyfinSession(userKey, auth.userId, auth.accessToken);
     setSessionUser(res, username);
     setSessionJellyfinUrl(res, jellyfinUrl);
-    res.send(renderDeviceLinkedPage(username, appPassword, deviceLabel));
+    const csrfToken = generateToken(req, res);
+    res.send(renderDeviceLinkedPage(username, appPassword, deviceLabel, csrfToken, jellyfinUrl));
     return;
   }
 
@@ -1364,7 +1375,8 @@ router.post("/web/link/new-device", doubleCsrfProtection, async (req: Request, r
     newAuth.accessToken,
     deviceLabel
   );
-  res.send(renderDeviceLinkedPage(sessionUser, appPassword, deviceLabel));
+  const csrfToken = generateToken(req, res);
+  res.send(renderDeviceLinkedPage(sessionUser, appPassword, deviceLabel, csrfToken, getSessionJellyfinUrl(req)));
 });
 
 router.get("/devices", (req: Request, res: Response) => {
@@ -1394,7 +1406,7 @@ router.get("/devices", (req: Request, res: Response) => {
     renderLayout(
       "My devices - Subfin",
       `
-          ${renderDashboardHeader(sessionUser)}
+          ${renderDashboardHeader(sessionUser, { jellyfinUrl: getSessionJellyfinUrl(req) })}
           <main class="shell-main">
             ${flash}
             <div class="shell-main-full">
@@ -1428,7 +1440,7 @@ router.post("/web/devices", doubleCsrfProtection, async (req: Request, res: Resp
     renderLayout(
       "My devices - Subfin",
       `
-        ${renderDashboardHeader(username)}
+        ${renderDashboardHeader(username, { jellyfinUrl })}
         <main class="shell-main">
           ${renderAuthenticatedDashboard(username, devices, getSharesForUser(username), isOpenMode())}
         </main>
@@ -1473,11 +1485,12 @@ router.post("/web/devices/reset", doubleCsrfProtection, (req: Request, res: Resp
     res.redirect("/devices?error=reset");
     return;
   }
+  const csrfToken = generateToken(req, res);
   res.send(`
 ${renderLayout(
   "New password - Subfin",
   `
-    ${renderDashboardHeader(resolved.username)}
+    ${renderDashboardHeader(resolved.username, { jellyfinUrl: getSessionJellyfinUrl(req) })}
     <main class="shell-main">
       <div class="card">
         <div class="card-header">
@@ -1519,7 +1532,8 @@ ${renderLayout(
         </div>
       </div>
     </main>
-  `
+  `,
+  csrfToken
 )}`);
 });
 
@@ -1696,7 +1710,7 @@ router.get("/create-share", (req: Request, res: Response) => {
     renderLayout(
       "Create share - Subfin",
       `
-        ${renderDashboardHeader(sessionUser, { backToDevices: true })}
+        ${renderDashboardHeader(sessionUser, { backToDevices: true, jellyfinUrl: getSessionJellyfinUrl(req) })}
         <main class="shell-main">
           <div class="shell-main-full">
             <section class="hero">
@@ -1852,7 +1866,7 @@ router.get("/create-share", (req: Request, res: Response) => {
     }
     fetch(base + '/web/api/create-share', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-csrf-token': window._csrfToken || '' },
       credentials: 'same-origin',
       body: JSON.stringify({ ids: selectedIds })
     }).then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })

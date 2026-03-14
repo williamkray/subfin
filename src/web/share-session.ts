@@ -46,11 +46,11 @@ export function createShareCookiePayload(shareUid: string): string {
 
 export function setShareCookie(res: Response, shareUid: string): void {
   const value = createShareCookiePayload(shareUid);
-  res.setHeader("Set-Cookie", `${COOKIE_NAME}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(TTL_MS / 1000)}`);
+  res.append("Set-Cookie", `${COOKIE_NAME}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(TTL_MS / 1000)}`);
 }
 
 export function clearShareCookie(res: Response): void {
-  res.setHeader("Set-Cookie", `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+  res.append("Set-Cookie", `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
 }
 
 export function getShareSessionFromCookie(req: Request): { shareUid: string } | null {
