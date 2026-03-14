@@ -8,7 +8,7 @@ import { randomFillSync, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getConfig } from "../config/load.js";
+import { getConfig, getLegacyMusicLibraryIds } from "../config/load.js";
 import { config } from "../config.js";
 import { decrypt, encrypt } from "./crypto.js";
 import type { UserKey } from "./types.js";
@@ -40,6 +40,7 @@ function openDb(): Database.Database {
   runSchema(db);
   migrateFromLegacyJsonIfPresent();
   backfillJellyfinUrls(db);
+  migrateLegacyMusicLibraryIds(db);
   return db;
 }
 
@@ -161,6 +162,50 @@ function backfillJellyfinUrls(database: Database.Database): void {
   database.prepare("UPDATE jellyfin_sessions SET jellyfin_url = ? WHERE jellyfin_url = ''").run(url);
   database.prepare("UPDATE play_queue SET jellyfin_url = ? WHERE jellyfin_url = ''").run(url);
   database.prepare("UPDATE pending_quickconnect SET jellyfin_url = ? WHERE jellyfin_url = ''").run(url);
+}
+
+/**
+ * One-time migration: if the old config had musicLibraryIds (global library restriction),
+ * seed user_library_settings for every existing linked user so they retain the same scope.
+ * Uses INSERT OR IGNORE so it is safe to run on every startup — only fills gaps.
+ *
+ * Note: MUSIC_LIBRARY_IDS env-var values are included here for completeness, but because
+ * the env var cannot be automatically removed, the deprecation warning in loadConfig() asks
+ * the operator to remove it manually. The migration still seeds the DB from it so that
+ * removing the env var later doesn't silently widen library access.
+ */
+function migrateLegacyMusicLibraryIds(database: Database.Database): void {
+  const libraryIds = getLegacyMusicLibraryIds();
+  if (!libraryIds || libraryIds.length === 0) return;
+
+  const users = database
+    .prepare("SELECT DISTINCT subsonic_username, jellyfin_url FROM linked_devices WHERE jellyfin_url != ''")
+    .all() as { subsonic_username: string; jellyfin_url: string }[];
+
+  if (users.length === 0) return;
+
+  const selectedIdsJson = JSON.stringify(libraryIds);
+  const now = new Date().toISOString();
+  const insert = database.prepare(`
+    INSERT OR IGNORE INTO user_library_settings (subsonic_username, jellyfin_url, selected_ids, updated_at)
+    VALUES (?, ?, ?, ?)
+  `);
+
+  let migrated = 0;
+  const run = database.transaction(() => {
+    for (const user of users) {
+      const result = insert.run(user.subsonic_username, user.jellyfin_url, selectedIdsJson, now);
+      if (result.changes > 0) migrated++;
+    }
+  });
+  run();
+
+  if (migrated > 0) {
+    console.log(
+      `[subfin] Migrated legacy musicLibraryIds [${libraryIds.join(", ")}] to per-user ` +
+      `library settings for ${migrated} user(s). Remove 'musicLibraryIds' from your config file.`
+    );
+  }
 }
 
 interface LegacyLinkedDevice {

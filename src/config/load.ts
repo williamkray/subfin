@@ -60,6 +60,53 @@ function getFromEnvOrFile(
   return undefined;
 }
 
+/**
+ * Emit loud startup warnings for config values that are deprecated in this version.
+ * Called once from loadConfig().
+ */
+function warnDeprecatedConfigKeys(file: Record<string, unknown>): void {
+  const BORDER = "=".repeat(72);
+  if (env.MUSIC_LIBRARY_IDS) {
+    console.warn(
+      `\n${BORDER}\n` +
+      `DEPRECATION WARNING: MUSIC_LIBRARY_IDS environment variable is no longer\n` +
+      `supported and has NO EFFECT. Library selection is now managed per-user\n` +
+      `via the Subfin web UI (/). Remove MUSIC_LIBRARY_IDS from your environment.\n` +
+      `${BORDER}\n`
+    );
+  }
+  if (Array.isArray(file.musicLibraryIds) && (file.musicLibraryIds as unknown[]).length > 0) {
+    console.warn(
+      `\n${BORDER}\n` +
+      `DEPRECATION WARNING: 'musicLibraryIds' in subfin.config.json is no longer\n` +
+      `supported. Library selection has been automatically migrated to per-user\n` +
+      `settings in the database. Remove 'musicLibraryIds' from your config file.\n` +
+      `${BORDER}\n`
+    );
+  }
+}
+
+/**
+ * Returns the legacy musicLibraryIds from the config file or MUSIC_LIBRARY_IDS env var.
+ * Used once at DB startup to migrate old global library restrictions to per-user settings.
+ * Returns null if neither source has any values set.
+ */
+export function getLegacyMusicLibraryIds(): string[] | null {
+  const file = loadFromFile();
+  if (Array.isArray(file.musicLibraryIds)) {
+    const ids = (file.musicLibraryIds as unknown[])
+      .filter((x): x is string => typeof x === "string")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (ids.length > 0) return ids;
+  }
+  if (env.MUSIC_LIBRARY_IDS) {
+    const ids = env.MUSIC_LIBRARY_IDS.split(",").map((s) => s.trim()).filter(Boolean);
+    if (ids.length > 0) return ids;
+  }
+  return null;
+}
+
 function parseSalt(saltRaw: string): Buffer {
   const trimmed = saltRaw.trim();
   if (trimmed.length < 32) {
@@ -80,6 +127,8 @@ function parseSalt(saltRaw: string): Buffer {
 export function loadConfig(): Config {
   const file = loadFromFile();
   const jellyfinFile = (file.jellyfin as Record<string, unknown>) ?? {};
+
+  warnDeprecatedConfigKeys(file);
 
   const portStr = getFromEnvOrFile(file, "PORT", "port") ?? "4040";
   const subfinPublicUrl = (getFromEnvOrFile(file, "SUBFIN_PUBLIC_URL", "subfinPublicUrl") ?? "").replace(/\/$/, "");
