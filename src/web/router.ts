@@ -415,7 +415,8 @@ const baseStyles = `
   }
   input[type="text"],
   input[type="password"],
-  input[type="url"] {
+  input[type="url"],
+  select {
     border-radius: 999px;
     border: 1px solid var(--border-subtle);
     padding: 7px 11px;
@@ -432,7 +433,8 @@ const baseStyles = `
   }
   input[type="text"]:focus,
   input[type="password"]:focus,
-  input[type="url"]:focus {
+  input[type="url"]:focus,
+  select:focus {
     border-color: var(--accent-strong);
     box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.5), 0 8px 22px rgba(15, 23, 42, 0.8);
     background: rgba(15, 23, 42, 0.98);
@@ -654,13 +656,11 @@ function renderLayout(title: string, innerHtml: string, csrfToken?: string): str
 </html>`;
 }
 
-function renderDashboardHeader(sessionUser: string | null, opts?: { backToDevices?: boolean; jellyfinUrl?: string }): string {
+function renderDashboardHeader(sessionUser: string | null, opts?: { backToDevices?: boolean; jellyfinUrl?: string; allowedHosts?: string[] }): string {
   const navLink =
     opts?.backToDevices && sessionUser
       ? `<a href="/devices" class="btn-secondary btn-small" style="text-decoration:none;">Devices</a>`
-      : sessionUser
-        ? `<a href="/create-share" class="btn-secondary btn-small" style="text-decoration:none;">Create share</a>`
-        : "";
+      : "";
   const sessionLabel = (() => {
     if (!sessionUser) return "";
     const host = opts?.jellyfinUrl ? (() => { try { return new URL(opts.jellyfinUrl).host; } catch { return ""; } })() : "";
@@ -674,7 +674,20 @@ function renderDashboardHeader(sessionUser: string | null, opts?: { backToDevice
            <button type="submit" class="btn-secondary btn-small">Log out</button>
          </form>
        </div>`
-    : `<div class="badge"><span class="badge-dot"></span><span>Ready to link Subsonic clients</span></div>`;
+    : (() => {
+        const hosts = opts?.allowedHosts;
+        // Show a server selector next to the badge when there is not exactly one allowed host.
+        if (!hosts || hosts.length === 1) {
+          return `<div class="badge"><span class="badge-dot"></span><span>Ready to link Subsonic clients</span></div>`;
+        }
+        const selector = hosts.length === 0
+          ? `<input type="url" id="jf-server-selector" placeholder="https://jellyfin.example.com" autocomplete="url" style="width:220px;">`
+          : `<select id="jf-server-selector">${hosts.map((h) => `<option value="${escapeHtml(h)}">${escapeHtml(h)}</option>`).join("")}</select>`;
+        return `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+          <div class="badge"><span class="badge-dot"></span><span>Ready to link Subsonic clients</span></div>
+          ${selector}
+        </div>`;
+      })();
   return `
     <header class="shell-header">
       <div class="brand">
@@ -732,7 +745,7 @@ router.get("/", (req: Request, res: Response) => {
     renderLayout(
       "Subfin",
       `
-        ${renderDashboardHeader(sessionUser, { jellyfinUrl: getSessionJellyfinUrl(req) })}
+        ${renderDashboardHeader(sessionUser, { jellyfinUrl: getSessionJellyfinUrl(req), allowedHosts: sessionUser ? undefined : getConfig().allowedJellyfinHosts })}
         <main class="shell-main">
           <div class="shell-main-full">
             ${loginFlash}
@@ -762,10 +775,13 @@ function renderJellyfinUrlField(allowedHosts: string[], fieldName = "jfUrl"): st
 }
 
 function renderLoginPanels(allowedHosts: string[]): string {
-  const urlField = renderJellyfinUrlField(allowedHosts);
-  const manageHref = allowedHosts.length === 1
-    ? `/auth/quickconnect?intent=manage&jfUrl=${encodeURIComponent(allowedHosts[0]!)}`
-    : `/auth/quickconnect?intent=manage`;
+  // When there is exactly one host it is pre-filled; otherwise JS syncs from the
+  // header selector (#jf-server-selector) into every .jf-url-mirror hidden input.
+  const fixedUrl = allowedHosts.length === 1 ? allowedHosts[0]! : "";
+  const hiddenUrl = `<input type="hidden" name="jfUrl" class="jf-url-mirror" value="${escapeHtml(fixedUrl)}">`;
+  const syncScript = allowedHosts.length !== 1
+    ? `<script>(function(){var sel=document.getElementById('jf-server-selector');if(!sel)return;function sync(){var v=sel.value;document.querySelectorAll('.jf-url-mirror').forEach(function(el){el.value=v;});}sel.addEventListener('input',sync);sel.addEventListener('change',sync);sync();})();</script>`
+    : "";
   return `
     <section class="auth-grid">
       <div class="card">
@@ -780,7 +796,7 @@ function renderLoginPanels(allowedHosts: string[]): string {
         </div>
         <form method="get" action="/auth/quickconnect" class="stack">
           <input type="hidden" name="intent" value="link">
-          ${urlField}
+          ${hiddenUrl}
           <label>
             Device label (optional)
             <input type="text" name="deviceLabel" placeholder="e.g. Work laptop, Car, Living room">
@@ -801,9 +817,17 @@ function renderLoginPanels(allowedHosts: string[]): string {
         <div class="card-body">
           Sign in with Quick Connect to view linked devices, rename them, reset app passwords, or unlink.
         </div>
-        ${allowedHosts.length > 1 ? `<form method="get" action="/auth/quickconnect" class="stack"><input type="hidden" name="intent" value="manage">${renderJellyfinUrlField(allowedHosts)}<div class="actions-row"><button type="submit">Continue</button></div></form>` : `<div class="actions-row"><a href="${manageHref}"><button type="button">Continue</button></a><span class="tiny">You'll be asked to approve the login in Jellyfin.</span></div>`}
+        <form method="get" action="/auth/quickconnect" class="stack">
+          <input type="hidden" name="intent" value="manage">
+          ${hiddenUrl}
+          <div class="actions-row">
+            <button type="submit">Continue</button>
+            <span class="tiny">You'll be asked to approve the login in Jellyfin.</span>
+          </div>
+        </form>
       </div>
     </section>
+    ${syncScript}
   `;
 }
 
@@ -946,6 +970,7 @@ function renderAuthenticatedDashboard(
             <div class="card-kicker">Shares</div>
             <div class="card-title">Share links</div>
           </div>
+          <a href="/create-share" class="btn-secondary btn-small" style="text-decoration:none;">Create share</a>
         </div>
         <div class="card-body">
           Public links you created (playlist, album, etc.). Copy the link to send; use Unshare to revoke.
