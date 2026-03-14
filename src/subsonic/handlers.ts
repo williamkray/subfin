@@ -307,7 +307,7 @@ export async function handleGetArtist(
     console.log("[ARTIST] getArtist params: id=%s cleanId=%s", id, cleanId);
   }
   const ctx = toJellyfinContext(auth);
-  const folderIds = await jf.getAllowedMusicFolderIds(ctx, auth.jellyfinUserId);
+  const folderIds = await getEffectiveMusicFolderIds(auth, undefined);
   let albums: Awaited<ReturnType<typeof jf.getAlbumsByArtist>> = [];
   if (folderIds === null) {
     albums = await jf.getAlbumsByArtist(ctx, cleanId, undefined);
