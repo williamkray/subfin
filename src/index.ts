@@ -21,11 +21,11 @@ const app = express();
 const trustProxy = process.env.SUBFIN_TRUST_PROXY === "true" || process.env.SUBFIN_TRUST_PROXY === "1";
 if (trustProxy) app.set("trust proxy", 1);
 
-// Restrict CORS to the configured public URL when available; otherwise allow all origins
-// (native Subsonic clients don't send Origin, so this only affects browser-initiated cross-origin requests).
-const corsOrigin = config.subfinPublicUrl || "*";
-app.use(cors({ origin: corsOrigin }));
-app.use(helmet({
+// CORS: restrict to configured origins when set; default "*" allows all origins.
+// Native Subsonic clients don't send Origin headers — this only affects browser clients (e.g. Aonsoku).
+app.use(cors({ origin: config.corsOrigins }));
+// Helmet for web UI: strict CSP. CORP defaults to same-origin (fine for web pages).
+app.use(/^(?!\/rest(\/|$))/, helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
@@ -37,6 +37,12 @@ app.use(helmet({
       frameSrc: ["'none'"],
     },
   },
+}));
+// Helmet for REST API: no CSP (data API), CORP=cross-origin so browser clients
+// (e.g. Aonsoku at a different origin) can load cover art and stream URLs.
+app.use(/^\/rest(\/|$)/, helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: "cross-origin" },
 }));
 app.use(cookieParser());
 app.use(express.json({ limit: "64kb" }));

@@ -45,10 +45,26 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 | `SUBFIN_SALT` | *(required)* | Secret for DB encryption (see above). In config file: `"salt": "<base64 or hex>"`. |
 | `SUBFIN_LOG_REST` | (off) | Set to `true` or `1` to log each REST request (method and auth) for debugging clients. Do not enable in production; logs may contain tokens. |
 | `SUBFIN_PUBLIC_URL` | (empty) | Optional public URL of Subfin (e.g. `https://subfin.example.com`) for absolute image URLs in `getArtistInfo` / `getArtistInfo2` and used when generating Share links. |
+| `SUBFIN_CORS_ORIGINS` | (unset, allows all) | Comma-separated allowed CORS origins for browser-based clients (e.g. `https://aonsoku.example.com,http://localhost:8080`). When unset, all origins are allowed (`*`). Native Subsonic clients are unaffected. In config file: `"corsOrigins": ["https://aonsoku.example.com"]`. |
 | `LASTFM_API_KEY` | (unset) | Optional Last.fm API key for enriching artist info (`getArtistInfo` / `getArtistInfo2`) with biography and Last.fm URLs. In the config file, use `"lastFmApiKey": "..."`. When unset, Subfin does **not** call Last.fm and relies only on Jellyfin data and placeholders. |
 | `SUBFIN_CONFIG` | `subfin.config.json` | Path to JSON config file (optional). All settings above can be in this file; env overrides. |
 
 ## Production Deployment
+
+### CORS
+
+CORS headers are relevant only for browser-based Subsonic clients (e.g. Aonsoku) that make cross-origin requests. Native desktop/mobile clients do not send `Origin` headers and are unaffected.
+
+By default, all origins are allowed (`*`). Restrict with `SUBFIN_CORS_ORIGINS`:
+
+| Scenario | Setting |
+|----------|---------|
+| Local testing (subfin `:4040`, client `:8080`) | Leave unset, or `http://localhost:8080` |
+| Docker Compose (localhost access) | Leave unset |
+| Reverse proxy, separate domains | `https://your-client.example.com` |
+| Subsonic native clients only | Leave unset |
+
+Note: `SUBFIN_PUBLIC_URL` is subfin's own public URL — it is **not** used for CORS.
 
 ### fail2ban Integration
 

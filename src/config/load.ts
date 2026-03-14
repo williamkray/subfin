@@ -29,6 +29,8 @@ export interface Config {
   lastFmApiKey?: string;
   /** Secret used to derive encryption key for sensitive DB fields. Required. From SUBFIN_SALT or config file. */
   salt: Buffer;
+  /** Allowed CORS origins. "*" = allow all (default). Array = restricted to listed origins. */
+  corsOrigins: string[] | "*";
 }
 
 function loadFromFile(): Record<string, unknown> {
@@ -150,6 +152,20 @@ export function loadConfig(): Config {
     // Backward compat: single-server deployments default to [JELLYFIN_URL] (restricted mode, one host).
     allowedJellyfinHosts = jellyfinBaseUrl ? [jellyfinBaseUrl] : [];
   }
+  const corsOriginsEnv = env.SUBFIN_CORS_ORIGINS;
+  let corsOrigins: string[] | "*";
+  if (corsOriginsEnv !== undefined && corsOriginsEnv !== "") {
+    corsOrigins = corsOriginsEnv.split(",").map((s) => s.trim()).filter(Boolean);
+  } else if (Array.isArray(file.corsOrigins)) {
+    const arr = (file.corsOrigins as unknown[])
+      .filter((x): x is string => typeof x === "string")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    corsOrigins = arr.length > 0 ? arr : "*";
+  } else {
+    corsOrigins = "*";
+  }
+
   const dbPath = getFromEnvOrFile(file, "SUBFIN_DB_PATH", "dbPath") ?? "./subfin.db";
   const logRestRaw = getFromEnvOrFile(file, "SUBFIN_LOG_REST", "logRest");
   const logRest = logRestRaw === "true" || logRestRaw === "1" || file.logRest === true;
@@ -173,6 +189,7 @@ export function loadConfig(): Config {
       deviceName: jellyfinDeviceName,
     },
     allowedJellyfinHosts,
+    corsOrigins,
     dbPath,
     logRest,
     lastFmApiKey,
