@@ -1584,8 +1584,7 @@ ${renderLayout(
           });
         </script>
         <div class="actions-row">
-          <a href="/devices"><button type="button" class="btn-secondary">Back to devices</button></a>
-          <a href="/"><button type="button">Back to overview</button></a>
+          <a href="/devices"><button type="button">Manage devices</button></a>
         </div>
       </div>
     </main>
