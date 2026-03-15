@@ -3,7 +3,7 @@
  */
 import archiver from "archiver";
 import axios from "axios";
-import { Router, type Request, type Response } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import * as jf from "../jellyfin/client.js";
 import { config } from "../config.js";
 import {
@@ -724,14 +724,16 @@ router.get("/", (req: Request, res: Response) => {
 
   const err = (req.query.error as string) || "";
   const loginFlash =
-    !sessionUser && err
-      ? (err === "auth"
-          ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Quick Connect failed or was denied. Try again.</p>'
-          : err === "missing"
-            ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Session expired or invalid. Start again from the overview.</p>'
-            : err === "no-device"
-              ? '<p class="card card-muted" style="margin-bottom: 14px;">Link a device first from the overview, then you can add more from here.</p>'
-              : "")
+    err
+      ? (err === "csrf"
+          ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Your session token expired. Please try again — if the problem persists, clear your browser cookies.</p>'
+          : !sessionUser && err === "auth"
+            ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Quick Connect failed or was denied. Try again.</p>'
+            : !sessionUser && err === "missing"
+              ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Session expired or invalid. Start again from the overview.</p>'
+              : !sessionUser && err === "no-device"
+                ? '<p class="card card-muted" style="margin-bottom: 14px;">Link a device first from the overview, then you can add more from here.</p>'
+                : "")
       : "";
 
   const shares = sessionUser ? getSharesForUser(sessionUser) : [];
@@ -2283,5 +2285,20 @@ function getUsernameForDeviceAction(req: Request): { username: string } | { erro
   if (!token) return { errorRedirect: "/devices?error=wrong" };
   return { username };
 }
+
+// CSRF error handler — catches invalid/stale CSRF tokens (e.g. after browser upgrade or cookie
+// expiry) and redirects to home with a user-friendly message instead of a raw 403.
+router.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  if (
+    err &&
+    typeof err === "object" &&
+    (err as { status?: number }).status === 403 &&
+    typeof (err as { message?: string }).message === "string" &&
+    (err as { message: string }).message.toLowerCase().includes("csrf")
+  ) {
+    return res.redirect("/?error=csrf");
+  }
+  next(err);
+});
 
 export { router as webRouter };

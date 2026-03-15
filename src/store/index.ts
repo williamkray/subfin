@@ -156,10 +156,14 @@ function runSchema(database: Database.Database): void {
   }
 }
 
-/** After schema migration, backfill empty jellyfin_url values for existing single-tenant data. */
+/**
+ * After schema migration, backfill empty jellyfin_url values for existing pre-multi-tenant data.
+ * Rows with jellyfin_url = '' are always from before multi-tenancy was introduced, so assigning
+ * them to allowedJellyfinHosts[0] is correct regardless of how many hosts are now configured.
+ */
 function backfillJellyfinUrls(database: Database.Database): void {
   const cfg = getConfig();
-  if (cfg.allowedJellyfinHosts.length !== 1) return;
+  if (cfg.allowedJellyfinHosts.length === 0) return;
   const url = cfg.allowedJellyfinHosts[0]!;
   database.prepare("UPDATE linked_devices SET jellyfin_url = ? WHERE jellyfin_url = ''").run(url);
   database.prepare("UPDATE jellyfin_sessions SET jellyfin_url = ? WHERE jellyfin_url = ''").run(url);

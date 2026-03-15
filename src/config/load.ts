@@ -3,7 +3,7 @@
  * All settings (including salt for DB encryption) can come from file or env.
  * Salt is required for securing sensitive data in the database.
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 const env = process.env;
@@ -33,7 +33,70 @@ export interface Config {
   corsOrigins: string[] | "*";
 }
 
+/**
+ * Rewrite the config file in-place to remove deprecated keys and populate new ones
+ * derived from values already present. Creates a .bak backup before modifying.
+ * Safe to call multiple times — only writes when changes are actually needed.
+ */
+function migrateConfigFileIfNeeded(): void {
+  const configPath = resolve(process.cwd(), CONFIG_PATH);
+  if (!existsSync(configPath)) return;
+
+  let raw: string;
+  let data: Record<string, unknown>;
+  try {
+    raw = readFileSync(configPath, "utf-8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return;
+    data = parsed as Record<string, unknown>;
+  } catch {
+    return;
+  }
+
+  const changes: string[] = [];
+
+  // Add allowedJellyfinHosts derived from jellyfin.baseUrl if the new key is absent.
+  if (!Array.isArray(data.allowedJellyfinHosts)) {
+    const jellyfinSection = data.jellyfin as Record<string, unknown> | undefined;
+    const baseUrl =
+      typeof jellyfinSection?.baseUrl === "string"
+        ? jellyfinSection.baseUrl.trim().replace(/\/$/, "")
+        : null;
+    if (baseUrl) {
+      data.allowedJellyfinHosts = [baseUrl];
+      changes.push(`added "allowedJellyfinHosts": ["${baseUrl}"] (from jellyfin.baseUrl)`);
+    }
+  }
+
+  // Remove deprecated musicLibraryIds — already migrated to per-user DB settings.
+  if ("musicLibraryIds" in data) {
+    delete data.musicLibraryIds;
+    changes.push('removed deprecated "musicLibraryIds" (migrated to per-user library settings in DB)');
+  }
+
+  if (changes.length === 0) return;
+
+  const backupPath = configPath + ".bak";
+  try {
+    writeFileSync(backupPath, raw, "utf-8");
+  } catch (err) {
+    console.warn(`[subfin] Could not create config backup at ${backupPath}: ${err}. Skipping config file migration.`);
+    return;
+  }
+
+  try {
+    writeFileSync(configPath, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    console.log(`[subfin] Config file migrated (original backed up to ${backupPath}):`);
+    for (const change of changes) {
+      console.log(`[subfin]   - ${change}`);
+    }
+  } catch (err) {
+    console.warn(`[subfin] Could not write migrated config: ${err}`);
+  }
+}
+
 function loadFromFile(): Record<string, unknown> {
+  migrateConfigFileIfNeeded();
   const path = resolve(process.cwd(), CONFIG_PATH);
   if (!existsSync(path)) return {};
   try {
