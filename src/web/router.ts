@@ -628,6 +628,66 @@ const baseStyles = `
     font-size: 0.72rem;
     color: var(--text-muted);
   }
+  /* ── Toast notifications ── */
+  .toast-wrap {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    pointer-events: none;
+  }
+  .toast {
+    pointer-events: auto;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-left: 3px solid #22c55e;
+    border-radius: 12px;
+    padding: 10px 18px;
+    color: var(--text);
+    font-size: 0.82rem;
+    box-shadow: var(--shadow-soft);
+    white-space: nowrap;
+    opacity: 0;
+    transform: translateY(6px);
+    transition: opacity 0.18s ease, transform 0.18s ease;
+  }
+  .toast.toast-in {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  /* ── Modal overlay ── */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(5, 8, 18, 0.72);
+    backdrop-filter: blur(3px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    padding: 20px;
+  }
+  .modal-box {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-left: 3px solid var(--danger);
+    border-radius: var(--radius-lg);
+    padding: 18px 20px 16px;
+    max-width: 360px;
+    width: 100%;
+    box-shadow: var(--shadow-soft);
+  }
+  .modal-msg {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    line-height: 1.55;
+    margin-bottom: 14px;
+  }
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+  }
 `;
 
 function renderLayout(title: string, innerHtml: string, csrfToken?: string): string {
@@ -652,6 +712,7 @@ function renderLayout(title: string, innerHtml: string, csrfToken?: string): str
     ${innerHtml}
   </div>
   ${csrfScript}
+  <script>(function(){var p=new URLSearchParams(window.location.search),toast=p.get('toast'),modal=p.get('modal');if(toast||modal){p.delete('toast');p.delete('modal');var qs=p.toString();history.replaceState(null,'',window.location.pathname+(qs?'?'+qs:''));}if(toast){var wrap=document.createElement('div');wrap.className='toast-wrap';var el=document.createElement('div');el.className='toast';el.textContent=toast;wrap.appendChild(el);document.body.appendChild(wrap);requestAnimationFrame(function(){el.classList.add('toast-in');setTimeout(function(){el.style.transition='opacity 0.2s ease,transform 0.2s ease';el.style.opacity='0';el.style.transform='translateY(6px)';setTimeout(function(){wrap.remove();},220);},2000);});}if(modal){var ov=document.createElement('div');ov.className='modal-overlay';var box=document.createElement('div');box.className='modal-box';var msg=document.createElement('div');msg.className='modal-msg';msg.textContent=modal;var acts=document.createElement('div');acts.className='modal-actions';var btn=document.createElement('button');btn.type='button';btn.className='btn-secondary btn-small';btn.textContent='Dismiss';btn.onclick=function(){ov.remove();};acts.appendChild(btn);box.appendChild(msg);box.appendChild(acts);ov.appendChild(box);ov.addEventListener('click',function(e){if(e.target===ov)ov.remove();});document.body.appendChild(ov);}})();</script>
 </body>
 </html>`;
 }
@@ -722,20 +783,6 @@ router.get("/", (req: Request, res: Response) => {
     </section>
   `;
 
-  const err = (req.query.error as string) || "";
-  const loginFlash =
-    err
-      ? (err === "csrf"
-          ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Your session token expired. Please try again — if the problem persists, clear your browser cookies.</p>'
-          : !sessionUser && err === "auth"
-            ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Quick Connect failed or was denied. Try again.</p>'
-            : !sessionUser && err === "missing"
-              ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Session expired or invalid. Start again from the overview.</p>'
-              : !sessionUser && err === "no-device"
-                ? '<p class="card card-muted" style="margin-bottom: 14px;">Link a device first from the overview, then you can add more from here.</p>'
-                : "")
-      : "";
-
   const shares = sessionUser ? getSharesForUser(sessionUser) : [];
   const dashboard =
     sessionUser && devices
@@ -750,7 +797,6 @@ router.get("/", (req: Request, res: Response) => {
         ${renderDashboardHeader(sessionUser, { jellyfinUrl: getSessionJellyfinUrl(req), allowedHosts: sessionUser ? undefined : getConfig().allowedJellyfinHosts })}
         <main class="shell-main">
           <div class="shell-main-full">
-            ${loginFlash}
             ${hero}
             ${dashboard}
           </div>
@@ -1144,20 +1190,20 @@ router.get("/auth/quickconnect", async (req: Request, res: Response) => {
   const allowedHosts = getConfig().allowedJellyfinHosts;
   const jellyfinUrl = ((req.query.jfUrl as string)?.trim() || allowedHosts[0] || "").replace(/\/$/, "");
   if (!jellyfinUrl) {
-    res.status(400).send("No Jellyfin server URL provided.");
+    res.redirect(`/?modal=${encodeURIComponent("No Jellyfin server URL configured.")}`);
     return;
   }
   if (isOpenMode()) {
     try {
       await jf.validateJellyfinUrl(jellyfinUrl);
     } catch (err) {
-      res.status(400).send(`Invalid Jellyfin URL: ${(err as Error).message}`);
+      res.redirect(`/?modal=${encodeURIComponent(`Invalid Jellyfin URL: ${(err as Error).message}`)}`);
       return;
     }
   }
   const result = await jf.initiateQuickConnect(jellyfinUrl);
   if (!result) {
-    res.status(500).send("Quick Connect not available. Is Jellyfin reachable and Quick Connect enabled?");
+    res.redirect(`/?modal=${encodeURIComponent("Quick Connect not available. Is Jellyfin reachable and Quick Connect enabled in Jellyfin's settings?")}`);
     return;
   }
   const whatNext =
@@ -1253,14 +1299,14 @@ router.get("/web/quickconnect/done", async (req: Request, res: Response) => {
   const deviceName = (req.query.deviceName as string)?.trim();
   const jellyfinUrl = (req.query.jfUrl as string)?.trim() || getConfig().allowedJellyfinHosts[0] || "";
   if (!secret) {
-    res.redirect("/?error=missing");
+    res.redirect(`/?modal=${encodeURIComponent("Session expired. Please log in again.")}`);
     return;
   }
   const deviceLabel = (req.query.deviceLabel as string)?.trim() || undefined;
   const device = deviceId && deviceName ? { id: deviceId, name: deviceName } : undefined;
   const auth = await jf.authenticateWithQuickConnect(secret, jellyfinUrl, device);
   if (!auth) {
-    res.redirect("/?error=auth");
+    res.redirect(`/?modal=${encodeURIComponent("Quick Connect was denied or did not complete in time. Try again.")}`);
     return;
   }
   const username = (await jf.getCurrentUserName({ accessToken: auth.accessToken, jellyfinBaseUrl: jellyfinUrl })) ?? auth.userId;
@@ -1342,25 +1388,25 @@ router.post("/web/link/password", doubleCsrfProtection, async (req: Request, res
   const username = (req.body?.username as string)?.trim();
   const password = req.body?.password as string;
   if (!username || !password) {
-    res.redirect("/link/password?error=missing");
+    res.redirect(`/auth/password?modal=${encodeURIComponent("Please enter your Jellyfin username and password.")}`);
     return;
   }
   const jellyfinUrl = ((req.body?.jfUrl as string)?.trim() || getConfig().allowedJellyfinHosts[0] || "").replace(/\/$/, "");
   if (!jellyfinUrl) {
-    res.redirect("/auth/password?error=missing");
+    res.redirect(`/auth/password?modal=${encodeURIComponent("No Jellyfin server URL configured.")}`);
     return;
   }
   if (isOpenMode()) {
     try {
       await jf.validateJellyfinUrl(jellyfinUrl);
     } catch (err) {
-      res.status(400).send(`Invalid Jellyfin URL: ${(err as Error).message}`);
+      res.redirect(`/auth/password?modal=${encodeURIComponent(`Invalid Jellyfin URL: ${(err as Error).message}`)}`);
       return;
     }
   }
   const auth = await jf.authenticateByName(jellyfinUrl, username, password);
   if (!auth) {
-    res.redirect("/link/password?error=wrong");
+    res.redirect(`/auth/password?modal=${encodeURIComponent("Wrong username or password. Please try again.")}`);
     return;
   }
   // Auth-only step: remember Jellyfin credentials for this Subsonic username.
@@ -1383,7 +1429,7 @@ router.post("/web/link/new-device", doubleCsrfProtection, async (req: Request, r
 
   const creds = getJellyfinCredentialsForLinking(userKey);
   if (!creds) {
-    res.redirect("/?error=no-device");
+    res.redirect(`/?modal=${encodeURIComponent("Link a device first from the overview, then you can add more from here.")}`);
     return;
   }
   const newAuth = await jf.getNewTokenViaQuickConnect(
@@ -1392,7 +1438,7 @@ router.post("/web/link/new-device", doubleCsrfProtection, async (req: Request, r
     creds.jellyfinUserId
   );
   if (!newAuth) {
-    res.redirect("/devices?error=qc-failed");
+    res.redirect(`/devices?modal=${encodeURIComponent("Quick Connect was denied or timed out. Approve in Jellyfin → Settings → Quick Connect, then try again.")}`);
     return;
   }
 
@@ -1412,22 +1458,9 @@ router.get("/devices", (req: Request, res: Response) => {
     res.redirect("/");
     return;
   }
-  const err = (req.query.error as string) || "";
-  const ok =
-    (req.query.unlinked as string) === "1" ||
-    (req.query.renamed as string) === "1" ||
-    (req.query.unshared as string) === "1";
   const sessionJfUrl = getSessionJellyfinUrl(req);
   const devices = listLinkedDevices({ subsonicUsername: sessionUser, jellyfinUrl: sessionJfUrl });
   const shares = getSharesForUser(sessionUser);
-  const flash =
-    err === "qc-failed"
-      ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Quick Connect failed or was denied. No device was created. Try again (approve in Jellyfin: Settings → Quick Connect).</p>'
-      : err === "unshare"
-            ? '<p class="card card-muted" style="margin-bottom: 14px; border-left: 4px solid #b91c1c;">Could not unshare (share not found or already removed).</p>'
-            : ok
-              ? '<p class="card card-muted" style="margin-bottom: 14px;">Done.</p>'
-              : "";
   const csrfToken = generateToken(req, res);
   res.send(
     renderLayout(
@@ -1435,7 +1468,6 @@ router.get("/devices", (req: Request, res: Response) => {
       `
           ${renderDashboardHeader(sessionUser, { jellyfinUrl: getSessionJellyfinUrl(req) })}
           <main class="shell-main">
-            ${flash}
             <div class="shell-main-full">
               ${renderAuthenticatedDashboard(sessionUser, devices, shares, isOpenMode())}
             </div>
@@ -1450,12 +1482,12 @@ router.post("/web/devices", doubleCsrfProtection, async (req: Request, res: Resp
   const username = (req.body?.username as string)?.trim();
   const password = req.body?.password as string;
   if (!username || !password) {
-    res.redirect("/devices?error=missing");
+    res.redirect(`/devices?modal=${encodeURIComponent("Missing or invalid request. Please try again.")}`);
     return;
   }
   const token = resolveToJellyfinToken(username, password);
   if (!token) {
-    res.redirect("/devices?error=wrong");
+    res.redirect(`/devices?modal=${encodeURIComponent("Wrong username or password. Please try again.")}`);
     return;
   }
   const jellyfinUrl = token.jellyfinUrl || getConfig().allowedJellyfinHosts[0] || "";
@@ -1485,7 +1517,7 @@ router.post("/web/devices/unlink", doubleCsrfProtection, async (req: Request, re
   }
   const deviceId = parseInt(req.body?.deviceId as string, 10);
   if (Number.isNaN(deviceId)) {
-    res.redirect("/devices?error=missing");
+    res.redirect(`/devices?modal=${encodeURIComponent("Missing or invalid request. Please try again.")}`);
     return;
   }
   const token = getDeviceJellyfinToken(deviceId, resolved.username);
@@ -1493,7 +1525,7 @@ router.post("/web/devices/unlink", doubleCsrfProtection, async (req: Request, re
     await jf.reportSessionEnded(token);
   }
   const ok = unlinkDevice(deviceId, resolved.username);
-  res.redirect(ok ? "/devices?unlinked=1" : "/devices?error=unlink");
+  res.redirect(ok ? `/devices?toast=${encodeURIComponent("Device removed.")}` : `/devices?modal=${encodeURIComponent("Could not remove this device. It may have already been removed.")}`);
 });
 
 router.post("/web/devices/reset", doubleCsrfProtection, (req: Request, res: Response) => {
@@ -1504,12 +1536,12 @@ router.post("/web/devices/reset", doubleCsrfProtection, (req: Request, res: Resp
   }
   const deviceId = parseInt(req.body?.deviceId as string, 10);
   if (Number.isNaN(deviceId)) {
-    res.redirect("/devices?error=missing");
+    res.redirect(`/devices?modal=${encodeURIComponent("Missing or invalid request. Please try again.")}`);
     return;
   }
   const newPassword = resetAppPassword(deviceId, resolved.username);
   if (!newPassword) {
-    res.redirect("/devices?error=reset");
+    res.redirect(`/devices?modal=${encodeURIComponent("Could not reset this device's password. The device may no longer exist.")}`);
     return;
   }
   const csrfToken = generateToken(req, res);
@@ -1572,11 +1604,11 @@ router.post("/web/shares/delete", doubleCsrfProtection, (req: Request, res: Resp
   }
   const shareUid = (req.body?.share_uid as string)?.trim();
   if (!shareUid) {
-    res.redirect("/devices?error=missing");
+    res.redirect(`/devices?modal=${encodeURIComponent("Missing or invalid request. Please try again.")}`);
     return;
   }
   const deleted = deleteShare(shareUid, sessionUser);
-  res.redirect(deleted ? "/devices?unshared=1" : "/devices?error=unshare");
+  res.redirect(deleted ? `/devices?toast=${encodeURIComponent("Share removed.")}` : `/devices?modal=${encodeURIComponent("Could not remove this share. It may have already been removed.")}`);
 });
 
 router.post("/web/shares/update", doubleCsrfProtection, (req: Request, res: Response) => {
@@ -1588,11 +1620,11 @@ router.post("/web/shares/update", doubleCsrfProtection, (req: Request, res: Resp
   const shareUid = (req.body?.share_uid as string)?.trim();
   const description = (req.body?.description as string)?.trim() || null;
   if (!shareUid) {
-    res.redirect("/devices?error=missing");
+    res.redirect(`/devices?modal=${encodeURIComponent("Missing or invalid request. Please try again.")}`);
     return;
   }
   const updated = updateShare(shareUid, sessionUser, { description });
-  res.redirect(updated ? "/devices?renamed=1" : "/devices?error=rename");
+  res.redirect(updated ? `/devices?toast=${encodeURIComponent("Share updated.")}` : `/devices?modal=${encodeURIComponent("Could not update this share. It may no longer exist.")}`);
 });
 
 router.post("/web/devices/rename", doubleCsrfProtection, (req: Request, res: Response) => {
@@ -1606,12 +1638,12 @@ router.post("/web/devices/rename", doubleCsrfProtection, (req: Request, res: Res
   const deviceLabel = rawLabel.trim() === "" ? null : rawLabel.trim();
 
   if (Number.isNaN(deviceId)) {
-    res.redirect("/devices?error=missing");
+    res.redirect(`/devices?modal=${encodeURIComponent("Missing or invalid request. Please try again.")}`);
     return;
   }
 
   const ok = renameDevice(deviceId, resolved.username, deviceLabel);
-  res.redirect(ok ? "/devices?renamed=1" : "/devices?error=rename");
+  res.redirect(ok ? `/devices?toast=${encodeURIComponent("Device renamed.")}` : `/devices?modal=${encodeURIComponent("Could not rename this device. It may no longer exist.")}`);
 });
 
 router.post("/web/logout", doubleCsrfProtection, (req: Request, res: Response) => {
@@ -2280,9 +2312,9 @@ function getUsernameForDeviceAction(req: Request): { username: string } | { erro
 
   const username = (req.body?.username as string)?.trim();
   const password = req.body?.password as string;
-  if (!username || !password) return { errorRedirect: "/devices?error=missing" };
+  if (!username || !password) return { errorRedirect: `/devices?modal=${encodeURIComponent("Missing or invalid request. Please try again.")}` };
   const token = resolveToJellyfinToken(username, password);
-  if (!token) return { errorRedirect: "/devices?error=wrong" };
+  if (!token) return { errorRedirect: `/devices?modal=${encodeURIComponent("Wrong username or password. Please try again.")}` };
   return { username };
 }
 
@@ -2296,7 +2328,7 @@ router.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
     typeof (err as { message?: string }).message === "string" &&
     (err as { message: string }).message.toLowerCase().includes("csrf")
   ) {
-    return res.redirect("/?error=csrf");
+    return res.redirect(`/?modal=${encodeURIComponent("Your session token expired. Please try again — if the problem persists, clear your browser cookies.")}`);
   }
   next(err);
 });
