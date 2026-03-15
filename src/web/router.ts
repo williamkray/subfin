@@ -1158,9 +1158,7 @@ function renderDeviceLinkedPage(
           });
         </script>
         <div class="actions-row">
-          <a href="/"><button type="button">Back to overview</button></a>
-          <a href="/devices"><button type="button" class="btn-secondary">Manage linked devices</button></a>
-          <a href="/devices"><button type="button" class="btn-secondary">Link another device</button></a>
+          <a href="/devices"><button type="button">Manage devices</button></a>
         </div>
       </div>
       <aside>
@@ -1169,7 +1167,7 @@ function renderDeviceLinkedPage(
             <div class="card-title">Tip</div>
           </div>
           <div class="card-body">
-            Each linked device has its own token. Use "Link another device" on the main page for each new client.
+            Each linked device has its own app password. Link additional devices from the main page.
           </div>
         </div>
       </aside>
