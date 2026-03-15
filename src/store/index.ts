@@ -114,7 +114,7 @@ function runSchema(database: Database.Database): void {
         PRIMARY KEY (subsonic_username, jellyfin_url)
       );
       INSERT OR IGNORE INTO jellyfin_sessions_new (subsonic_username, jellyfin_url, jellyfin_user_id, jellyfin_access_token_encrypted, created_at)
-        SELECT subsonic_username, COALESCE(jellyfin_url, ''), jellyfin_user_id, jellyfin_access_token_encrypted, created_at
+        SELECT subsonic_username, '', jellyfin_user_id, jellyfin_access_token_encrypted, created_at
         FROM jellyfin_sessions;
       DROP TABLE jellyfin_sessions;
       ALTER TABLE jellyfin_sessions_new RENAME TO jellyfin_sessions;
@@ -141,7 +141,7 @@ function runSchema(database: Database.Database): void {
         PRIMARY KEY (subsonic_username, jellyfin_url)
       );
       INSERT OR IGNORE INTO play_queue_new (subsonic_username, jellyfin_url, entry_ids, current_id, current_index, position_ms, changed_at, changed_by)
-        SELECT subsonic_username, COALESCE(jellyfin_url, ''), entry_ids, current_id, COALESCE(current_index, 0), position_ms, changed_at, COALESCE(changed_by, '')
+        SELECT subsonic_username, '', entry_ids, current_id, COALESCE(current_index, 0), position_ms, changed_at, COALESCE(changed_by, '')
         FROM play_queue;
       DROP TABLE play_queue;
       ALTER TABLE play_queue_new RENAME TO play_queue;
