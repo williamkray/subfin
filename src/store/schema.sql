@@ -15,8 +15,9 @@ CREATE TABLE IF NOT EXISTS linked_devices (
 );
 
 CREATE INDEX IF NOT EXISTS idx_linked_devices_username ON linked_devices(subsonic_username);
-CREATE INDEX IF NOT EXISTS idx_linked_devices_username_url ON linked_devices(subsonic_username, jellyfin_url);
 CREATE INDEX IF NOT EXISTS idx_linked_devices_jellyfin_user ON linked_devices(jellyfin_user_id);
+-- NOTE: idx_linked_devices_username_url is created by the migration in runSchema() after
+-- the jellyfin_url column is guaranteed to exist (ALTER TABLE for upgrades, or present on fresh install).
 
 -- Pending QuickConnect: secret -> encrypted jellyfin token; cleaned after use or expiry.
 CREATE TABLE IF NOT EXISTS pending_quickconnect (

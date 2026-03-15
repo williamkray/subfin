@@ -84,8 +84,11 @@ function runSchema(database: Database.Database): void {
   const hasJellyfinUrl = linkedDevicesInfo.some((c) => c.name === "jellyfin_url");
   if (!hasJellyfinUrl) {
     database.exec("ALTER TABLE linked_devices ADD COLUMN jellyfin_url TEXT NOT NULL DEFAULT ''");
-    database.exec("CREATE INDEX IF NOT EXISTS idx_linked_devices_username_url ON linked_devices(subsonic_username, jellyfin_url)");
   }
+  // Always ensure the composite index exists. This runs unconditionally so it is created for
+  // both fresh installs (column exists from schema.sql, migration skipped) and upgrades
+  // (column just added above). IF NOT EXISTS makes it idempotent.
+  database.exec("CREATE INDEX IF NOT EXISTS idx_linked_devices_username_url ON linked_devices(subsonic_username, jellyfin_url)");
 
   // Migration: add jellyfin_url to pending_quickconnect if missing.
   const pendingInfo = database.prepare("PRAGMA table_info(pending_quickconnect)").all() as { name: string }[];
