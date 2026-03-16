@@ -105,12 +105,14 @@ function mapCachedArtists(payload: CachedArtistIndexPayload): BaseItemDto[] {
 import type { BaseItemDto } from "@jellyfin/sdk/lib/generated-client/models/base-item-dto.js";
 import * as jf from "../jellyfin/client.js";
 import { config } from "../config.js";
+import { isOpenMode } from "../config/load.js";
 import {
   clearPlayQueue,
   getPlayQueue,
   savePlayQueue,
   createShare as storeCreateShare,
   getJellyfinCredentialsForLinking,
+  getUserLibrarySettings,
   getSharesForUser,
   updateShare as storeUpdateShare,
   deleteShare as storeDeleteShare,
@@ -129,14 +131,15 @@ import {
 } from "./mappers.js";
 import { toJellyfinContext, type AuthResult } from "./auth.js";
 
-/** Resolve effective music folder id(s) for list endpoints: client param wins; else MUSIC_LIBRARY_IDS when set. Returns null = no restriction, [] = no allowed folders, [id...] = use these. */
+/** Resolve effective music folder id(s) for list endpoints: client param wins; else per-user DB settings. Returns null = no restriction, [id...] = use these. */
 async function getEffectiveMusicFolderIds(
   auth: AuthResult,
   clientMusicFolderId?: string
 ): Promise<string[] | null> {
   const trimmed = clientMusicFolderId?.trim();
   if (trimmed) return [trimmed];
-  return jf.getAllowedMusicFolderIds(toJellyfinContext(auth), auth.jellyfinUserId);
+  const savedIds = getUserLibrarySettings({ subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl });
+  return jf.getAllowedMusicFolderIds(toJellyfinContext(auth), auth.jellyfinUserId, savedIds);
 }
 
 /** Normalize artist name for deduplication/lookup: lowercase + strip spaces and common punctuation. */
@@ -161,10 +164,13 @@ async function getAlbumArtistsForFolders(
   const ctx = toJellyfinContext(auth);
   const byArtist = new Map<string, { Id: string; Name: string; AlbumCount: number }>();
   const pageSize = 200;
+  const MAX_ALBUMS = 50_000;
+  let totalAlbumsSeen = 0;
 
   const accumulateFromFolder = async (musicFolderId: string | undefined) => {
     let offset = 0;
     for (;;) {
+      if (totalAlbumsSeen >= MAX_ALBUMS) break;
       const page = await jf.getAlbumsForLibrary(ctx, {
         userId: auth.jellyfinUserId,
         musicFolderId,
@@ -174,6 +180,8 @@ async function getAlbumArtistsForFolders(
       });
       if (page.length === 0) break;
       for (const album of page) {
+        if (totalAlbumsSeen >= MAX_ALBUMS) break;
+        totalAlbumsSeen++;
         const primaryArtistId = resolvePrimaryArtistIdForAlbum(album);
         if (!primaryArtistId) continue;
         const artistName =
@@ -243,15 +251,21 @@ export async function handleGetOpenSubsonicExtensions(): Promise<Record<string, 
         name: "songLyrics",
         versions: [1],
       },
+      {
+        name: "indexBasedQueue",
+        versions: [1],
+      },
     ],
   };
 }
 
 export async function handleGetMusicFolders(auth: AuthResult): Promise<Record<string, unknown>> {
   const folders = await jf.getMusicLibraries(toJellyfinContext(auth), auth.jellyfinUserId);
+  const allowed = await getEffectiveMusicFolderIds(auth);
+  const filtered = allowed === null ? folders : folders.filter((f) => allowed.includes(f.id));
   return {
     musicFolders: {
-      musicFolder: folders.map((f) => ({ id: f.id, name: f.name })),
+      musicFolder: filtered.map((f) => ({ id: f.id, name: f.name })),
     },
   };
 }
@@ -273,7 +287,7 @@ export async function handleGetIndexes(
   params: Record<string, string>
 ): Promise<Record<string, unknown>> {
   const folderIds = await getEffectiveMusicFolderIds(auth, params.musicFolderId);
-  const artists = await getAlbumArtistsForFolders(auth, folderIds);
+  const artists = await getOrBuildArtistIndex(auth, folderIds);
   const idx = toSubsonicArtistsIndex(artists);
   return {
     indexes: {
@@ -295,7 +309,7 @@ export async function handleGetArtist(
     console.log("[ARTIST] getArtist params: id=%s cleanId=%s", id, cleanId);
   }
   const ctx = toJellyfinContext(auth);
-  const folderIds = await jf.getAllowedMusicFolderIds(ctx, auth.jellyfinUserId);
+  const folderIds = await getEffectiveMusicFolderIds(auth, undefined);
   let albums: Awaited<ReturnType<typeof jf.getAlbumsByArtist>> = [];
   if (folderIds === null) {
     albums = await jf.getAlbumsByArtist(ctx, cleanId, undefined);
@@ -364,10 +378,24 @@ export async function handleGetMusicDirectory(
   }
 
   // Fallback: treat as artist (ar- prefix or raw artist id).
-  const [artist, albums] = await Promise.all([
-    jf.getArtist(toJellyfinContext(auth), cleanId),
-    jf.getAlbumsByArtist(toJellyfinContext(auth), cleanId),
-  ]);
+  const ctx = toJellyfinContext(auth);
+  const folderIds = await getEffectiveMusicFolderIds(auth, undefined);
+  let albums: Awaited<ReturnType<typeof jf.getAlbumsByArtist>> = [];
+  if (folderIds === null) {
+    albums = await jf.getAlbumsByArtist(ctx, cleanId, undefined);
+  } else if (folderIds.length === 0) {
+    albums = [];
+  } else if (folderIds.length === 1) {
+    albums = await jf.getAlbumsByArtist(ctx, cleanId, folderIds[0]);
+  } else {
+    const results = await Promise.all(
+      folderIds.map((musicFolderId) => jf.getAlbumsByArtist(ctx, cleanId, musicFolderId))
+    );
+    const byId = new Map<string, Awaited<ReturnType<typeof jf.getAlbumsByArtist>>[number]>();
+    for (const list of results) for (const a of list) if (a.Id) byId.set(a.Id, a);
+    albums = Array.from(byId.values());
+  }
+  const artist = await jf.getArtist(ctx, cleanId);
   if (!artist) {
     throw new Error("NotFound");
   }
@@ -1781,6 +1809,9 @@ export async function handleCreateShare(
   auth: AuthResult,
   params: { ids: string[]; description?: string; expires?: string }
 ): Promise<Record<string, unknown>> {
+  if (isOpenMode()) {
+    throw new Error("Sharing is not available on this server.");
+  }
   const ids = params.ids?.filter((id) => typeof id === "string" && id.trim()) ?? [];
   if (ids.length === 0) throw new Error("At least one id is required");
 
@@ -1876,7 +1907,8 @@ export async function handleCreateShare(
   if (expiresAt !== null && (Number.isNaN(expiresAt) || expiresAt < 0)) throw new Error("Invalid expires");
 
   // Use behind-the-scenes Quick Connect so the share has its own token, not tied to the requesting device.
-  const creds = getJellyfinCredentialsForLinking(auth.subsonicUsername);
+  const userKey = { subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl };
+  const creds = getJellyfinCredentialsForLinking(userKey);
   if (!creds) {
     throw new Error(
       "Quick Connect required to create shares. Use the web app to link a device with Quick Connect first."
@@ -1885,6 +1917,7 @@ export async function handleCreateShare(
   const shareDeviceName =
     "Subfin Share: " + (description ? description.slice(0, 80) : "link");
   const shareAuth = await jf.getNewTokenViaQuickConnect(
+    auth.jellyfinBaseUrl,
     creds.jellyfinAccessToken,
     creds.jellyfinUserId,
     { deviceName: shareDeviceName }
@@ -1895,7 +1928,7 @@ export async function handleCreateShare(
     );
   }
 
-  const { shareUid, secret } = storeCreateShare(auth.subsonicUsername, shareAuth.userId, shareAuth.accessToken, {
+  const { shareUid, secret } = storeCreateShare(userKey, shareAuth.userId, shareAuth.accessToken, {
     entryIds,
     entryIdsFlat,
     description,
@@ -2051,8 +2084,9 @@ export async function handleSavePlayQueue(
     .filter((id) => id && id !== "[object Object]")
     .map((id) => stripSubsonicIdPrefix(id));
 
+  const userKey = { subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl };
   if (entryIds.length === 0) {
-    clearPlayQueue(auth.subsonicUsername);
+    clearPlayQueue(userKey);
     return {};
   }
 
@@ -2061,9 +2095,50 @@ export async function handleSavePlayQueue(
   const positionMs = Math.max(0, Number.parseInt(params.position ?? "0", 10) || 0);
   const changedBy = (params.changedBy ?? params.c ?? "").trim().slice(0, 255);
 
-  savePlayQueue(auth.subsonicUsername, {
+  const resolvedCurrentId = currentId && entryIds.includes(currentId) ? currentId : entryIds[0] ?? null;
+  const currentIndex = resolvedCurrentId ? Math.max(0, entryIds.indexOf(resolvedCurrentId)) : 0;
+  savePlayQueue(userKey, {
     entryIds,
-    currentId: currentId && entryIds.includes(currentId) ? currentId : entryIds[0] ?? null,
+    currentId: resolvedCurrentId,
+    currentIndex,
+    positionMs,
+    changedBy,
+  });
+  return {};
+}
+
+/** Save play queue by index for this user (OpenSubsonic indexBasedQueue extension). */
+export async function handleSavePlayQueueByIndex(
+  auth: AuthResult,
+  params: Record<string, string> & { playQueueIds?: string[] }
+): Promise<Record<string, unknown>> {
+  const ids = params.playQueueIds ?? [];
+  const rawIds = Array.isArray(ids) ? ids : [];
+  const entryIds = rawIds
+    .map((id) => (typeof id === "string" ? id : String(id)).trim())
+    .filter((id) => id && id !== "[object Object]")
+    .map((id) => stripSubsonicIdPrefix(id));
+
+  const userKey = { subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl };
+  if (entryIds.length === 0) {
+    clearPlayQueue(userKey);
+    return {};
+  }
+
+  const currentIndex = Math.max(0, Number.parseInt(params.currentIndex ?? "0", 10) || 0);
+  if (currentIndex >= entryIds.length) {
+    const err = new Error(`currentIndex ${currentIndex} is out of range (0–${entryIds.length - 1})`);
+    (err as NodeJS.ErrnoException).code = "OutOfRange";
+    throw err;
+  }
+  const currentId = entryIds[currentIndex] ?? null;
+  const positionMs = Math.max(0, Number.parseInt(params.position ?? "0", 10) || 0);
+  const changedBy = (params.changedBy ?? params.c ?? "").trim().slice(0, 255);
+
+  savePlayQueue(userKey, {
+    entryIds,
+    currentId,
+    currentIndex,
     positionMs,
     changedBy,
   });
@@ -2072,7 +2147,7 @@ export async function handleSavePlayQueue(
 
 /** Return saved play queue for this user with full entry metadata from Jellyfin (OpenSubsonic getPlayQueue). */
 export async function handleGetPlayQueue(auth: AuthResult): Promise<Record<string, unknown>> {
-  const queue = getPlayQueue(auth.subsonicUsername);
+  const queue = getPlayQueue({ subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl });
   if (!queue || queue.entryIds.length === 0) {
     return {
       playQueue: {
@@ -2100,6 +2175,45 @@ export async function handleGetPlayQueue(auth: AuthResult): Promise<Record<strin
   return {
     playQueue: {
       current: queue.currentId ?? (queue.entryIds[0] ?? ""),
+      position: queue.positionMs,
+      username: auth.subsonicUsername,
+      changed: queue.changedAt,
+      changedBy: queue.changedBy,
+      entry: entries,
+    },
+  };
+}
+
+/** Return saved play queue by index for this user (OpenSubsonic indexBasedQueue extension). */
+export async function handleGetPlayQueueByIndex(auth: AuthResult): Promise<Record<string, unknown>> {
+  const queue = getPlayQueue({ subsonicUsername: auth.subsonicUsername, jellyfinUrl: auth.jellyfinBaseUrl });
+  if (!queue || queue.entryIds.length === 0) {
+    return {
+      playQueueByIndex: {
+        position: 0,
+        username: auth.subsonicUsername,
+        changed: new Date().toISOString(),
+        changedBy: "",
+        entry: [],
+      },
+    };
+  }
+
+  const ctx = toJellyfinContext(auth);
+  const entries: Record<string, unknown>[] = [];
+  for (const id of queue.entryIds) {
+    const song = await jf.getSong(ctx, id);
+    if (song) {
+      const albumId = (song as Record<string, unknown>).AlbumId as string | undefined;
+      const albumName = song.Album ?? undefined;
+      const artistName = song.AlbumArtist ?? song.Artists?.[0] ?? "";
+      entries.push(toSubsonicSong(song, albumId, albumName, artistName));
+    }
+  }
+
+  return {
+    playQueueByIndex: {
+      currentIndex: queue.currentIndex,
       position: queue.positionMs,
       username: auth.subsonicUsername,
       changed: queue.changedAt,

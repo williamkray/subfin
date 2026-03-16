@@ -3,7 +3,7 @@
  * All settings (including salt for DB encryption) can come from file or env.
  * Salt is required for securing sensitive data in the database.
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 const env = process.env;
@@ -21,16 +21,82 @@ export interface Config {
   port: number;
   subfinPublicUrl: string;
   jellyfin: JellyfinConfig;
-  musicLibraryIds: string[];
+  /** Allowed Jellyfin backend URLs. Non-empty = restricted mode; empty = open mode (SSRF mitigation required). */
+  allowedJellyfinHosts: string[];
   dbPath: string;
   logRest: boolean;
   /** Optional Last.fm API key for enriching artist info (biography, last.fm URL). */
   lastFmApiKey?: string;
   /** Secret used to derive encryption key for sensitive DB fields. Required. From SUBFIN_SALT or config file. */
   salt: Buffer;
+  /** Allowed CORS origins. "*" = allow all (default). Array = restricted to listed origins. */
+  corsOrigins: string[] | "*";
+}
+
+/**
+ * Rewrite the config file in-place to remove deprecated keys and populate new ones
+ * derived from values already present. Creates a .bak backup before modifying.
+ * Safe to call multiple times — only writes when changes are actually needed.
+ */
+function migrateConfigFileIfNeeded(): void {
+  const configPath = resolve(process.cwd(), CONFIG_PATH);
+  if (!existsSync(configPath)) return;
+
+  let raw: string;
+  let data: Record<string, unknown>;
+  try {
+    raw = readFileSync(configPath, "utf-8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return;
+    data = parsed as Record<string, unknown>;
+  } catch {
+    return;
+  }
+
+  const changes: string[] = [];
+
+  // Add allowedJellyfinHosts derived from jellyfin.baseUrl if the new key is absent.
+  if (!Array.isArray(data.allowedJellyfinHosts)) {
+    const jellyfinSection = data.jellyfin as Record<string, unknown> | undefined;
+    const baseUrl =
+      typeof jellyfinSection?.baseUrl === "string"
+        ? jellyfinSection.baseUrl.trim().replace(/\/$/, "")
+        : null;
+    if (baseUrl) {
+      data.allowedJellyfinHosts = [baseUrl];
+      changes.push(`added "allowedJellyfinHosts": ["${baseUrl}"] (from jellyfin.baseUrl)`);
+    }
+  }
+
+  // Remove deprecated musicLibraryIds — already migrated to per-user DB settings.
+  if ("musicLibraryIds" in data) {
+    delete data.musicLibraryIds;
+    changes.push('removed deprecated "musicLibraryIds" (migrated to per-user library settings in DB)');
+  }
+
+  if (changes.length === 0) return;
+
+  const backupPath = configPath + ".bak";
+  try {
+    writeFileSync(backupPath, raw, "utf-8");
+  } catch (err) {
+    console.warn(`[subfin] Could not create config backup at ${backupPath}: ${err}. Skipping config file migration.`);
+    return;
+  }
+
+  try {
+    writeFileSync(configPath, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    console.log(`[subfin] Config file migrated (original backed up to ${backupPath}):`);
+    for (const change of changes) {
+      console.log(`[subfin]   - ${change}`);
+    }
+  } catch (err) {
+    console.warn(`[subfin] Could not write migrated config: ${err}`);
+  }
 }
 
 function loadFromFile(): Record<string, unknown> {
+  migrateConfigFileIfNeeded();
   const path = resolve(process.cwd(), CONFIG_PATH);
   if (!existsSync(path)) return {};
   try {
@@ -59,6 +125,53 @@ function getFromEnvOrFile(
   return undefined;
 }
 
+/**
+ * Emit loud startup warnings for config values that are deprecated in this version.
+ * Called once from loadConfig().
+ */
+function warnDeprecatedConfigKeys(file: Record<string, unknown>): void {
+  const BORDER = "=".repeat(72);
+  if (env.MUSIC_LIBRARY_IDS) {
+    console.warn(
+      `\n${BORDER}\n` +
+      `DEPRECATION WARNING: MUSIC_LIBRARY_IDS environment variable is no longer\n` +
+      `supported and has NO EFFECT. Library selection is now managed per-user\n` +
+      `via the Subfin web UI (/). Remove MUSIC_LIBRARY_IDS from your environment.\n` +
+      `${BORDER}\n`
+    );
+  }
+  if (Array.isArray(file.musicLibraryIds) && (file.musicLibraryIds as unknown[]).length > 0) {
+    console.warn(
+      `\n${BORDER}\n` +
+      `DEPRECATION WARNING: 'musicLibraryIds' in subfin.config.json is no longer\n` +
+      `supported. Library selection has been automatically migrated to per-user\n` +
+      `settings in the database. Remove 'musicLibraryIds' from your config file.\n` +
+      `${BORDER}\n`
+    );
+  }
+}
+
+/**
+ * Returns the legacy musicLibraryIds from the config file or MUSIC_LIBRARY_IDS env var.
+ * Used once at DB startup to migrate old global library restrictions to per-user settings.
+ * Returns null if neither source has any values set.
+ */
+export function getLegacyMusicLibraryIds(): string[] | null {
+  const file = loadFromFile();
+  if (Array.isArray(file.musicLibraryIds)) {
+    const ids = (file.musicLibraryIds as unknown[])
+      .filter((x): x is string => typeof x === "string")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (ids.length > 0) return ids;
+  }
+  if (env.MUSIC_LIBRARY_IDS) {
+    const ids = env.MUSIC_LIBRARY_IDS.split(",").map((s) => s.trim()).filter(Boolean);
+    if (ids.length > 0) return ids;
+  }
+  return null;
+}
+
 function parseSalt(saltRaw: string): Buffer {
   const trimmed = saltRaw.trim();
   if (trimmed.length < 32) {
@@ -80,18 +193,42 @@ export function loadConfig(): Config {
   const file = loadFromFile();
   const jellyfinFile = (file.jellyfin as Record<string, unknown>) ?? {};
 
+  warnDeprecatedConfigKeys(file);
+
   const portStr = getFromEnvOrFile(file, "PORT", "port") ?? "4040";
   const subfinPublicUrl = (getFromEnvOrFile(file, "SUBFIN_PUBLIC_URL", "subfinPublicUrl") ?? "").replace(/\/$/, "");
   const jellyfinBaseUrl = (getFromEnvOrFile(file, "JELLYFIN_URL", "baseUrl", "jellyfin") ?? "http://localhost:8096").replace(/\/$/, "");
   const jellyfinClient = getFromEnvOrFile(file, "JELLYFIN_CLIENT", "clientName", "jellyfin") ?? "Subfin";
   const jellyfinDeviceId = getFromEnvOrFile(file, "JELLYFIN_DEVICE_ID", "deviceId", "jellyfin") ?? "subfin-device-1";
   const jellyfinDeviceName = getFromEnvOrFile(file, "JELLYFIN_DEVICE_NAME", "deviceName", "jellyfin") ?? "Subfin Middleware";
-  const musicLibraryIdsRaw = getFromEnvOrFile(file, "MUSIC_LIBRARY_IDS", "musicLibraryIds");
-  const musicLibraryIds: string[] = musicLibraryIdsRaw
-    ? musicLibraryIdsRaw.split(",").map((s) => s.trim()).filter(Boolean)
-    : Array.isArray(file.musicLibraryIds)
-      ? file.musicLibraryIds.filter((x): x is string => typeof x === "string")
-      : [];
+  // ALLOWED_JELLYFIN_HOSTS: comma-separated URLs. If not set, defaults to [jellyfinBaseUrl] for backward compat.
+  const allowedJellyfinHostsRaw = getFromEnvOrFile(file, "ALLOWED_JELLYFIN_HOSTS", "allowedJellyfinHosts");
+  let allowedJellyfinHosts: string[];
+  if (allowedJellyfinHostsRaw !== undefined) {
+    allowedJellyfinHosts = allowedJellyfinHostsRaw.split(",").map((s) => s.trim().replace(/\/$/, "")).filter(Boolean);
+  } else if (Array.isArray(file.allowedJellyfinHosts)) {
+    allowedJellyfinHosts = (file.allowedJellyfinHosts as unknown[])
+      .filter((x): x is string => typeof x === "string")
+      .map((s) => s.trim().replace(/\/$/, ""))
+      .filter(Boolean);
+  } else {
+    // Backward compat: single-server deployments default to [JELLYFIN_URL] (restricted mode, one host).
+    allowedJellyfinHosts = jellyfinBaseUrl ? [jellyfinBaseUrl] : [];
+  }
+  const corsOriginsEnv = env.SUBFIN_CORS_ORIGINS;
+  let corsOrigins: string[] | "*";
+  if (corsOriginsEnv !== undefined && corsOriginsEnv !== "") {
+    corsOrigins = corsOriginsEnv.split(",").map((s) => s.trim()).filter(Boolean);
+  } else if (Array.isArray(file.corsOrigins)) {
+    const arr = (file.corsOrigins as unknown[])
+      .filter((x): x is string => typeof x === "string")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    corsOrigins = arr.length > 0 ? arr : "*";
+  } else {
+    corsOrigins = "*";
+  }
+
   const dbPath = getFromEnvOrFile(file, "SUBFIN_DB_PATH", "dbPath") ?? "./subfin.db";
   const logRestRaw = getFromEnvOrFile(file, "SUBFIN_LOG_REST", "logRest");
   const logRest = logRestRaw === "true" || logRestRaw === "1" || file.logRest === true;
@@ -114,7 +251,8 @@ export function loadConfig(): Config {
       deviceId: jellyfinDeviceId,
       deviceName: jellyfinDeviceName,
     },
-    musicLibraryIds: Array.isArray(musicLibraryIds) ? musicLibraryIds : [],
+    allowedJellyfinHosts,
+    corsOrigins,
     dbPath,
     logRest,
     lastFmApiKey,
@@ -127,4 +265,9 @@ let cached: Config | null = null;
 export function getConfig(): Config {
   if (!cached) cached = loadConfig();
   return cached;
+}
+
+/** True when no Jellyfin host allowlist is configured (open mode: any URL accepted, SSRF mitigation required). */
+export function isOpenMode(): boolean {
+  return getConfig().allowedJellyfinHosts.length === 0;
 }

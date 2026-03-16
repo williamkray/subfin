@@ -1,21 +1,13 @@
 /**
  * Parse Subsonic-style auth (u, p or t+s, or apiKey) and resolve to Jellyfin token via store.
- * When no stored app password matches and client sends username + password, tries native Jellyfin
- * authentication (option B): each client gets a unique device id (from User-Agent + IP) so Jellyfin
- * tracks devices separately; no device is stored in Subfin.
+ * All users must authenticate via app passwords created through the web UI device linking flow.
  */
 import { createHash } from "node:crypto";
 import type { JellyfinContext } from "../jellyfin/client.js";
-import { authenticateByNameWithDevice } from "../jellyfin/client.js";
-import { resolveToJellyfinToken, getDevicesForToken, resolveShareAuth, getShareAuthByUid } from "../store/index.js";
+import { resolveToJellyfinToken, getDevicesForTokenAllServers, resolveShareAuth, getShareAuthByUid } from "../store/index.js";
 import { validateShareToken } from "../web/share-tokens.js";
+import { getConfig } from "../config/load.js";
 import type { SubsonicError } from "./response.js";
-
-/** Optional client identity for native Jellyfin auth: stable device id per client. */
-export interface AuthClientInfo {
-  userAgent: string;
-  clientIp: string;
-}
 
 export interface AuthParams {
   u?: string;
@@ -31,6 +23,8 @@ export interface AuthResult {
   subsonicUsername: string;
   jellyfinUserId: string;
   jellyfinAccessToken: string;
+  /** The Jellyfin server URL this user is authenticated against. Namespace boundary for multi-tenant. */
+  jellyfinBaseUrl: string;
   /** Set when auth is resolved from a linked device; used for Jellyfin device/session identity. */
   jellyfinDeviceId?: string;
   jellyfinDeviceName?: string;
@@ -46,41 +40,31 @@ function deviceDisplay(deviceId: number, deviceLabel: string | null): { id: stri
   };
 }
 
-/** Derive a stable Jellyfin device id from client identity so the same client gets the same device. */
-function nativeAuthDeviceId(clientInfo: AuthClientInfo): string {
-  const input = (clientInfo.userAgent || "").trim() + "|" + (clientInfo.clientIp || "").trim();
-  const hash = createHash("sha256").update(input, "utf8").digest("hex").slice(0, 24);
-  return "subfin-native-" + hash;
-}
-
-/** Human-readable device name for Jellyfin admin (native auth sessions). */
-function nativeAuthDeviceName(clientInfo: AuthClientInfo): string {
-  const ua = (clientInfo.userAgent || "").trim();
-  const ip = (clientInfo.clientIp || "").trim();
-  const part = ua ? ua.slice(0, 50) : ip || "native";
-  return "Subfin: " + part;
-}
-
 /** Build JellyfinContext from AuthResult for use with jf.* calls (per-device identity when available). */
 export function toJellyfinContext(auth: AuthResult): JellyfinContext {
   if (auth.jellyfinDeviceId && auth.jellyfinDeviceName) {
     return {
       accessToken: auth.jellyfinAccessToken,
+      jellyfinBaseUrl: auth.jellyfinBaseUrl,
       userId: auth.jellyfinUserId,
       deviceId: auth.jellyfinDeviceId,
       deviceName: auth.jellyfinDeviceName,
     };
   }
-  return auth.jellyfinAccessToken;
+  return {
+    accessToken: auth.jellyfinAccessToken,
+    jellyfinBaseUrl: auth.jellyfinBaseUrl,
+    userId: auth.jellyfinUserId,
+  };
 }
 
 /** Validate and resolve auth. Returns AuthResult or Subsonic error object.
- * When clientInfo is provided and no stored app password matches, tries Jellyfin username+password
- * (native auth); each client gets a unique device id so Jellyfin tracks sessions per device. */
+ * All users must authenticate via app passwords created through the web UI device linking flow. */
 export async function resolveAuth(
-  params: AuthParams,
-  clientInfo?: AuthClientInfo
+  params: AuthParams
 ): Promise<AuthResult | SubsonicError> {
+  const defaultJellyfinUrl = getConfig().allowedJellyfinHosts[0] ?? "";
+
   // Share auth via short-lived token (e.g. M3U/zip URLs)
   if (params.token?.trim()) {
     const tokenParam = params.token.trim();
@@ -90,6 +74,7 @@ export async function resolveAuth(
       if (auth) {
         return {
           subsonicUsername: auth.subsonicUsername,
+          jellyfinBaseUrl: auth.jellyfinUrl || defaultJellyfinUrl,
           jellyfinUserId: auth.jellyfinUserId,
           jellyfinAccessToken: auth.jellyfinAccessToken,
           jellyfinDeviceId: auth.jellyfinDeviceId,
@@ -128,6 +113,7 @@ export async function resolveAuth(
         if (resolved) {
           return {
             subsonicUsername: resolved.subsonicUsername,
+            jellyfinBaseUrl: resolved.jellyfinUrl || defaultJellyfinUrl,
             jellyfinUserId: resolved.jellyfinUserId,
             jellyfinAccessToken: resolved.jellyfinAccessToken,
             jellyfinDeviceId: resolved.jellyfinDeviceId,
@@ -156,7 +142,7 @@ export async function resolveAuth(
     password = params.apiKey;
   } else if (params.t && params.s) {
     // Token auth: t = md5(password + s). We only have stored app passwords to verify.
-    const devices = getDevicesForToken(username);
+    const devices = getDevicesForTokenAllServers(username);
     for (const d of devices) {
       if (!d.app_password_plain) continue;
       const expected = computeToken(d.app_password_plain, params.s);
@@ -164,6 +150,7 @@ export async function resolveAuth(
         const dev = deviceDisplay(d.device_id, d.device_label);
         return {
           subsonicUsername: username,
+          jellyfinBaseUrl: d.jellyfin_url || defaultJellyfinUrl,
           jellyfinUserId: d.jellyfin_user_id,
           jellyfinAccessToken: d.jellyfin_access_token,
           jellyfinDeviceId: dev.id,
@@ -178,27 +165,14 @@ export async function resolveAuth(
     return { code: 10, message: "Required parameter 'p', 't'+'s', or 'apiKey' missing." };
   }
 
-  let resolved = resolveToJellyfinToken(username, password);
-  if (!resolved && clientInfo) {
-    const deviceId = nativeAuthDeviceId(clientInfo);
-    const deviceName = nativeAuthDeviceName(clientInfo);
-    const auth = await authenticateByNameWithDevice(username, password, deviceId, deviceName);
-    if (auth) {
-      return {
-        subsonicUsername: username,
-        jellyfinUserId: auth.userId,
-        jellyfinAccessToken: auth.accessToken,
-        jellyfinDeviceId: deviceId,
-        jellyfinDeviceName: deviceName,
-      };
-    }
-  }
+  const resolved = resolveToJellyfinToken(username, password);
   if (!resolved) {
     return { code: 40, message: "Wrong username or password." };
   }
   const dev = deviceDisplay(resolved.deviceId, resolved.deviceLabel);
   return {
     subsonicUsername: username,
+    jellyfinBaseUrl: resolved.jellyfinUrl || defaultJellyfinUrl,
     jellyfinUserId: resolved.jellyfinUserId,
     jellyfinAccessToken: resolved.jellyfinAccessToken,
     jellyfinDeviceId: dev.id,
@@ -230,8 +204,10 @@ export function resolveAuthFromBasicHeader(
     const resolved = resolveToJellyfinToken(username, password);
     if (!resolved) return null;
     const dev = deviceDisplay(resolved.deviceId, resolved.deviceLabel);
+    const defaultJellyfinUrl = getConfig().allowedJellyfinHosts[0] ?? "";
     return {
       subsonicUsername: username,
+      jellyfinBaseUrl: resolved.jellyfinUrl || defaultJellyfinUrl,
       jellyfinUserId: resolved.jellyfinUserId,
       jellyfinAccessToken: resolved.jellyfinAccessToken,
       jellyfinDeviceId: dev.id,
@@ -243,51 +219,13 @@ export function resolveAuthFromBasicHeader(
 }
 
 /**
- * Resolve auth from Basic header, trying store then Jellyfin native auth.
+ * Resolve auth from Basic header using store lookup only.
  * Use when params auth failed and client may have sent credentials only in the header.
  */
-export async function resolveAuthFromBasicHeaderWithJellyfin(
-  authorization: string | undefined,
-  clientInfo?: AuthClientInfo
-): Promise<AuthResult | null> {
-  if (!authorization || !authorization.startsWith("Basic ")) return null;
-  try {
-    const b64 = authorization.slice(6).trim();
-    const decoded = Buffer.from(b64, "base64").toString("utf-8");
-    const colon = decoded.indexOf(":");
-    if (colon <= 0) return null;
-    const username = decoded.slice(0, colon).trim();
-    const password = decoded.slice(colon + 1);
-    if (!username || !password) return null;
-    const resolved = resolveToJellyfinToken(username, password);
-    if (resolved) {
-      const dev = deviceDisplay(resolved.deviceId, resolved.deviceLabel);
-      return {
-        subsonicUsername: username,
-        jellyfinUserId: resolved.jellyfinUserId,
-        jellyfinAccessToken: resolved.jellyfinAccessToken,
-        jellyfinDeviceId: dev.id,
-        jellyfinDeviceName: dev.name,
-      };
-    }
-    if (clientInfo) {
-      const deviceId = nativeAuthDeviceId(clientInfo);
-      const deviceName = nativeAuthDeviceName(clientInfo);
-      const auth = await authenticateByNameWithDevice(username, password, deviceId, deviceName);
-      if (auth) {
-        return {
-          subsonicUsername: username,
-          jellyfinUserId: auth.userId,
-          jellyfinAccessToken: auth.accessToken,
-          jellyfinDeviceId: deviceId,
-          jellyfinDeviceName: deviceName,
-        };
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
+export function resolveAuthFromBasicHeaderWithJellyfin(
+  authorization: string | undefined
+): AuthResult | null {
+  return resolveAuthFromBasicHeader(authorization);
 }
 
 /**
@@ -311,7 +249,8 @@ export function resolveAuthFromBasicHeaderWithToken(
     const headerUser = decoded.slice(0, colon).trim();
     const tokenValue = decoded.slice(colon + 1);
     if (headerUser !== username || !tokenValue) return null;
-    const devices = getDevicesForToken(username);
+    const devices = getDevicesForTokenAllServers(username);
+    const defaultJellyfinUrl = getConfig().allowedJellyfinHosts[0] ?? "";
     for (const d of devices) {
       if (!d.app_password_plain) continue;
       const expected = computeToken(d.app_password_plain, salt);
@@ -319,6 +258,7 @@ export function resolveAuthFromBasicHeaderWithToken(
         const dev = deviceDisplay(d.device_id, d.device_label);
         return {
           subsonicUsername: username,
+          jellyfinBaseUrl: d.jellyfin_url || defaultJellyfinUrl,
           jellyfinUserId: d.jellyfin_user_id,
           jellyfinAccessToken: d.jellyfin_access_token,
           jellyfinDeviceId: dev.id,

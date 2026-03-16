@@ -3,6 +3,7 @@
 CREATE TABLE IF NOT EXISTS linked_devices (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   subsonic_username TEXT NOT NULL,
+  jellyfin_url TEXT NOT NULL DEFAULT '',
   app_password_hash TEXT NOT NULL,
   app_password_encrypted BLOB NOT NULL,
   jellyfin_user_id TEXT NOT NULL,
@@ -15,34 +16,54 @@ CREATE TABLE IF NOT EXISTS linked_devices (
 
 CREATE INDEX IF NOT EXISTS idx_linked_devices_username ON linked_devices(subsonic_username);
 CREATE INDEX IF NOT EXISTS idx_linked_devices_jellyfin_user ON linked_devices(jellyfin_user_id);
+-- NOTE: idx_linked_devices_username_url is created by the migration in runSchema() after
+-- the jellyfin_url column is guaranteed to exist (ALTER TABLE for upgrades, or present on fresh install).
 
 -- Pending QuickConnect: secret -> encrypted jellyfin token; cleaned after use or expiry.
 CREATE TABLE IF NOT EXISTS pending_quickconnect (
   secret TEXT PRIMARY KEY,
+  jellyfin_url TEXT NOT NULL DEFAULT '',
   jellyfin_user_id TEXT NOT NULL,
   jellyfin_access_token_encrypted BLOB NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Jellyfin sessions: store Jellyfin token per Subsonic username after auth,
+-- Jellyfin sessions: store Jellyfin token per (Subsonic username, Jellyfin URL) after auth,
 -- independent of any specific linked device. Device linking uses this as the
 -- source of truth for Jellyfin credentials when generating app passwords.
+-- NOTE: composite PK. Migration in runSchema() recreates this table if needed.
 CREATE TABLE IF NOT EXISTS jellyfin_sessions (
-  subsonic_username TEXT PRIMARY KEY,
+  subsonic_username TEXT NOT NULL,
+  jellyfin_url TEXT NOT NULL DEFAULT '',
   jellyfin_user_id TEXT NOT NULL,
   jellyfin_access_token_encrypted BLOB NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (subsonic_username, jellyfin_url)
 );
 
--- Saved play queue per user (OpenSubsonic savePlayQueue/getPlayQueue). One queue per user so
--- any device can save and any device can restore (cross-device continuity).
+-- Saved play queue per (user, Jellyfin URL) (OpenSubsonic savePlayQueue/getPlayQueue).
+-- One queue per user+server so any device on that server can save and restore.
+-- NOTE: composite PK. Migration in runSchema() recreates this table if needed.
 CREATE TABLE IF NOT EXISTS play_queue (
-  subsonic_username TEXT PRIMARY KEY,
+  subsonic_username TEXT NOT NULL,
+  jellyfin_url TEXT NOT NULL DEFAULT '',
   entry_ids TEXT NOT NULL,
   current_id TEXT,
+  current_index INTEGER NOT NULL DEFAULT 0,
   position_ms INTEGER NOT NULL DEFAULT 0,
   changed_at TEXT NOT NULL,
-  changed_by TEXT NOT NULL DEFAULT ''
+  changed_by TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (subsonic_username, jellyfin_url)
+);
+
+-- Per-user library selection: which Jellyfin music libraries to show in Subsonic clients.
+-- Empty selected_ids = no restriction (all libraries).
+CREATE TABLE IF NOT EXISTS user_library_settings (
+  subsonic_username TEXT NOT NULL,
+  jellyfin_url TEXT NOT NULL,
+  selected_ids TEXT NOT NULL DEFAULT '[]',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (subsonic_username, jellyfin_url)
 );
 
 -- Shares: public share = one linked device (share device) + metadata and allowlist.

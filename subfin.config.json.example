@@ -1,14 +1,26 @@
 {
   "port": 4040,
+
+  "// subfinPublicUrl": "Public URL of this subfin instance (e.g. https://subfin.example.com). Used to restrict CORS to your own origin. Leave empty to allow all origins (fine for local/private deployments).",
   "subfinPublicUrl": "",
+
+  "// allowedJellyfinHosts": "List of allowed Jellyfin server URLs. Non-empty = restricted mode: only these hosts are accepted during device linking. Empty array = open mode: any Jellyfin URL is accepted (SSRF validation is enforced automatically). Sharing is disabled in open mode. Supports multiple hosts for multi-server deployments.",
+  "allowedJellyfinHosts": [
+    "http://localhost:8096"
+  ],
+
+  "// jellyfin": "Connection identity presented to Jellyfin. clientName/deviceId/deviceName affect how subfin appears in the Jellyfin admin dashboard.",
   "jellyfin": {
+    "// baseUrl": "DEPRECATED: superseded by allowedJellyfinHosts. Still accepted as a fallback when allowedJellyfinHosts is absent, defaulting to restricted mode with this single host.",
     "baseUrl": "http://localhost:8096",
     "clientName": "Subfin",
     "deviceId": "subfin-device-1",
     "deviceName": "Subfin Middleware"
   },
-  "musicLibraryIds": [],
+
   "dbPath": "./subfin.db",
   "logRest": false,
-  "salt": "REPLACE_WITH_32_BYTE_BASE64_OR_HEX_GENERATE_VIA_node_-e_console.log(require('crypto').randomBytes(32).toString('base64'))"
+
+  "// salt": "Required. Secret used to encrypt sensitive data (Jellyfin tokens) in the database. Generate: node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\"",
+  "salt": "REPLACE_WITH_32_BYTE_BASE64_OR_HEX"
 }

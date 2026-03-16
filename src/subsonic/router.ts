@@ -4,7 +4,7 @@
 import { type Request, type Response } from "express";
 import http from "node:http";
 import https from "node:https";
-import type { AuthParams } from "./auth.js";
+import type { AuthParams, AuthResult } from "./auth.js";
 import {
   resolveAuth,
   resolveAuthFromBasicHeader,
@@ -12,6 +12,7 @@ import {
   resolveAuthFromBasicHeaderWithToken,
 } from "./auth.js";
 import { getClientIp } from "../request-context.js";
+import { restRateLimit, recordRestAuthFailure } from "./rate-limit.js";
 import { resolveAuthFromShareCookie } from "../web/share-session.js";
 import { subsonicEnvelope, subsonicError, ErrorCode, VERSION } from "./response.js";
 import * as handlers from "./handlers.js";
@@ -21,7 +22,7 @@ import { buildJellyfinAuthHeader } from "../jellyfin/client.js";
 
 const HANDLERS: Record<
   string,
-  (auth: { subsonicUsername: string; jellyfinUserId: string; jellyfinAccessToken: string }, params: Record<string, string>) => Promise<Record<string, unknown>>
+  (auth: AuthResult, params: Record<string, string>) => Promise<Record<string, unknown>>
 > = {
   ping: async () => handlers.handlePing(),
   getlicense: async () => handlers.handleGetLicense(),
@@ -67,6 +68,8 @@ const HANDLERS: Record<
   unstar: async (auth, params) => handlers.handleUnstar(auth, params),
   saveplayqueue: async (auth, params) => handlers.handleSavePlayQueue(auth, params),
   getplayqueue: async (auth) => handlers.handleGetPlayQueue(auth),
+  saveplayqueuebyindex: async (auth, params) => handlers.handleSavePlayQueueByIndex(auth, params),
+  getplayqueuebyindex: async (auth) => handlers.handleGetPlayQueueByIndex(auth),
   createshare: async (auth, params) => handlers.handleCreateShare(auth, params as unknown as { ids: string[]; description?: string; expires?: string }),
   getshares: async (auth) => handlers.handleGetShares(auth),
   updateshare: async (auth, params) => handlers.handleUpdateShare(auth, params),
@@ -224,6 +227,31 @@ function getPlayQueueSaveParams(req: Request): {
   return { playQueueIds: ids, current, position, changedBy };
 }
 
+/** Collect savePlayQueueByIndex params: multiple id, currentIndex, position, client name (c). */
+function getPlayQueueByIndexSaveParams(req: Request): {
+  playQueueIds: string[];
+  currentIndex: string;
+  position: string;
+  changedBy: string;
+} {
+  const q = req.query as Record<string, unknown>;
+  const body = (req.body as Record<string, unknown>) ?? {};
+  const ids: string[] = [];
+  for (const [k, v] of Object.entries(q)) {
+    if (k !== "id" && !k.startsWith("id[")) continue;
+    ids.push(...toIdStrings(v));
+  }
+  for (const [k, v] of Object.entries(body)) {
+    if (k !== "id" && !k.startsWith("id[")) continue;
+    ids.push(...toIdStrings(v));
+  }
+  const one = (v: unknown): string => (v === undefined || v === null ? "" : Array.isArray(v) ? String(v[0] ?? "") : String(v));
+  const currentIndex = one(q.currentIndex ?? body.currentIndex).trim() || "0";
+  const position = one(q.position ?? body.position).trim() || "0";
+  const changedBy = one(q.c ?? body.c).trim();
+  return { playQueueIds: ids, currentIndex, position, changedBy };
+}
+
 /** Collect id[] and optional description/expires for createShare. */
 function getCreateShareParams(req: Request): { ids: string[]; description?: string; expires?: string } {
   const q = req.query as Record<string, unknown>;
@@ -282,32 +310,34 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
 
   const params = getParams(req);
   const format = getFormat(params);
+
+  // Per-IP rate limit: applied before any auth or handler work.
+  // Binary proxy endpoints are excluded: they are high-volume by design (one request per album
+  // cover, per stream) and don't require brute-force protection since there are no secrets to guess.
+  const isProxyEndpoint = method === "stream" || method === "download" || method === "getcoverart" || method === "getavatar";
+  if (!isProxyEndpoint && restRateLimit(req)) {
+    sendError(res, format, ErrorCode.Generic, "Too many requests", 429);
+    return;
+  }
   const authParams = getAuthParams(params);
-  const clientInfo = {
-    userAgent: req.get("user-agent") || "",
-    clientIp: getClientIp() || "unknown",
-  };
 
   // Auth
   let authResult: Awaited<ReturnType<typeof resolveAuth>>;
   // getCoverArt: try Authorization: Basic first when present (some clients send creds only in header)
   if (method === "getcoverart" && req.get("authorization")?.startsWith("Basic ")) {
     const headerAuth = resolveAuthFromBasicHeader(req.get("authorization"));
-    authResult = headerAuth ?? (await resolveAuth(authParams, clientInfo));
+    authResult = headerAuth ?? (await resolveAuth(authParams));
   } else {
-    authResult = await resolveAuth(authParams, clientInfo);
+    authResult = await resolveAuth(authParams);
   }
   // When u/p not sent (e.g. share page player with cookie), try share cookie
   if ("code" in authResult && authResult.code === 10) {
     const shareAuth = resolveAuthFromShareCookie(req);
     if (shareAuth) authResult = shareAuth;
   }
-  // When params auth failed, try Authorization: Basic (store + Jellyfin pass-through) for any method
+  // When params auth failed, try Authorization: Basic for any method
   if ("code" in authResult && req.get("authorization")?.startsWith("Basic ")) {
-    const basicAuth = await resolveAuthFromBasicHeaderWithJellyfin(
-      req.get("authorization"),
-      clientInfo
-    );
+    const basicAuth = resolveAuthFromBasicHeaderWithJellyfin(req.get("authorization"));
     if (basicAuth) authResult = basicAuth;
   }
   // getCoverArt: additional fallbacks when params auth failed (image loader sends t in header, u+s in URL)
@@ -336,6 +366,12 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
     }
   }
   if ("code" in authResult) {
+    const ip = getClientIp() ?? req.socket?.remoteAddress ?? "unknown";
+    console.log(`[AUTH_FAIL] method=${method} ip=${ip} code=${authResult.code}`);
+    if (recordRestAuthFailure(req)) {
+      sendError(res, format, ErrorCode.Generic, "Too many requests", 429);
+      return;
+    }
     const httpStatus = authResult.code === 40 ? 401 : 200;
     sendError(res, format, authResult.code, authResult.message, httpStatus);
     return;
@@ -450,6 +486,9 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
   }
   if (method === "saveplayqueue") {
     Object.assign(params, getPlayQueueSaveParams(req));
+  }
+  if (method === "saveplayqueuebyindex") {
+    Object.assign(params, getPlayQueueByIndexSaveParams(req));
   }
   if (method === "createshare") {
     Object.assign(params, getCreateShareParams(req));
@@ -1283,6 +1322,10 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
         );
         return;
       }
+      if ((err as NodeJS.ErrnoException)?.code === "OutOfRange") {
+        sendError(res, format, ErrorCode.Generic, err?.message ?? "Index out of range");
+        return;
+      }
       console.error(err);
       sendError(res, format, ErrorCode.Generic, err?.message ?? "Internal error");
     });
@@ -1347,6 +1390,8 @@ function proxyBinary(
       });
     }
 
+    const MAX_PROXY_BYTES = 500 * 1024 * 1024; // 500MB — covers large lossless files
+
     const proxyReq = agent.request(
       {
         method: "GET",
@@ -1371,6 +1416,10 @@ function proxyBinary(
         let bytes = 0;
         proxyRes.on("data", (chunk: Buffer) => {
           bytes += chunk.length;
+          if (bytes > MAX_PROXY_BYTES) {
+            proxyReq.destroy(new Error("upstream response too large"));
+            try { clientRes.destroy(); } catch { /* ignore */ }
+          }
         });
         proxyRes.on("end", () => {
           if (config.logRest) {
@@ -1387,6 +1436,10 @@ function proxyBinary(
         proxyRes.pipe(clientRes);
       }
     );
+
+    proxyReq.setTimeout(30_000, () => {
+      proxyReq.destroy(new Error("upstream timeout"));
+    });
 
     proxyReq.on("error", (err) => {
       console.error("Proxy stream error", err);

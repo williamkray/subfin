@@ -8,9 +8,11 @@ import { randomFillSync, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { getConfig } from "../config/load.js";
+import { getConfig, getLegacyMusicLibraryIds } from "../config/load.js";
 import { config } from "../config.js";
 import { decrypt, encrypt } from "./crypto.js";
+import type { UserKey } from "./types.js";
+import { assertUserKey } from "./types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -37,6 +39,8 @@ function openDb(): Database.Database {
   db.pragma("journal_mode = WAL");
   runSchema(db);
   migrateFromLegacyJsonIfPresent();
+  backfillJellyfinUrls(db);
+  migrateLegacyMusicLibraryIds(db);
   return db;
 }
 
@@ -44,13 +48,16 @@ function runSchema(database: Database.Database): void {
   const schemaPath = resolve(__dirname, "schema.sql");
   const sql = readFileSync(schemaPath, "utf-8");
   database.exec(sql);
+
+  const linkedDevicesInfo = database.prepare("PRAGMA table_info(linked_devices)").all() as { name: string }[];
+
   // Migration: add Jellyfin device id/name for share (QC) devices so requests use the same device.
-  const info = database.prepare("PRAGMA table_info(linked_devices)").all() as { name: string }[];
-  const hasJellyfinDeviceId = info.some((c) => c.name === "jellyfin_device_id");
+  const hasJellyfinDeviceId = linkedDevicesInfo.some((c) => c.name === "jellyfin_device_id");
   if (!hasJellyfinDeviceId) {
     database.exec("ALTER TABLE linked_devices ADD COLUMN jellyfin_device_id TEXT");
     database.exec("ALTER TABLE linked_devices ADD COLUMN jellyfin_device_name TEXT");
   }
+
   // Migration: store share secret encrypted so we can show full share URL in the web UI.
   const sharesInfo = database.prepare("PRAGMA table_info(shares)").all() as { name: string }[];
   const hasShareSecret = sharesInfo.some((c) => c.name === "share_secret_encrypted");
@@ -71,6 +78,140 @@ function runSchema(database: Database.Database): void {
         last_source_change_at TEXT
       );
     `);
+  }
+
+  // Migration: multi-tenant — add jellyfin_url to linked_devices if missing.
+  const hasJellyfinUrl = linkedDevicesInfo.some((c) => c.name === "jellyfin_url");
+  if (!hasJellyfinUrl) {
+    database.exec("ALTER TABLE linked_devices ADD COLUMN jellyfin_url TEXT NOT NULL DEFAULT ''");
+  }
+  // Always ensure the composite index exists. This runs unconditionally so it is created for
+  // both fresh installs (column exists from schema.sql, migration skipped) and upgrades
+  // (column just added above). IF NOT EXISTS makes it idempotent.
+  database.exec("CREATE INDEX IF NOT EXISTS idx_linked_devices_username_url ON linked_devices(subsonic_username, jellyfin_url)");
+
+  // Migration: add jellyfin_url to pending_quickconnect if missing.
+  const pendingInfo = database.prepare("PRAGMA table_info(pending_quickconnect)").all() as { name: string }[];
+  const pendingHasUrl = pendingInfo.some((c) => c.name === "jellyfin_url");
+  if (!pendingHasUrl) {
+    database.exec("ALTER TABLE pending_quickconnect ADD COLUMN jellyfin_url TEXT NOT NULL DEFAULT ''");
+  }
+
+  // Migration: recreate jellyfin_sessions with composite PK (subsonic_username, jellyfin_url).
+  // Old table had PRIMARY KEY (subsonic_username) only. SQLite can't ALTER PRIMARY KEY.
+  const sessionPkInfo = database.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='jellyfin_sessions'"
+  ).get() as { sql: string } | undefined;
+  const sessionNeedsCompositePk = sessionPkInfo && !sessionPkInfo.sql.includes("PRIMARY KEY (subsonic_username, jellyfin_url)");
+  if (sessionNeedsCompositePk) {
+    database.exec(`
+      CREATE TABLE jellyfin_sessions_new (
+        subsonic_username TEXT NOT NULL,
+        jellyfin_url TEXT NOT NULL DEFAULT '',
+        jellyfin_user_id TEXT NOT NULL,
+        jellyfin_access_token_encrypted BLOB NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (subsonic_username, jellyfin_url)
+      );
+      INSERT OR IGNORE INTO jellyfin_sessions_new (subsonic_username, jellyfin_url, jellyfin_user_id, jellyfin_access_token_encrypted, created_at)
+        SELECT subsonic_username, '', jellyfin_user_id, jellyfin_access_token_encrypted, created_at
+        FROM jellyfin_sessions;
+      DROP TABLE jellyfin_sessions;
+      ALTER TABLE jellyfin_sessions_new RENAME TO jellyfin_sessions;
+    `);
+  }
+
+  // Migration: recreate play_queue with composite PK (subsonic_username, jellyfin_url).
+  // Also handles adding current_index if the table was newly recreated.
+  const playQueuePkInfo = database.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='play_queue'"
+  ).get() as { sql: string } | undefined;
+  const playQueueNeedsCompositePk = playQueuePkInfo && !playQueuePkInfo.sql.includes("PRIMARY KEY (subsonic_username, jellyfin_url)");
+  if (playQueueNeedsCompositePk) {
+    database.exec(`
+      CREATE TABLE play_queue_new (
+        subsonic_username TEXT NOT NULL,
+        jellyfin_url TEXT NOT NULL DEFAULT '',
+        entry_ids TEXT NOT NULL,
+        current_id TEXT,
+        current_index INTEGER NOT NULL DEFAULT 0,
+        position_ms INTEGER NOT NULL DEFAULT 0,
+        changed_at TEXT NOT NULL,
+        changed_by TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (subsonic_username, jellyfin_url)
+      );
+      INSERT OR IGNORE INTO play_queue_new (subsonic_username, jellyfin_url, entry_ids, current_id, current_index, position_ms, changed_at, changed_by)
+        SELECT subsonic_username, '', entry_ids, current_id, COALESCE(current_index, 0), position_ms, changed_at, COALESCE(changed_by, '')
+        FROM play_queue;
+      DROP TABLE play_queue;
+      ALTER TABLE play_queue_new RENAME TO play_queue;
+    `);
+  } else {
+    // play_queue already has composite PK; ensure current_index column exists (old migration path).
+    const playQueueInfo = database.prepare("PRAGMA table_info(play_queue)").all() as { name: string }[];
+    const hasCurrentIndex = playQueueInfo.some((c) => c.name === "current_index");
+    if (!hasCurrentIndex) {
+      database.exec("ALTER TABLE play_queue ADD COLUMN current_index INTEGER NOT NULL DEFAULT 0");
+    }
+  }
+}
+
+/**
+ * After schema migration, backfill empty jellyfin_url values for existing pre-multi-tenant data.
+ * Rows with jellyfin_url = '' are always from before multi-tenancy was introduced, so assigning
+ * them to allowedJellyfinHosts[0] is correct regardless of how many hosts are now configured.
+ */
+function backfillJellyfinUrls(database: Database.Database): void {
+  const cfg = getConfig();
+  if (cfg.allowedJellyfinHosts.length === 0) return;
+  const url = cfg.allowedJellyfinHosts[0]!;
+  database.prepare("UPDATE linked_devices SET jellyfin_url = ? WHERE jellyfin_url = ''").run(url);
+  database.prepare("UPDATE jellyfin_sessions SET jellyfin_url = ? WHERE jellyfin_url = ''").run(url);
+  database.prepare("UPDATE play_queue SET jellyfin_url = ? WHERE jellyfin_url = ''").run(url);
+  database.prepare("UPDATE pending_quickconnect SET jellyfin_url = ? WHERE jellyfin_url = ''").run(url);
+}
+
+/**
+ * One-time migration: if the old config had musicLibraryIds (global library restriction),
+ * seed user_library_settings for every existing linked user so they retain the same scope.
+ * Uses INSERT OR IGNORE so it is safe to run on every startup — only fills gaps.
+ *
+ * Note: MUSIC_LIBRARY_IDS env-var values are included here for completeness, but because
+ * the env var cannot be automatically removed, the deprecation warning in loadConfig() asks
+ * the operator to remove it manually. The migration still seeds the DB from it so that
+ * removing the env var later doesn't silently widen library access.
+ */
+function migrateLegacyMusicLibraryIds(database: Database.Database): void {
+  const libraryIds = getLegacyMusicLibraryIds();
+  if (!libraryIds || libraryIds.length === 0) return;
+
+  const users = database
+    .prepare("SELECT DISTINCT subsonic_username, jellyfin_url FROM linked_devices WHERE jellyfin_url != ''")
+    .all() as { subsonic_username: string; jellyfin_url: string }[];
+
+  if (users.length === 0) return;
+
+  const selectedIdsJson = JSON.stringify(libraryIds);
+  const now = new Date().toISOString();
+  const insert = database.prepare(`
+    INSERT OR IGNORE INTO user_library_settings (subsonic_username, jellyfin_url, selected_ids, updated_at)
+    VALUES (?, ?, ?, ?)
+  `);
+
+  let migrated = 0;
+  const run = database.transaction(() => {
+    for (const user of users) {
+      const result = insert.run(user.subsonic_username, user.jellyfin_url, selectedIdsJson, now);
+      if (result.changes > 0) migrated++;
+    }
+  });
+  run();
+
+  if (migrated > 0) {
+    console.log(
+      `[subfin] Migrated legacy musicLibraryIds [${libraryIds.join(", ")}] to per-user ` +
+      `library settings for ${migrated} user(s). Remove 'musicLibraryIds' from your config file.`
+    );
   }
 }
 
@@ -217,13 +358,14 @@ function generateAppPassword(): string {
  * When linking via Quick Connect, pass jellyfinDeviceId and jellyfinDeviceName so all Jellyfin
  * requests use that device and it appears as a distinct device in the Jellyfin dashboard. */
 export function addLinkedDevice(
-  subsonicUsername: string,
+  key: UserKey,
   jellyfinUserId: string,
   jellyfinAccessToken: string,
   deviceLabel?: string,
   jellyfinDeviceId?: string,
   jellyfinDeviceName?: string
 ): string {
+  assertUserKey(key);
   const cfg = getConfig();
   const database = openDb();
   const plainPassword = generateAppPassword();
@@ -233,11 +375,12 @@ export function addLinkedDevice(
   const created = new Date().toISOString();
   database
     .prepare(
-      `INSERT INTO linked_devices (subsonic_username, app_password_hash, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, device_label, jellyfin_device_id, jellyfin_device_name, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO linked_devices (subsonic_username, jellyfin_url, app_password_hash, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, device_label, jellyfin_device_id, jellyfin_device_name, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
-      subsonicUsername,
+      key.subsonicUsername,
+      key.jellyfinUrl,
       hash,
       appEnc,
       jellyfinUserId,
@@ -250,23 +393,26 @@ export function addLinkedDevice(
   return plainPassword;
 }
 
-/** Resolve Subsonic (username, password) to Jellyfin token and matched device. */
+/** Resolve Subsonic (username, password) to Jellyfin token and matched device.
+ * Returns jellyfinUrl from the matching linked device (namespace boundary for multi-tenant). */
 export function resolveToJellyfinToken(
   subsonicUsername: string,
   password: string
 ): {
   jellyfinUserId: string;
   jellyfinAccessToken: string;
+  jellyfinUrl: string;
   deviceId: number;
   deviceLabel: string | null;
 } | null {
   const database = openDb();
   const rows = database
     .prepare(
-      "SELECT id, jellyfin_user_id, app_password_hash, jellyfin_access_token_encrypted, device_label FROM linked_devices WHERE subsonic_username = ?"
+      "SELECT id, jellyfin_url, jellyfin_user_id, app_password_hash, jellyfin_access_token_encrypted, device_label FROM linked_devices WHERE subsonic_username = ?"
     )
     .all(subsonicUsername) as {
       id: number;
+      jellyfin_url: string;
       jellyfin_user_id: string;
       app_password_hash: string;
       jellyfin_access_token_encrypted: Buffer;
@@ -279,6 +425,7 @@ export function resolveToJellyfinToken(
       return {
         jellyfinUserId: row.jellyfin_user_id,
         jellyfinAccessToken: token,
+        jellyfinUrl: row.jellyfin_url,
         deviceId: row.id,
         deviceLabel: row.device_label,
       };
@@ -287,17 +434,18 @@ export function resolveToJellyfinToken(
   return null;
 }
 
-/** Get Jellyfin credentials for a user who already has a linked device. */
+/** Get Jellyfin credentials for a user on a specific Jellyfin server. */
 export function getJellyfinCredentialsForUser(
-  subsonicUsername: string
+  key: UserKey
 ): { jellyfinUserId: string; jellyfinAccessToken: string } | null {
+  assertUserKey(key);
   const database = openDb();
   // Prefer explicit Jellyfin session (auth-only step), fall back to any linked device.
   const sessionRow = database
     .prepare(
-      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM jellyfin_sessions WHERE subsonic_username = ?"
+      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM jellyfin_sessions WHERE subsonic_username = ? AND jellyfin_url = ?"
     )
-    .get(subsonicUsername) as
+    .get(key.subsonicUsername, key.jellyfinUrl) as
     | { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer }
     | undefined;
 
@@ -310,9 +458,9 @@ export function getJellyfinCredentialsForUser(
 
   const deviceRow = database
     .prepare(
-      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM linked_devices WHERE subsonic_username = ? LIMIT 1"
+      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM linked_devices WHERE subsonic_username = ? AND jellyfin_url = ? LIMIT 1"
     )
-    .get(subsonicUsername) as
+    .get(key.subsonicUsername, key.jellyfinUrl) as
     | { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer }
     | undefined;
   if (!deviceRow) return null;
@@ -324,16 +472,17 @@ export function getJellyfinCredentialsForUser(
  * Prefers the most recently linked device's token so each token is used for at most one
  * QC authorize (Jellyfin may reject 401 after a token has authorized once or twice). */
 export function getJellyfinCredentialsForLinking(
-  subsonicUsername: string
+  key: UserKey
 ): { jellyfinUserId: string; jellyfinAccessToken: string } | null {
+  assertUserKey(key);
   const database = openDb();
   const cfg = getConfig();
   // Use most recently linked device (fresh token not yet used for QC authorize).
   const deviceRow = database
     .prepare(
-      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM linked_devices WHERE subsonic_username = ? ORDER BY created_at DESC LIMIT 1"
+      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM linked_devices WHERE subsonic_username = ? AND jellyfin_url = ? ORDER BY created_at DESC LIMIT 1"
     )
-    .get(subsonicUsername) as
+    .get(key.subsonicUsername, key.jellyfinUrl) as
     | { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer }
     | undefined;
   if (deviceRow) {
@@ -343,9 +492,9 @@ export function getJellyfinCredentialsForLinking(
   // No linked devices yet (first device): use session from initial QC login.
   const sessionRow = database
     .prepare(
-      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM jellyfin_sessions WHERE subsonic_username = ?"
+      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted FROM jellyfin_sessions WHERE subsonic_username = ? AND jellyfin_url = ?"
     )
-    .get(subsonicUsername) as
+    .get(key.subsonicUsername, key.jellyfinUrl) as
     | { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer }
     | undefined;
   if (!sessionRow) return null;
@@ -362,16 +511,17 @@ export function getFirstSubsonicUsername(): string | null {
   return row?.subsonic_username ?? null;
 }
 
-/** List linked devices for a Subsonic username. */
+/** List linked devices for a Subsonic username on a specific Jellyfin server. */
 export function listLinkedDevices(
-  subsonicUsername: string
+  key: UserKey
 ): Omit<LinkedDevice, "app_password_hash">[] {
+  assertUserKey(key);
   const database = openDb();
   const rows = database
     .prepare(
-      "SELECT id, subsonic_username, jellyfin_user_id, device_label, created_at FROM linked_devices WHERE subsonic_username = ? ORDER BY created_at DESC"
+      "SELECT id, subsonic_username, jellyfin_user_id, device_label, created_at FROM linked_devices WHERE subsonic_username = ? AND jellyfin_url = ? ORDER BY created_at DESC"
     )
-    .all(subsonicUsername) as { id: number; subsonic_username: string; jellyfin_user_id: string; device_label: string | null; created_at: string }[];
+    .all(key.subsonicUsername, key.jellyfinUrl) as { id: number; subsonic_username: string; jellyfin_user_id: string; device_label: string | null; created_at: string }[];
   return rows.map((r) => ({
     id: r.id,
     subsonic_username: r.subsonic_username,
@@ -451,14 +601,47 @@ export interface LinkedDeviceForToken {
   device_label: string | null;
 }
 
-/** Internal: devices for a user including plain app password (for token auth). */
-export function getDevicesForToken(subsonicUsername: string): LinkedDeviceForToken[] {
+/** Internal: all devices for a username across all Jellyfin servers (for t+s token auth where URL isn't yet known). */
+export function getDevicesForTokenAllServers(subsonicUsername: string): (LinkedDeviceForToken & { jellyfin_url: string })[] {
   const database = openDb();
   const rows = database
     .prepare(
-      "SELECT id, subsonic_username, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, device_label FROM linked_devices WHERE subsonic_username = ?"
+      "SELECT id, subsonic_username, jellyfin_url, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, device_label FROM linked_devices WHERE subsonic_username = ?"
     )
     .all(subsonicUsername) as {
+      id: number;
+      subsonic_username: string;
+      jellyfin_url: string;
+      app_password_encrypted: Buffer;
+      jellyfin_user_id: string;
+      jellyfin_access_token_encrypted: Buffer;
+      device_label: string | null;
+    }[];
+  const cfg = getConfig();
+  return rows.map((r) => {
+    const plain = decrypt(r.app_password_encrypted, cfg);
+    const token = decrypt(r.jellyfin_access_token_encrypted, cfg);
+    return {
+      subsonic_username: r.subsonic_username,
+      jellyfin_url: r.jellyfin_url,
+      app_password_plain: plain || undefined,
+      jellyfin_user_id: r.jellyfin_user_id,
+      jellyfin_access_token: token,
+      device_id: r.id,
+      device_label: r.device_label,
+    };
+  });
+}
+
+/** Internal: devices for a user+server including plain app password (for token auth). */
+export function getDevicesForToken(key: UserKey): LinkedDeviceForToken[] {
+  assertUserKey(key);
+  const database = openDb();
+  const rows = database
+    .prepare(
+      "SELECT id, subsonic_username, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, device_label FROM linked_devices WHERE subsonic_username = ? AND jellyfin_url = ?"
+    )
+    .all(key.subsonicUsername, key.jellyfinUrl) as {
       id: number;
       subsonic_username: string;
       app_password_encrypted: Buffer;
@@ -481,9 +664,10 @@ export function getDevicesForToken(subsonicUsername: string): LinkedDeviceForTok
   });
 }
 
-/** Store pending QuickConnect result. */
+/** Store pending QuickConnect result. jellyfinUrl identifies which Jellyfin server the token belongs to. */
 export function setPendingQuickConnect(
   secret: string,
+  jellyfinUrl: string,
   jellyfinUserId: string,
   jellyfinAccessToken: string
 ): void {
@@ -518,23 +702,23 @@ export function setPendingQuickConnect(
   }
   database
     .prepare(
-      "INSERT OR REPLACE INTO pending_quickconnect (secret, jellyfin_user_id, jellyfin_access_token_encrypted, created_at) VALUES (?, ?, ?, ?)"
+      "INSERT OR REPLACE INTO pending_quickconnect (secret, jellyfin_url, jellyfin_user_id, jellyfin_access_token_encrypted, created_at) VALUES (?, ?, ?, ?, ?)"
     )
-    .run(secret, jellyfinUserId, enc, created);
+    .run(secret, jellyfinUrl, jellyfinUserId, enc, created);
 }
 
-/** Get and remove pending QuickConnect result. */
+/** Get and remove pending QuickConnect result. Returns jellyfinUrl alongside credentials. */
 export function consumePendingQuickConnect(
   secret: string
-): { jellyfinUserId: string; jellyfinAccessToken: string } | null {
+): { jellyfinUrl: string; jellyfinUserId: string; jellyfinAccessToken: string } | null {
   const database = openDb();
   const ttlMs = 10 * 60 * 1000; // 10 minutes
   const cutoff = new Date(Date.now() - ttlMs).toISOString();
   const row = database
     .prepare(
-      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted, created_at FROM pending_quickconnect WHERE secret = ?"
+      "SELECT jellyfin_url, jellyfin_user_id, jellyfin_access_token_encrypted, created_at FROM pending_quickconnect WHERE secret = ?"
     )
-    .get(secret) as { jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer; created_at: string } | undefined;
+    .get(secret) as { jellyfin_url: string; jellyfin_user_id: string; jellyfin_access_token_encrypted: Buffer; created_at: string } | undefined;
   if (!row || row.created_at < cutoff) {
     // Expired or missing: ensure it's removed and treat as not found.
     database.prepare("DELETE FROM pending_quickconnect WHERE secret = ?").run(secret);
@@ -543,7 +727,7 @@ export function consumePendingQuickConnect(
   database.prepare("DELETE FROM pending_quickconnect WHERE secret = ?").run(secret);
   const cfg = getConfig();
   const token = decrypt(row.jellyfin_access_token_encrypted, cfg);
-  return { jellyfinUserId: row.jellyfin_user_id, jellyfinAccessToken: token };
+  return { jellyfinUrl: row.jellyfin_url, jellyfinUserId: row.jellyfin_user_id, jellyfinAccessToken: token };
 }
 
 /** Invalidate all stored tokens for a Jellyfin user. */
@@ -553,72 +737,79 @@ export function invalidateTokensForJellyfinUser(jellyfinUserId: string): void {
   database.prepare("DELETE FROM jellyfin_sessions WHERE jellyfin_user_id = ?").run(jellyfinUserId);
 }
 
-/** Store a Jellyfin session for a Subsonic username (auth step without linking a device). */
+/** Store a Jellyfin session for a (Subsonic username, Jellyfin URL) pair (auth step without linking a device). */
 export function setJellyfinSession(
-  subsonicUsername: string,
+  key: UserKey,
   jellyfinUserId: string,
   jellyfinAccessToken: string
 ): void {
+  assertUserKey(key);
   const cfg = getConfig();
   const database = openDb();
   const enc = encrypt(jellyfinAccessToken, cfg);
   const created = new Date().toISOString();
   database
     .prepare(
-      `INSERT INTO jellyfin_sessions (subsonic_username, jellyfin_user_id, jellyfin_access_token_encrypted, created_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(subsonic_username) DO UPDATE SET
+      `INSERT INTO jellyfin_sessions (subsonic_username, jellyfin_url, jellyfin_user_id, jellyfin_access_token_encrypted, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(subsonic_username, jellyfin_url) DO UPDATE SET
          jellyfin_user_id = excluded.jellyfin_user_id,
          jellyfin_access_token_encrypted = excluded.jellyfin_access_token_encrypted,
          created_at = excluded.created_at`
     )
-    .run(subsonicUsername, jellyfinUserId, enc, created);
+    .run(key.subsonicUsername, key.jellyfinUrl, jellyfinUserId, enc, created);
 }
 
-/** Save play queue for a user (OpenSubsonic savePlayQueue). Replaces any existing queue. */
+/** Save play queue for a user+server (OpenSubsonic savePlayQueue). Replaces any existing queue. */
 export function savePlayQueue(
-  subsonicUsername: string,
-  data: { entryIds: string[]; currentId: string | null; positionMs: number; changedBy: string }
+  key: UserKey,
+  data: { entryIds: string[]; currentId: string | null; currentIndex: number; positionMs: number; changedBy: string }
 ): void {
+  assertUserKey(key);
   const database = openDb();
   const changedAt = new Date().toISOString();
   const entryIdsJson = JSON.stringify(data.entryIds);
   database
     .prepare(
-      `INSERT INTO play_queue (subsonic_username, entry_ids, current_id, position_ms, changed_at, changed_by)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(subsonic_username) DO UPDATE SET
+      `INSERT INTO play_queue (subsonic_username, jellyfin_url, entry_ids, current_id, current_index, position_ms, changed_at, changed_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(subsonic_username, jellyfin_url) DO UPDATE SET
          entry_ids = excluded.entry_ids,
          current_id = excluded.current_id,
+         current_index = excluded.current_index,
          position_ms = excluded.position_ms,
          changed_at = excluded.changed_at,
          changed_by = excluded.changed_by`
     )
     .run(
-      subsonicUsername,
+      key.subsonicUsername,
+      key.jellyfinUrl,
       entryIdsJson,
       data.currentId ?? null,
+      Math.max(0, data.currentIndex),
       Math.max(0, data.positionMs),
       changedAt,
       data.changedBy?.trim().slice(0, 255) ?? ""
     );
 }
 
-/** Get saved play queue for a user, or null if none. */
-export function getPlayQueue(subsonicUsername: string): {
+/** Get saved play queue for a user+server, or null if none. */
+export function getPlayQueue(key: UserKey): {
   entryIds: string[];
   currentId: string | null;
+  currentIndex: number;
   positionMs: number;
   changedAt: string;
   changedBy: string;
 } | null {
+  assertUserKey(key);
   const database = openDb();
   const row = database
     .prepare(
-      "SELECT entry_ids, current_id, position_ms, changed_at, changed_by FROM play_queue WHERE subsonic_username = ?"
+      "SELECT entry_ids, current_id, current_index, position_ms, changed_at, changed_by FROM play_queue WHERE subsonic_username = ? AND jellyfin_url = ?"
     )
-    .get(subsonicUsername) as
-    | { entry_ids: string; current_id: string | null; position_ms: number; changed_at: string; changed_by: string }
+    .get(key.subsonicUsername, key.jellyfinUrl) as
+    | { entry_ids: string; current_id: string | null; current_index: number; position_ms: number; changed_at: string; changed_by: string }
     | undefined;
   if (!row) return null;
   let entryIds: string[];
@@ -631,16 +822,18 @@ export function getPlayQueue(subsonicUsername: string): {
   return {
     entryIds,
     currentId: row.current_id ?? null,
+    currentIndex: Math.max(0, row.current_index ?? 0),
     positionMs: Math.max(0, row.position_ms),
     changedAt: row.changed_at,
     changedBy: row.changed_by ?? "",
   };
 }
 
-/** Clear saved play queue for a user (savePlayQueue with no ids). */
-export function clearPlayQueue(subsonicUsername: string): void {
+/** Clear saved play queue for a user+server (savePlayQueue with no ids). */
+export function clearPlayQueue(key: UserKey): void {
+  assertUserKey(key);
   const database = openDb();
-  database.prepare("DELETE FROM play_queue WHERE subsonic_username = ?").run(subsonicUsername);
+  database.prepare("DELETE FROM play_queue WHERE subsonic_username = ? AND jellyfin_url = ?").run(key.subsonicUsername, key.jellyfinUrl);
 }
 
 // --- Shares (public share = one linked device + metadata/allowlist) ---
@@ -656,11 +849,43 @@ export interface ShareRow {
   created_at: string;
 }
 
+/** Get per-user library selections for a user+server. Returns list of selected library IDs, or null if none set (= all libraries). */
+export function getUserLibrarySettings(key: UserKey): string[] | null {
+  assertUserKey(key);
+  const database = openDb();
+  const row = database
+    .prepare("SELECT selected_ids FROM user_library_settings WHERE subsonic_username = ? AND jellyfin_url = ?")
+    .get(key.subsonicUsername, key.jellyfinUrl) as { selected_ids: string } | undefined;
+  if (!row) return null;
+  try {
+    const ids = JSON.parse(row.selected_ids) as string[];
+    return Array.isArray(ids) ? ids : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Set per-user library selections for a user+server. Pass empty array to clear (= all libraries). */
+export function setUserLibrarySettings(key: UserKey, selectedIds: string[]): void {
+  assertUserKey(key);
+  const database = openDb();
+  const updatedAt = new Date().toISOString();
+  database
+    .prepare(
+      `INSERT INTO user_library_settings (subsonic_username, jellyfin_url, selected_ids, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(subsonic_username, jellyfin_url) DO UPDATE SET
+         selected_ids = excluded.selected_ids,
+         updated_at = excluded.updated_at`
+    )
+    .run(key.subsonicUsername, key.jellyfinUrl, JSON.stringify(selectedIds), updatedAt);
+}
+
 /** Create a share: one linked device + one shares row. Returns shareUid and the app password (secret).
  * Pass jellyfinDeviceId and jellyfinDeviceName when the token was obtained via Quick Connect
  * so the share's Jellyfin requests use that device (shows as distinct in Jellyfin dashboard). */
 export function createShare(
-  subsonicUsername: string,
+  key: UserKey,
   jellyfinUserId: string,
   jellyfinAccessToken: string,
   opts: {
@@ -672,12 +897,13 @@ export function createShare(
     jellyfinDeviceName?: string;
   }
 ): { shareUid: string; secret: string; linkedDeviceId: number } {
+  assertUserKey(key);
   const database = openDb();
   const shareUid = randomUUID();
   const description = opts.description?.trim() || null;
   const deviceLabel = description ? `SHARE: ${description}` : "SHARE: Share";
   const secret = addLinkedDevice(
-    subsonicUsername,
+    key,
     jellyfinUserId,
     jellyfinAccessToken,
     deviceLabel,
@@ -685,8 +911,8 @@ export function createShare(
     opts.jellyfinDeviceName
   );
   const deviceRow = database
-    .prepare("SELECT id FROM linked_devices WHERE subsonic_username = ? ORDER BY id DESC LIMIT 1")
-    .get(subsonicUsername) as { id: number } | undefined;
+    .prepare("SELECT id FROM linked_devices WHERE subsonic_username = ? AND jellyfin_url = ? ORDER BY id DESC LIMIT 1")
+    .get(key.subsonicUsername, key.jellyfinUrl) as { id: number } | undefined;
   if (!deviceRow) throw new Error("Failed to get created device id");
   const linkedDeviceId = deviceRow.id;
   const expiresAt =
@@ -813,6 +1039,7 @@ export function resolveShareAuth(
   secret: string
 ): {
   subsonicUsername: string;
+  jellyfinUrl: string;
   jellyfinUserId: string;
   jellyfinAccessToken: string;
   linkedDeviceId: number;
@@ -828,10 +1055,11 @@ export function resolveShareAuth(
   const database = openDb();
   const deviceRow = database
     .prepare(
-      "SELECT app_password_hash, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, jellyfin_device_id, jellyfin_device_name FROM linked_devices WHERE id = ?"
+      "SELECT jellyfin_url, app_password_hash, app_password_encrypted, jellyfin_user_id, jellyfin_access_token_encrypted, jellyfin_device_id, jellyfin_device_name FROM linked_devices WHERE id = ?"
     )
     .get(share.linked_device_id) as
     | {
+        jellyfin_url: string;
         app_password_hash: string;
         app_password_encrypted: Buffer;
         jellyfin_user_id: string;
@@ -854,6 +1082,7 @@ export function resolveShareAuth(
   }
   return {
     subsonicUsername: share.subsonic_username,
+    jellyfinUrl: deviceRow.jellyfin_url,
     jellyfinUserId: deviceRow.jellyfin_user_id,
     jellyfinAccessToken,
     linkedDeviceId: share.linked_device_id,
@@ -868,6 +1097,7 @@ export function resolveShareAuth(
 /** Get share credentials and allowlist by share_uid only (no secret check). For use when auth was already validated e.g. via share cookie. Checks expiry. */
 export function getShareAuthByUid(shareUid: string): {
   subsonicUsername: string;
+  jellyfinUrl: string;
   jellyfinUserId: string;
   jellyfinAccessToken: string;
   allowedTrackIds: Set<string>;
@@ -880,10 +1110,11 @@ export function getShareAuthByUid(shareUid: string): {
   const database = openDb();
   const deviceRow = database
     .prepare(
-      "SELECT jellyfin_user_id, jellyfin_access_token_encrypted, jellyfin_device_id, jellyfin_device_name FROM linked_devices WHERE id = ?"
+      "SELECT jellyfin_url, jellyfin_user_id, jellyfin_access_token_encrypted, jellyfin_device_id, jellyfin_device_name FROM linked_devices WHERE id = ?"
     )
     .get(share.linked_device_id) as
     | {
+        jellyfin_url: string;
         jellyfin_user_id: string;
         jellyfin_access_token_encrypted: Buffer;
         jellyfin_device_id: string | null;
@@ -901,6 +1132,7 @@ export function getShareAuthByUid(shareUid: string): {
   }
   return {
     subsonicUsername: share.subsonic_username,
+    jellyfinUrl: deviceRow.jellyfin_url,
     jellyfinUserId: deviceRow.jellyfin_user_id,
     jellyfinAccessToken,
     allowedTrackIds: new Set(allowedTrackIds),

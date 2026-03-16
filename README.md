@@ -40,13 +40,56 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 | `JELLYFIN_URL` | `http://localhost:8096` | Jellyfin server URL |
 | `JELLYFIN_CLIENT` | `Subfin` | Client name sent to Jellyfin |
 | `JELLYFIN_DEVICE_ID` | `subfin-device-1` | Device ID |
-| `MUSIC_LIBRARY_IDS` | (all) | Comma-separated library IDs or display names to expose (optional). Accepts Jellyfin view IDs (32-char hex, e.g. from the URL `topParentId=...` when opening a library in the web UI) or library names (e.g. `Contemporary Music`); names are matched case-insensitively. Names containing commas must use the ID. When set, **all** list endpoints (getMusicFolders, getArtists, getIndexes, getAlbumList, getRandomSongs, getGenres, getSongsByGenre) are restricted to these libraries when the client does not send a music folder. |
+| `ALLOWED_JELLYFIN_HOSTS` | (defaults to `JELLYFIN_URL`) | Comma-separated list of allowed Jellyfin backend URLs (e.g. `https://jf1.example.com,https://jf2.example.com`). Controls multi-tenant mode: non-empty = restricted mode (operator-approved backends only); empty = open mode (any Jellyfin URL accepted, requires SSRF hardening). When unset, defaults to `[JELLYFIN_URL]` for backward-compatible single-server deployments. Per-user library selection replaces the old `MUSIC_LIBRARY_IDS` option and is configured in the web UI after linking a device. |
 | `SUBFIN_DB_PATH` | `./subfin.db` | Path for the SQLite database (tokens and app passwords, encrypted at rest). If a legacy `subfin.json` exists at the same path with `.json` extension, it is migrated once to SQLite and renamed to `subfin.json.migrated`. |
 | `SUBFIN_SALT` | *(required)* | Secret for DB encryption (see above). In config file: `"salt": "<base64 or hex>"`. |
 | `SUBFIN_LOG_REST` | (off) | Set to `true` or `1` to log each REST request (method and auth) for debugging clients. Do not enable in production; logs may contain tokens. |
 | `SUBFIN_PUBLIC_URL` | (empty) | Optional public URL of Subfin (e.g. `https://subfin.example.com`) for absolute image URLs in `getArtistInfo` / `getArtistInfo2` and used when generating Share links. |
+| `SUBFIN_CORS_ORIGINS` | (unset, allows all) | Comma-separated allowed CORS origins for browser-based clients (e.g. `https://aonsoku.example.com,http://localhost:8080`). When unset, all origins are allowed (`*`). Native Subsonic clients are unaffected. In config file: `"corsOrigins": ["https://aonsoku.example.com"]`. |
 | `LASTFM_API_KEY` | (unset) | Optional Last.fm API key for enriching artist info (`getArtistInfo` / `getArtistInfo2`) with biography and Last.fm URLs. In the config file, use `"lastFmApiKey": "..."`. When unset, Subfin does **not** call Last.fm and relies only on Jellyfin data and placeholders. |
 | `SUBFIN_CONFIG` | `subfin.config.json` | Path to JSON config file (optional). All settings above can be in this file; env overrides. |
+
+## Production Deployment
+
+### CORS
+
+CORS headers are relevant only for browser-based Subsonic clients (e.g. Aonsoku) that make cross-origin requests. Native desktop/mobile clients do not send `Origin` headers and are unaffected.
+
+By default, all origins are allowed (`*`). Restrict with `SUBFIN_CORS_ORIGINS`:
+
+| Scenario | Setting |
+|----------|---------|
+| Local testing (subfin `:4040`, client `:8080`) | Leave unset, or `http://localhost:8080` |
+| Docker Compose (localhost access) | Leave unset |
+| Reverse proxy, separate domains | `https://your-client.example.com` |
+| Subsonic native clients only | Leave unset |
+
+Note: `SUBFIN_PUBLIC_URL` is subfin's own public URL — it is **not** used for CORS.
+
+### fail2ban Integration
+
+Auth failures are logged in structured format: `[AUTH_FAIL] method=<method> ip=<ip> code=<code>`
+
+**`/etc/fail2ban/filter.d/subfin.conf`:**
+```ini
+[Definition]
+failregex = \[AUTH_FAIL\] method=\S+ ip=<HOST> code=40
+ignoreregex =
+```
+
+**`/etc/fail2ban/jail.d/subfin.conf`:**
+```ini
+[subfin]
+enabled  = true
+port     = 4040
+filter   = subfin
+logpath  = /path/to/subfin.log
+maxretry = 10
+findtime = 600
+bantime  = 3600
+```
+
+Set `SUBFIN_TRUST_PROXY=true` when running behind a reverse proxy (nginx/Caddy) so rate limiting and logging use the real client IP.
 
 ## Run
 
@@ -168,14 +211,14 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 |---------|--------|------------------|-------|
 | `ping` | **Fully implemented** | N/A (internal health) | Returns a standard Subsonic `subsonic-response` without calling Jellyfin. |
 | `getLicense` | **Fully implemented** | N/A | Always reports a valid license; Jellyfin has no license concept. |
-| `getOpenSubsonicExtensions` | **Partially implemented** | N/A | Returns a static list of supported extensions (transcoders, formats, lyrics). |
+| `getOpenSubsonicExtensions` | **Partially implemented** | N/A | Returns a static list of supported extensions (transcoders, formats, lyrics, `indexBasedQueue`). |
 | `tokenInfo` | **Not planned** | — | Out of scope; no API to expose app-password metadata from Subfin's store. |
 
 ### Browsing (library and metadata)
 
 | Endpoint | Status | Jellyfin mapping | Notes |
 |---------|--------|------------------|-------|
-| `getMusicFolders` | **Fully implemented** | `UserViewsApi.getUserViews(userId)` (filter `CollectionType=Music`) | Returns user-visible music libraries; respects `MUSIC_LIBRARY_IDS`. Uses UserViews because `Library/MediaFolders` returns 403 for non-admin users. |
+| `getMusicFolders` | **Fully implemented** | `UserViewsApi.getUserViews(userId)` (filter `CollectionType=Music`) | Returns user-visible music libraries. Per-user library selection (configured in the web UI) restricts which libraries are returned. Uses UserViews because `Library/MediaFolders` returns 403 for non-admin users. |
 | `getIndexes` | **Fully implemented** | `ItemsApi.getItems(includeItemTypes=MusicArtist)` | Builds letter indexes from Jellyfin artists; stores `ignoredArticles` locally. |
 | `getMusicDirectory` | **Fully implemented (music)** | `ItemsApi.getItems` (album or artist) | Treats `id` as album or artist (strips `ar-`/`al-`/`pl-`); returns albums or songs accordingly. |
 | `getGenres` | **Partially implemented** | `GenresApi.getGenres` | Uses Jellyfin’s genres API to list distinct text genres with song/album counts; semantics follow Jellyfin’s tagging model, so composite/untidy genre strings are surfaced as-is. |
@@ -240,7 +283,7 @@ High-level mapping of OpenSubsonic endpoints to Jellyfin APIs and current Subfin
 
 | Endpoint | Status | Jellyfin mapping | Notes |
 |---------|--------|------------------|-------|
-| `createShare` | **Fully implemented** | Subfin SQLite store | Creates a public share link for a playlist or album; returns a Subfin-hosted URL. Requires `SUBFIN_PUBLIC_URL` to be set for absolute URLs. |
+| `createShare` | **Fully implemented** | Subfin SQLite store | Creates a public share link for a playlist or album; returns a Subfin-hosted URL. Requires `SUBFIN_PUBLIC_URL` to be set for absolute URLs. Disabled in open mode (`ALLOWED_JELLYFIN_HOSTS` empty). |
 | `getShares` | **Fully implemented** | Subfin SQLite store | Lists all shares for the current user. |
 | `updateShare` | **Fully implemented** | Subfin SQLite store | Updates share description or expiry. |
 | `deleteShare` | **Fully implemented** | Subfin SQLite store | Deletes a share. |
@@ -257,6 +300,7 @@ Most of the remaining items below are **currently unimplemented** (exceptions: `
 - **Chat** *(not planned)*: `addChatMessage`, `getChatMessages` — no implementation intended.
 - **Playback state**: `savePlayQueue`, `getPlayQueue`, `scrobble`, `setRating`, `star`, `unstar` → Jellyfin play queue, playback reporting, and rating/favorite APIs.
   - **`savePlayQueue`** and **`getPlayQueue`** are **fully implemented**: Subfin stores one play queue per user (in SQLite). Clients save the queue as a list of **entry IDs** (track ids), plus the current track id and position in ms, and restore it on any device for cross-device continuity. Call `savePlayQueue` with no parameters to clear the saved queue.
+  - **`savePlayQueueByIndex`** and **`getPlayQueueByIndex`** are **fully implemented** (OpenSubsonic `indexBasedQueue` extension v1): same storage as above, but the current track is identified by zero-based `currentIndex` instead of song id. This allows duplicate tracks in a queue. Call `savePlayQueueByIndex` with no `id` parameters to clear the queue. Both endpoints are interoperable — saving via one is readable via the other.
   - `scrobble`: the client should send **scrobble with `submission=false`** when a track actually starts so Jellyfin’s “now playing” dashboard updates immediately; `submission=true` at end-of-track is also supported.
   - `setRating`, `star`, and `unstar` are **fully implemented**: they call Jellyfin’s favorite and user-like APIs (`markFavorite`, `unmarkFavorite`, `setUserLikeForItem`), so favorites and likes stay in sync with Jellyfin.
 - **Library scanning / transcoding**: `startScan`, `getScanStatus`, `getTranscodeDecision` → Jellyfin library scan and transcoding APIs (not yet surfaced by Subfin).
