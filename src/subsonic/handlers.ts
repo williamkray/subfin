@@ -632,7 +632,7 @@ export async function handleGetPlaylists(
         songCount: p.songCount,
         public: false,
         created: p.created ?? p.changed ?? new Date(0).toISOString(),
-        changed: p.changed,
+        changed: p.changed ?? p.created ?? new Date(0).toISOString(),
         duration: p.duration != null ? Math.floor(p.duration / 10_000_000) : 0,
         // OpenSubsonic: playlist-level cover art id.
         // Navic and other clients use this with getCoverArt to show playlist images.
@@ -661,7 +661,7 @@ export async function handleGetPlaylist(
   const comment = meta?.comment ?? "";
   const songCount = meta?.songCount ?? items.length;
   const created = meta?.created ?? meta?.changed ?? new Date(0).toISOString();
-  const changed = meta?.changed;
+  const changed = meta?.changed ?? created;
   const duration =
     meta?.duration != null ? Math.floor(meta.duration / 10_000_000) : 0;
 
@@ -1951,6 +1951,7 @@ export async function handleCreateShare(
           description: description ?? undefined,
           username: auth.subsonicUsername,
           created: new Date().toISOString(),
+          expires: expiresAt ? new Date(expiresAt).toISOString() : new Date(Date.now() + 365 * 24 * 3600 * 1000).toISOString(),
           visitCount: 0,
           entry,
         },
@@ -1979,13 +1980,15 @@ export async function handleGetShares(auth: AuthResult): Promise<Record<string, 
       const song = await jf.getSong(ctx, id);
       if (song) entries.push(toSubsonicSong(song));
     }
-    const url = `${baseUrl}/share/${s.share_uid}`;
+    const url = s.fullUrl ?? `${baseUrl}/share/${s.share_uid}`;
+    const implicitExpires = new Date(new Date(s.created_at).getTime() + 365 * 24 * 3600 * 1000).toISOString();
     shareList.push({
       id: s.share_uid,
       url,
       description: s.description ?? undefined,
       username: auth.subsonicUsername,
       created: s.created_at,
+      expires: s.expires_at ?? implicitExpires,
       visitCount: s.visit_count ?? 0,
       entry: entries,
     });

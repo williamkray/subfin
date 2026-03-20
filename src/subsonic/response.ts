@@ -7,7 +7,8 @@
  * Subsonic-only clients.
  */
 
-export const VERSION = "1.16.1";
+export const VERSION = "1.16.1";         // Subsonic API version
+export const SERVER_VERSION = "0.2.1";   // Subfin software version
 
 export interface SubsonicError {
   code: number;
@@ -23,6 +24,8 @@ export function subsonicEnvelope<T>(payload: T): Record<string, unknown> {
     "subsonic-response": {
       status: "ok",
       version: VERSION,
+      type: "subfin",
+      serverVersion: SERVER_VERSION,
       openSubsonic: true,
       ...payload,
     },

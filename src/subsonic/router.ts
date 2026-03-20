@@ -12,7 +12,7 @@ import {
   resolveAuthFromBasicHeaderWithToken,
 } from "./auth.js";
 import { getClientIp } from "../request-context.js";
-import { restRateLimit, recordRestAuthFailure } from "./rate-limit.js";
+import { recordRestAuthFailure } from "./rate-limit.js";
 import { resolveAuthFromShareCookie } from "../web/share-session.js";
 import { subsonicEnvelope, subsonicError, ErrorCode, VERSION } from "./response.js";
 import * as handlers from "./handlers.js";
@@ -96,7 +96,7 @@ function getAuthParams(params: Record<string, string>): AuthParams {
     (params[a] ?? params[b])?.trim() || undefined;
   return {
     u: one("u", "U"),
-    p: params.p ?? params.P,
+    p: (params.p ?? params.P)?.trim() || undefined,
     t: params.t ?? params.T,
     s: params.s ?? params.S,
     apiKey: params.apiKey ?? params.ApiKey,
@@ -311,14 +311,6 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
   const params = getParams(req);
   const format = getFormat(params);
 
-  // Per-IP rate limit: applied before any auth or handler work.
-  // Binary proxy endpoints are excluded: they are high-volume by design (one request per album
-  // cover, per stream) and don't require brute-force protection since there are no secrets to guess.
-  const isProxyEndpoint = method === "stream" || method === "download" || method === "getcoverart" || method === "getavatar";
-  if (!isProxyEndpoint && restRateLimit(req)) {
-    sendError(res, format, ErrorCode.Generic, "Too many requests", 429);
-    return;
-  }
   const authParams = getAuthParams(params);
 
   // Auth
@@ -372,8 +364,7 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
       sendError(res, format, ErrorCode.Generic, "Too many requests", 429);
       return;
     }
-    const httpStatus = authResult.code === 40 ? 401 : 200;
-    sendError(res, format, authResult.code, authResult.message, httpStatus);
+    sendError(res, format, authResult.code, authResult.message);
     return;
   }
   const auth = authResult;
@@ -1269,6 +1260,53 @@ export async function subsonicRouter(req: Request, res: Response): Promise<void>
           }
           parts.push("</starred2>", "</subsonic-response>");
           xml = parts.join("");
+        } else if (method === "getshares" || method === "createshare") {
+          const shares = ((payload as any).shares?.share ?? []) as any[];
+          const parts: string[] = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            `<subsonic-response status="ok" version="${VERSION}">`,
+            "<shares>",
+          ];
+          for (const sh of shares) {
+            let shareTag = `<share id="${escapeXmlAttr(String(sh.id ?? ""))}"`;
+            shareTag += ` url="${escapeXmlAttr(String(sh.url ?? ""))}"`;
+            shareTag += ` username="${escapeXmlAttr(String(sh.username ?? ""))}"`;
+            shareTag += ` created="${escapeXmlAttr(String(sh.created ?? ""))}"`;
+            shareTag += ` expires="${escapeXmlAttr(String(sh.expires ?? ""))}"`;
+            shareTag += ` visitCount="${sh.visitCount ?? 0}"`;
+            if (sh.description) shareTag += ` description="${escapeXmlAttr(String(sh.description))}"`;
+            shareTag += ">";
+            parts.push(shareTag);
+            const entries = (sh.entry ?? []) as any[];
+            for (const s of entries) {
+              let tag = `<entry id="${escapeXmlAttr(String(s.id ?? ""))}"`;
+              if (s.parent) tag += ` parent="${escapeXmlAttr(String(s.parent))}"`;
+              if (s.title) tag += ` title="${escapeXmlAttr(String(s.title))}"`;
+              if (s.album) tag += ` album="${escapeXmlAttr(String(s.album))}"`;
+              if (s.artist) tag += ` artist="${escapeXmlAttr(String(s.artist))}"`;
+              if (s.coverArt) tag += ` coverArt="${escapeXmlAttr(String(s.coverArt))}"`;
+              if (s.track != null) tag += ` track="${s.track}"`;
+              if (s.year != null) tag += ` year="${s.year}"`;
+              if (s.genre) tag += ` genre="${escapeXmlAttr(String(s.genre))}"`;
+              if (s.size != null) tag += ` size="${s.size}"`;
+              if (s.duration != null) tag += ` duration="${s.duration}"`;
+              if (s.bitRate != null) tag += ` bitRate="${s.bitRate}"`;
+              if (s.path) tag += ` path="${escapeXmlAttr(String(s.path))}"`;
+              if (s.suffix) tag += ` suffix="${escapeXmlAttr(String(s.suffix))}"`;
+              if (s.contentType) tag += ` contentType="${escapeXmlAttr(String(s.contentType))}"`;
+              if (s.transcodedSuffix) tag += ` transcodedSuffix="${escapeXmlAttr(String(s.transcodedSuffix))}"`;
+              if (s.transcodedContentType) tag += ` transcodedContentType="${escapeXmlAttr(String(s.transcodedContentType))}"`;
+              if (s.discNumber != null) tag += ` discNumber="${s.discNumber}"`;
+              if (s.type) tag += ` type="${escapeXmlAttr(String(s.type))}"`;
+              tag += "/>";
+              parts.push(tag);
+            }
+            parts.push("</share>");
+          }
+          parts.push("</shares>", "</subsonic-response>");
+          xml = parts.join("");
+        } else if (method === "updateshare" || method === "deleteshare") {
+          xml = `<?xml version="1.0" encoding="UTF-8"?><subsonic-response status="ok" version="${VERSION}"/>`;
         }
 
         if (xml != null) {
@@ -1437,7 +1475,7 @@ function proxyBinary(
       }
     );
 
-    proxyReq.setTimeout(30_000, () => {
+    proxyReq.setTimeout(300_000, () => {
       proxyReq.destroy(new Error("upstream timeout"));
     });
 

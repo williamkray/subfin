@@ -7,6 +7,8 @@ import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import helmet from "helmet";
+import { fileURLToPath } from "url";
+import path from "path";
 import { config } from "./config.js";
 import { clientIpMiddleware } from "./request-context.js";
 import { subsonicRouter } from "./subsonic/router.js";
@@ -54,6 +56,9 @@ app.use(clientIpMiddleware);
 app.all(["/rest", "/rest/:method"], async (req, res) => {
   await subsonicRouter(req, res);
 });
+
+// Static assets (logo, favicon)
+app.use(express.static(path.join(path.dirname(fileURLToPath(import.meta.url)), "public")));
 
 // Web UI: link, devices, unlink, reset password
 app.use("/", webRouter);

@@ -143,6 +143,7 @@ export async function resolveAuth(
   } else if (params.t && params.s) {
     // Token auth: t = md5(password + s). We only have stored app passwords to verify.
     const devices = getDevicesForTokenAllServers(username);
+    const hasAnyDevice = devices.length > 0;
     for (const d of devices) {
       if (!d.app_password_plain) continue;
       const expected = computeToken(d.app_password_plain, params.s);
@@ -158,7 +159,12 @@ export async function resolveAuth(
         };
       }
     }
-    return { code: 40, message: "Wrong username or password." };
+    // If devices exist but none have recoverable plaintext, token auth literally cannot work.
+    // Return code 41 so clients (e.g. Amperfy) automatically retry with legacy p= auth.
+    const allLackPlaintext = hasAnyDevice && devices.every(d => !d.app_password_plain);
+    return allLackPlaintext
+      ? { code: 41, message: "Token authentication not supported for this account." }
+      : { code: 40, message: "Wrong username or password." };
   }
 
   if (!password) {

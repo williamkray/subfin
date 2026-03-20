@@ -8,6 +8,7 @@ RUN npm ci
 
 COPY tsconfig.json ./
 COPY src ./src
+COPY public ./public
 RUN npm run build
 
 # Run stage
@@ -36,4 +37,4 @@ EXPOSE 4040
 
 USER subfin
 
-CMD ["node", "dist/index.js"]
+CMD ["node", "--import", "./dist/instrument.js", "dist/index.js"]

@@ -76,6 +76,12 @@ export function toSubsonicSong(item: BaseItemDto, albumId?: string, albumName?: 
   const size = (item as Record<string, number | undefined>).Size ?? 0;
   const bitRate = duration > 0 && size > 0 ? Math.floor((size * 8) / duration / 1000) : undefined;
   const anyItem = item as Record<string, any>;
+  const audioStream = anyItem.MediaSources?.[0]?.MediaStreams?.find(
+    (s: Record<string, unknown>) => s.Type === "Audio"
+  );
+  const samplingRate: number = audioStream?.SampleRate ?? 44100;
+  const channelCount: number = audioStream?.Channels ?? 2;
+  const bitDepth: number = audioStream?.BitDepth ?? 16;
   // Prefer explicit albumId argument, then Jellyfin AlbumId, then ParentId as a last resort.
   const albumIdFromItem = anyItem.AlbumId as string | undefined;
   const effectiveAlbumId = albumId ?? albumIdFromItem ?? item.ParentId;
@@ -127,7 +133,11 @@ export function toSubsonicSong(item: BaseItemDto, albumId?: string, albumName?: 
     transcodedSuffix: "mp3",
     transcodedContentType: "audio/mpeg",
     discNumber: item.ParentIndexNumber ?? 1,
-    path: (item as Record<string, string | undefined>).Path,
+    path: (item as Record<string, string | undefined>).Path ?? "",
+    // OpenSubsonic: audio format details — required non-null by strict clients (e.g. Navic).
+    bitDepth,
+    samplingRate,
+    channelCount,
   };
 }
 

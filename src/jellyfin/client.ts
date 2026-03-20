@@ -28,6 +28,9 @@ import { config } from "../config.js";
 
 const { jellyfin: jf } = config;
 
+/** Fields required to populate OpenSubsonic audio-format fields (bitDepth, samplingRate, channelCount, path). */
+const SONG_FIELDS = [ItemFields.MediaSources, ItemFields.Path];
+
 /**
  * Context for Jellyfin API calls. Either a plain access token (legacy / no device) or an object
  * with token, optional per-device identity, and optional Jellyfin base URL for multi-tenant.
@@ -663,6 +666,7 @@ export async function getSongsByAlbum(
       recursive: false,
       sortBy: ["ParentIndexNumber", "IndexNumber"],
       sortOrder: ["Ascending", "Ascending"],
+      fields: SONG_FIELDS,
     });
     return response.data?.Items ?? [];
   } catch {
@@ -708,6 +712,7 @@ export async function getTopSongsForArtist(
     sortOrder: ["Descending"],
     limit: count,
     enableUserData: true as any,
+    fields: SONG_FIELDS,
   } as any);
   return songsResp.data?.Items ?? [];
 }
@@ -763,6 +768,7 @@ export async function getRandomSongs(
     sortOrder: ["Ascending"],
     limit: size ?? 50,
     startIndex: offset ?? 0,
+    fields: SONG_FIELDS,
   });
   return response.data?.Items ?? [];
 }
@@ -926,6 +932,7 @@ export async function getSongsByGenre(
     sortOrder: ["Ascending"],
     limit: size ?? 50,
     startIndex: offset ?? 0,
+    fields: SONG_FIELDS,
   });
   return response.data?.Items ?? [];
 }
@@ -947,6 +954,7 @@ export async function getFavoriteSongs(
     sortOrder: ["Ascending"],
     limit: size ?? 200,
     startIndex: offset ?? 0,
+    fields: SONG_FIELDS,
   } as any);
   return response.data?.Items ?? [];
 }
@@ -1153,6 +1161,7 @@ export async function searchSongs(
     searchTerm: query,
     limit: size ?? 50,
     startIndex: offset ?? 0,
+    fields: SONG_FIELDS,
   });
   return response.data?.Items ?? [];
 }
@@ -1264,7 +1273,7 @@ export async function getPlaylistItems(
 ): Promise<BaseItemDto[]> {
   const { accessToken, device } = normalizeContext(ctx);
   const api: any = getApi(ctx);
-  const url = api.getUri(`/Playlists/${playlistId}/Items`, { UserId: userId });
+  const url = api.getUri(`/Playlists/${playlistId}/Items`, { UserId: userId, Fields: "MediaSources,Path" });
   const authHeader = buildJellyfinAuthHeader(accessToken, device);
   const response = await api.axiosInstance.get(url, {
     headers: {
@@ -1383,6 +1392,7 @@ export async function getSong(
     const response = await itemsApi.getItems({
       ids: [id],
       includeItemTypes: [BaseItemKind.Audio],
+      fields: SONG_FIELDS,
     });
     return response.data?.Items?.[0] ?? null;
   } catch {
@@ -1425,7 +1435,7 @@ export async function getSimilarSongs(
   let isAlbum = /^al-/i.test(id);
   const cleanId = id.replace(/^(ar-|al-|pl-)/i, "");
   const limit = Math.min(Math.max(1, count), 100);
-  const opts = { userId, limit };
+  const opts = { userId, limit, fields: SONG_FIELDS };
 
   // When client sends raw id (e.g. Tempus artist Radio without ar- prefix), resolve so we call the right endpoint (Artists/Album/Item) for AudioMuse-style plugins
   if (!isArtist && !isAlbum) {

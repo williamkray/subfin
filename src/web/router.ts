@@ -206,24 +206,7 @@ const baseStyles = `
   .brand-mark {
     width: 32px;
     height: 32px;
-    border-radius: 13px;
-    background:
-      radial-gradient(circle at 10% 0%, rgba(248, 250, 252, 0.9), transparent 40%),
-      conic-gradient(from 210deg, #38bdf8, #6366f1, #22c55e, #38bdf8);
-    position: relative;
-    box-shadow:
-      0 0 0 1px rgba(15, 23, 42, 0.9),
-      0 10px 22px rgba(15, 23, 42, 0.7);
-  }
-  .brand-mark::after {
-    content: "";
-    position: absolute;
-    inset: 7px 6px 8px;
-    border-radius: 9px;
-    background:
-      radial-gradient(circle at 20% 0%, rgba(248, 250, 252, 0.85), transparent 55%),
-      linear-gradient(140deg, #020617, #020617 45%, #020617 55%, #020617);
-    box-shadow: inset 0 0 0 1px rgba(148, 163, 184, 0.28);
+    flex-shrink: 0;
   }
   .brand-title {
     font-size: 1.15rem;
@@ -704,6 +687,7 @@ function renderLayout(title: string, innerHtml: string, csrfToken?: string): str
   <meta charset="utf-8">
   <title>${escapeHtml(title)}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" type="image/png" href="/subfin.png">
   ${csrfMeta}
   <style>${baseStyles}</style>
 </head>
@@ -752,7 +736,7 @@ function renderDashboardHeader(sessionUser: string | null, opts?: { backToDevice
   return `
     <header class="shell-header">
       <div class="brand">
-        <div class="brand-mark"></div>
+        <img class="brand-mark" src="/subfin.png" alt="Subfin">
         <div class="brand-title">
           <span>Subfin</span>
           <span>OpenSubsonic → Jellyfin bridge</span>
