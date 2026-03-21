@@ -25,6 +25,7 @@ import { CollectionType } from "@jellyfin/sdk/lib/generated-client/models/collec
 import { ItemFields } from "@jellyfin/sdk/lib/generated-client/models/item-fields.js";
 import { MediaType } from "@jellyfin/sdk/lib/generated-client/models/media-type.js";
 import { config } from "../config.js";
+import { SERVER_VERSION } from "../subsonic/response.js";
 
 const { jellyfin: jf } = config;
 
@@ -110,7 +111,7 @@ function createJellyfinApi(jellyfinBaseUrl: string, accessToken: string, device?
   const jellyfin = new Jellyfin({
     clientInfo: {
       name: jf.clientName,
-      version: "0.1.0",
+      version: SERVER_VERSION,
     },
     deviceInfo,
   });

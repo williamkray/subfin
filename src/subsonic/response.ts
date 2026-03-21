@@ -7,8 +7,10 @@
  * Subsonic-only clients.
  */
 
+import pkg from "../../package.json" with { type: "json" };
+
 export const VERSION = "1.16.1";         // Subsonic API version
-export const SERVER_VERSION = "0.2.1";   // Subfin software version
+export const SERVER_VERSION = pkg.version; // Subfin software version — source of truth is package.json
 
 export interface SubsonicError {
   code: number;
