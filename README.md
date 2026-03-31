@@ -1,5 +1,8 @@
 # Subfin
 
+> [!WARNING]
+> check out a jellyfin plugin version of this project instead! https://github.com/williamkray/subfin-plugin
+
 OpenSubsonic-to-Jellyfin compatibility layer. Use Subsonic/Navidrome clients (DSub, substreamer, etc.) with your existing Jellyfin music library.
 
 >[!NOTE]
